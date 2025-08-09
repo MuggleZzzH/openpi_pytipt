@@ -1,0 +1,53 @@
+# Stage 11 RIPT-VLA测试配置 - 启用新的并行runner
+# 测试真正的多进程并行环境
+
+exp_name: stage11_ript_vla_parallel
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/stage11_ript_vla"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"
+  num_parallel_envs: 4  # 🚀 测试并行环境
+  max_episode_length: 150  # 短episode快速测试
+
+# === 算法配置 ===
+algo:
+  rloo_batch_size: 2  # 匹配并行环境数
+  lr: 1e-5
+  gradient_accumulation_steps: 1
+  # RolloutGenerator配置
+  enable_dynamic_sampling: false
+  rollout_skip_threshold: 3
+  enable_rollout_stats_tracking: true
+  rollout_stats_path: "./output/stage11_ript_vla/rollout_stats.json"
+  use_val_init: false
+
+# === 数据集配置 ===
+dataset:
+  num_init_states: 30  # RIPT-VLA并行环境使用更多初始状态
+  state_dim: 8  # 状态维度
+
+# === 训练配置 ===
+training:
+  num_train_steps: 2  # 只训练2步测试
+  seed: 42
+  save_freq: 1
+
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+
+# === 特性开关 ===
+features:
+  use_ript_vla_runner: false  # 关闭RIPT-VLA runner，使用LIBEROEnvRunner并行能力
+  enable_parallel_envs: true  # 开启并行环境（向量化）
+  enable_true_parallel_envs: true  # 开启真正多进程并行（SubprocVectorEnv）
+  enable_smart_sampling: true      # Runner日志用的智能采样开关（与algo.enable_dynamic_sampling对应）
+  use_parallel_init_state: false   # 并行时是否调用set_init_state（默认false以避免MuJoCo qpos维度不匹配）
+  save_video: true                 # 训练期间保存视频（会写到 pi0/ript/debug_images/videos）

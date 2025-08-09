@@ -1,0 +1,91 @@
+# Config for training PI0 with RIPT-CFG style RL
+exp_name: pi0_cfg_rl_libero_spatial
+
+# --- Paths ---
+# Path to the pretrained PI0 policy checkpoint
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+# Directory to save checkpoints and logs
+output_dir: "./pi0/ript/output"
+# Path to normalization statistics (auto-detected if not specified)
+norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json"
+
+# --- Task and Environment ---
+task:
+  benchmark_name: "libero_goal" # e.g., libero_spatial, libero_10
+  task_name: null # Specify a single task name, or null to use all from the benchmark split
+  # Number of parallel environments to run on each GPU　　
+  num_parallel_envs: 1 # 减少并行环境数量，适合单GPU
+  # Max steps per episode. null means it's determined by the environment.
+  max_episode_length: 200
+
+# --- RL Algorithm (RLOptimizerPI0_CFG) ---
+algo:
+  # RLOO batch size: number of rollouts to use for advantage estimation
+  rloo_batch_size: 4 # 减小批量大小以适应单GPU内存
+  # Number of training epochs over the collected rollouts
+  num_epochs: 4
+  # Batch size for policy update (within an epoch)
+  data_batch_size: 2 # 减小数据批量大小
+  # Gradient accumulation steps
+  gradient_accumulation_steps: 1
+  # Learning rate
+  lr: 1e-5
+  # Gradient norm clipping value
+  grad_norm_clip: 1.0
+  # --- Dynamic Sampling (New) ---
+  # If true, discard rollout batches that are all success or all fail
+  enable_dynamic_sampling: true
+  # If true, track success rates per init state and skip "mastered" ones
+  enable_rollout_stats_tracking: true
+  # How many times to skip a mastered state before re-evaluating it
+  rollout_skip_threshold: 3
+  # Path to load and save rollout statistics, enabling training resumption.
+  rollout_stats_path: "./ript/output/pi0_rl/rollout_stats.json"
+  # If true, sample initial states from the validation set instead of the training set
+  use_val_init: false
+
+# --- Training ---
+training:
+  # Total number of RL training steps (rollout + update)
+  num_train_steps: 1
+  # Random seed for reproducibility
+  seed: 42
+  # How often to save checkpoints (in steps)
+  save_freq: 5
+  # Whether to save the best model based on mean reward
+  save_best: true
+  # Whether to enable mixed precision training
+  use_mixed_precision: false
+  # Optimizer parameters
+  optimizer:
+    type: "Adam"  # Optimizer type: Adam, AdamW, SGD
+    weight_decay: 0.0  # Weight decay for AdamW
+    momentum: 0.9  # Momentum for SGD
+    beta1: 0.9  # Beta1 for Adam/AdamW
+    beta2: 0.999  # Beta2 for Adam/AdamW
+
+# --- Distributed Training ---
+distributed:
+  # Communication backend for distributed training
+  backend: "nccl"
+  # Whether to use gradient checkpointing to save memory
+  gradient_checkpointing: false
+  # Whether to use ZeRO optimizer to save memory
+  zero_optimization: false
+  # Whether to use mixed precision training
+  fp16: false
+  # Whether to use bf16 precision training (if supported by hardware)
+  bf16: false
+  # Whether to use sharded data parallelism
+  sharded_ddp: false
+
+# --- Logging ---
+logging:
+  use_wandb: true
+  wandb_project: "ript-pi0"
+  wandb_entity: null # Your wandb entity, e.g., username
+  wandb_mode: "offline" # 设置为离线模式，避免用户交互
+  # Log frequency in steps
+  log_freq: 1
+  # Whether to log gradients and parameters
+  log_gradients: false 

@@ -1,0 +1,68 @@
+# 第9阶段调试配置 - 配置系统升级测试
+exp_name: pi0_stage9_config_test
+
+# --- 路径配置 ---
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./pi0/ript/output"  
+norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json"
+
+# --- 任务和环境 ---
+task:
+  benchmark_name: "libero_goal"          # ① 切换基准
+  task_name: 0                           # ② 选定任务（可写索引或字符串）
+  # 可选：列出完整任务名，便于索引回退
+  task_names_to_use:
+    - "LIBERO_GOAL_move_the_blue_mug_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_green_bowl_to_the_target_pose"
+    # …按需继续补充
+  num_parallel_envs: 1
+  max_episode_length: 200
+
+# --- 算法配置 ---
+algo:
+  # 减小参数以便快速测试
+  rloo_batch_size: 2          # 每个初始状态的轨迹数
+  num_epochs: 2               # 训练epochs  
+  data_batch_size: 2          # 每轮收集的batch数
+  gradient_accumulation_steps: 1
+  lr: 1e-5
+  grad_norm_clip: 1.0
+  
+  # 动态采样配置
+  enable_dynamic_sampling: true
+  enable_rollout_stats_tracking: true
+  rollout_skip_threshold: 2   # 降低跳过阈值便于测试
+  rollout_stats_path: "./pi0/ript/output/stage9_rollout_stats.json"
+  use_val_init: false
+
+# --- 训练配置 ---  
+training:
+  num_train_steps: 3          # 只运行3轮便于调试
+  seed: 42
+  save_freq: 2
+  save_best: true
+  use_mixed_precision: false
+  
+  optimizer:
+    type: "AdamW"
+    weight_decay: 0.01
+    momentum: 0.9
+    beta1: 0.9
+    beta2: 0.999
+
+# --- 日志配置 ---
+logging:
+  use_wandb: false           # 调试时关闭wandb
+  wandb_project: "ript-pi0-stage9"
+  wandb_entity: null
+  wandb_mode: "offline"
+  log_freq: 1
+  log_gradients: false
+
+# --- 增强采样配置 ---
+enhanced_sampling:
+  enable_smart_filtering: true
+  max_sampling_attempts: 10  # 减少尝试次数便于调试
+  debug_sampling: true       # 启用详细调试输出
+  save_videos: true
+  video_dir: "rollout_videos_stage9"

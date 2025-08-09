@@ -1,0 +1,82 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.pyo
+*.pdb
+*.egg-info/
+*.egg
+*.manifest
+*.spec
+
+# Jupyter Notebook检查点
+.ipynb_checkpoints/
+
+# VSCode/IDE配置
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# 临时文件
+*.swp
+*.bak
+*.tmp
+*~
+.DS_Store
+Thumbs.db
+
+# 编译产物
+build/
+dist/
+*.o
+*.a
+*.out
+*.log~
+
+# 环境/依赖
+.env
+.venv
+venv/
+ENV/
+
+# 日志、图像、数据集、检查点等（全部屏蔽）
+output/
+checkpoints/
+dataset/
+logs/
+images/
+libero_task_videos/
+rollout_videos_stage9/
+quick_test_videos/
+wandb/
+report/
+LIBERO/
+lerobot_dataset/
+lerobot/
+CleanDiffuser/
+*.log
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.ckpt
+*.pth
+*.pt
+
+# 屏蔽所有名字中带有test的文件和文件夹
+test*
+*test*
+*/test*/

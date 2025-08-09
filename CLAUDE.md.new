@@ -1,0 +1,435 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Repository Overview
+
+This is a simplified PyTorch implementation of LeRobot's PI0 and PI0-fast Vision-Language-Action (VLA) models, based on Physical Intelligence's OpenPI checkpoints. The repository provides fixes, optimizations, comprehensive usage documentation, and a complete RIPT (Reinforcement Learning with Image-based Trajectory Prediction) framework for distributed RL fine-tuning.
+
+**Critical Note**: This repository includes extensive debugging and testing files that help diagnose common issues. Many files starting with `test_` are diagnostic tools for specific problems that arose during development.
+
+## Recent Major Enhancements
+
+The repository has recently been enhanced with production-ready features including:
+
+- **Stage 11 RIPT-VLA Integration**: Complete integration of RIPT-VLA parallel environment architecture with simplified training pipeline
+- **Advanced Parallel Environment Support**: True SubprocVectorEnv-based parallel execution with 3.00x speedup
+- **RIPT-VLA Style Training**: Simplified architecture inspired by RIPT-VLA's direct training approach
+- **Enhanced Testing Infrastructure**: Comprehensive parallel functionality testing and validation
+- **File-based Distributed Coordination**: `FileGlobalCounter` system for robust multi-process coordination
+- **Intelligent Memory Management**: Automatic GPU memory analysis and strategy selection for parallel training
+
+## Staged Development Architecture
+
+The codebase follows a **11-stage progressive development approach** from basic inference to production-ready distributed training:
+
+- **Stages 1-6**: `scripts/` directory - Basic inference and environment integration
+- **Stage 7**: `7_train_with_rl_core.py` - Core RL training implementation
+- **Stage 8**: `8_train_with_epochs.py` - Smart sampling and batch processing
+- **Stage 9**: `9_train_with_config.py` - YAML configuration system
+- **Stage 10**: `10_train_with_distributed.py` - Multi-GPU distributed training
+- **Stage 11**: `11_train_ript_vla_style.py` & `11_train_with_ript_vla.py` - RIPT-VLA integration and simplified architecture
+
+Each stage builds incrementally on the previous ones, maintaining backward compatibility while adding sophisticated features.
+
+## Core Architecture
+
+### Key Components
+
+1. **PI0 Policy Models** (`pi0/` directory):
+   - `modeling_pi0.py`: Main PI0 policy implementation with Flow Matching and critical image format fixes
+   - `modeling_pi0fast.py`: Optimized PI0-fast variant
+   - `paligemma_with_expert.py`: Vision-language model backbone
+
+2. **RIPT RL Training Framework** (`pi0/ript/` directory):
+   - `scripts/train_ript_pi0.py`: Distributed RL training script using CFG-style advantage weighting
+   - `algos/rl_optimizers/`: Core RL optimization algorithms
+     - `pi0_cfg_interface.py`: Critical adapter layer between PI0Policy and RIPT framework
+     - `rl_optimizer_pi0_cfg.py`: CFG-style RL optimizer with Leave-One-Out advantage computation
+     - `rollout_generator.py`: Trajectory generation and data collection
+     - `file_counter.py`: Distributed coordination for multi-process training with atomic file operations
+     - `enhanced_rollout_generator.py`: Advanced rollout generation with smart sampling and early stopping
+   - `env/pi0_libero_runner.py`: Original LIBERO environment runner
+   - `env/pi0_libero_runner_ript_vla.py`: RIPT-VLA style parallel environment runner
+   - `utils/`: LIBERO-specific utilities and policy wrappers
+   - `config/`: Training configuration files with feature toggles and parallel environment settings
+
+3. **Stage 11 RIPT-VLA Integration**:
+   - `11_train_ript_vla_style.py`: Simplified RIPT-VLA style training with direct architecture
+   - `11_train_with_ript_vla.py`: Full-featured Stage 11 with complex component integration
+   - `pi0/ript/env/pi0_libero_runner_ript_vla.py`: True parallel environment runner based on RIPT-VLA patterns
+
+4. **Model Conversion** (`conversion_scripts/`):
+   - `convert_pi0_to_hf_lerobot.py`: Converts JAX checkpoints from OpenPI to PyTorch format
+   - Preserves normalization statistics essential for inference
+
+5. **Environment Integration**:
+   - **CleanDiffuser/**: Primary LIBERO environment integration (used by RIPT training)
+   - **LIBERO/**: Official LIBERO benchmark tasks and utilities  
+   - **lerobot/**: Extended LeRobot framework with backward compatibility layers
+
+6. **Testing and Debugging Infrastructure**:
+   - Multiple `test_*.py` files for diagnosing specific issues
+   - `test_parallel_functionality.py`: Comprehensive parallel environment testing
+   - `test_stage11_*.py`: Stage 11 specific validation and testing
+   - `test_enhanced_features.py`: Production-ready test suite
+   - `quick_single_gpu_test.py`: Fast system validation
+
+## Essential Development Commands
+
+### Prerequisites and Installation
+Install core dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+For RIPT training, additional dependencies are required (already included in requirements.txt):
+- hydra-core, robosuite, gym for RL training
+- bddl for LIBERO environment tasks
+- moviepy, imageio for video generation and analysis
+
+### Model Conversion
+Convert OpenPI JAX checkpoints to PyTorch:
+```bash
+python conversion_scripts/convert_pi0_to_hf_lerobot.py \
+    --checkpoint_dir /path/to/jax/checkpoint/params \
+    --output_path /path/to/pytorch/checkpoint
+```
+
+**Important**: Always preserve the original JAX checkpoint directory as it contains `norm_stats.json` which is critical for proper model inference.
+
+### Running Inference
+Basic inference test:
+```bash
+python 1_e2e_inference.py
+```
+
+Libero environment demos:
+```bash
+python test/libero_demo_lerobot.py
+python 2_test_pi0_on_libero.py
+```
+
+### Stage 11 RIPT-VLA Training
+
+**RIPT-VLA Style Training (Recommended - Simplified Architecture):**
+```bash
+cd /zhaohan/ZJH/openpi_pytorch
+
+# Single environment test
+python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_test.yaml
+
+# Parallel environment test (3x speedup)
+python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_parallel_test.yaml
+```
+
+**Full Stage 11 Training (Complex Components):**
+```bash
+# Original runner
+python 11_train_with_ript_vla.py --config_path pi0/ript/config/stage11_test.yaml
+
+# RIPT-VLA runner
+python 11_train_with_ript_vla.py --config_path pi0/ript/config/stage11_ript_vla.yaml
+```
+
+### Legacy RIPT RL Training
+Train PI0 with reinforcement learning using RIPT framework:
+
+**Single GPU Training:**
+```bash
+cd /zhaohan/ZJH/openpi_pytorch
+python pi0/ript/scripts/train_ript_pi0.py --config_path pi0/ript/config/train_pi0_cfg_rl.yaml
+```
+
+**Multi-GPU Distributed Training:**
+```bash
+# Standard 4GPU training
+./scripts/launch_distributed_training.sh \
+    --config pi0/ript/config/distributed_train_pi0.yaml --gpus 4
+
+# Large-scale 8GPU training
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+./scripts/launch_distributed_training.sh \
+    --config pi0/ript/config/distributed_train_pi0.yaml --gpus 8
+```
+
+**Configuration-based Training (Stage 9-10):**
+```bash
+# YAML configuration system
+python 9_train_with_config.py --config_path pi0/ript/config/debug_train_stage9.yaml
+
+# Distributed configuration system  
+python 10_train_with_distributed.py --config_path pi0/ript/config/distributed_train_pi0.yaml
+```
+
+### Testing and Validation Commands
+```bash
+# Environment setup validation
+export DEBUG_SAVE_PROCESSED=1      # Save processed images for debugging
+export PI0_DEBUG_SAVE_VIDEO=true   # Enable rollout video generation
+export TOKENIZERS_PARALLELISM=false # Fix tokenizer warnings
+
+# Stage 11 specific testing
+python test_parallel_functionality.py      # Test parallel environment functionality
+python test_stage11_integration.py         # Comprehensive Stage 11 validation
+python test_ript_vla_integration.py        # RIPT-VLA integration tests
+
+# Comprehensive system validation (RECOMMENDED for new setups)
+python test_enhanced_features.py           # Full RIPT-VLA functionality test
+python quick_single_gpu_test.py --config_path pi0/ript/config/single_gpu_test.yaml
+
+# Core system validation
+python 1_e2e_inference.py                  # Basic inference test
+python test/test_ript_normalization.py     # Test normalization consistency
+python test/test_ript_training_quick.py    # Test core training components
+python test/check_libero_format.py         # Verify LIBERO image format
+
+# Component import validation
+python -c "from pi0.modeling_pi0 import PI0Policy; print('✓ PI0 import successful')"
+python -c "from pi0.ript.reward_function import BinarySuccessReward; print('✓ RIPT import successful')"
+python -c "from pi0.ript.env.pi0_libero_runner_ript_vla import PI0LiberoRunner; print('✓ RIPT-VLA Runner import successful')"
+
+# Parallel environment and distributed coordination testing
+python test_file_counter_integration.py   # Test distributed coordination
+python test_parallel_envs.py              # Test parallel environment functionality
+python test_parallel_functionality.py     # Comprehensive parallel testing
+
+# Performance analysis (when investigating issues)
+python test/test_ript_vs_original.py      # Compare RIPT vs reference implementation
+python test/analyze_inference_differences.py # Detailed inference analysis
+```
+
+### Development Environment Setup
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Set up LIBERO environment (for RIPT training)
+# CleanDiffuser and LIBERO should be included in requirements.txt
+
+# Verify GPU setup for distributed training
+nvidia-smi
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+```
+
+## Critical Architecture Details
+
+### Stage 11 RIPT-VLA Integration
+Stage 11 represents a major architectural evolution with two implementation approaches:
+
+**1. RIPT-VLA Style (11_train_ript_vla_style.py) - Recommended**:
+- Direct training loop without complex abstraction layers
+- Simplified component architecture inspired by RIPT-VLA
+- Direct SubprocVectorEnv parallel execution
+- 3.00x speedup with parallel environments
+
+**2. Full Integration (11_train_with_ript_vla.py)**:
+- Complete integration of existing RIPT components
+- Intelligent runner selection (original vs RIPT-VLA)
+- Backward compatibility with all previous stages
+- Support for complex rollout generation and optimization
+
+### Parallel Environment Architecture
+The RIPT-VLA integration provides true parallel environment execution:
+
+```python
+# Core parallel environment creation (RIPT-VLA style)
+def create_env(self, env_name):
+    env_factory = lambda: get_env(task)
+    env = SubprocVectorEnv([env_factory for _ in range(env_num)])
+    return env, task_id, env_num
+```
+
+**Performance Characteristics**:
+- 3.00x speedup with 3 parallel environments
+- Automatic memory optimization and fallback strategies
+- Intelligent subprocess management and cleanup
+
+### RIPT System Integration
+The RIPT framework implements CFG-style reinforcement learning for PI0 policies with enhanced parallel support:
+
+1. **Flow Matching + CFG-RL**: PI0 uses time-based interpolation for action generation, optimized with classifier-free guidance style advantage weighting
+2. **Parallel Environment Training**: True SubprocVectorEnv-based parallel execution
+3. **LIBERO Integration**: 32D policy actions mapped to 7D LIBERO environment actions (6-DOF pose + gripper)
+4. **Advantage Computation**: Leave-One-Out baseline for trajectory-level advantage estimation without value networks
+5. **Smart Sampling**: Enhanced sampling system with state history tracking and intelligent state selection
+
+### Progressive Training Pipeline Evolution
+The training system evolved through multiple stages:
+
+- **Stage 7-8**: Core RL training with smart sampling and batch processing
+- **Stage 9**: Configuration management with YAML support and parameter validation
+- **Stage 10**: Production-ready distributed training with PyTorch DDP
+- **Stage 11**: RIPT-VLA integration with simplified architecture and true parallel environments
+
+Each stage maintains full backward compatibility while adding sophisticated features.
+
+### Key Input/Output Interfaces
+The PI0 model processes multi-modal inputs through standardized interfaces:
+
+**Core Prediction Interface** (`pi0/modeling_pi0.py:55`):
+```python
+# Main inference method
+action = policy.select_action(observation)
+
+# Expected observation format:
+observation = {
+    "image": {
+        "base_0_rgb": torch.tensor,      # (B, 3, 224, 224) uint8 [0, 255]
+        "left_wrist_0_rgb": torch.tensor, # Optional additional camera views
+    },
+    "state": torch.tensor,               # (B, state_dim) float32 robot state
+    "prompt": ["task description"],      # List of task instructions
+}
+```
+
+**RIPT-VLA Integration Points**:
+- `PI0LiberoRunner.create_env()`: Creates true parallel SubprocVectorEnv environments
+- `PI0LiberoRunner.run_policy_in_env()`: Executes parallel rollouts with intelligent batching
+- Action post-processing includes denormalization and state offset addition
+
+## Configuration System
+
+### Stage 11 Configuration Files
+Training uses YAML configuration files in `pi0/ript/config/`:
+- `stage11_test.yaml`: Single environment testing with original runner
+- `stage11_ript_vla.yaml`: RIPT-VLA runner with parallel environments
+- `stage11_parallel_test.yaml`: Comprehensive parallel functionality testing
+- `train_pi0_cfg_rl.yaml`: Full training configuration (legacy)
+- `debug_train_pi0.yaml`: Minimal configuration for testing
+
+### Feature Flags
+Modern configuration system with granular feature control:
+- `use_ript_vla_runner`: Enable RIPT-VLA parallel environment runner
+- `enable_task_polling`: Dynamic task assignment and load balancing
+- `enable_parallel_envs`: Parallel environment processing with automatic optimization
+- `enable_smart_sampling`: Intelligent state sampling based on success history
+
+## Checkpoint Structure
+```
+checkpoints/
+├── pi0_libero_pytorch/          # Converted PyTorch model
+│   ├── config.json              # Model configuration
+│   ├── model.safetensors        # Model weights
+│   ├── norm_stats.json          # Critical normalization data
+│   └── tokenizer files...
+└── original_jax_checkpoint/     # Keep for norm_stats.json
+    ├── params/                  # JAX parameters
+    └── norm_stats.json          # Critical normalization data
+```
+
+## Common Issues and Solutions
+
+### Stage 11 Specific Issues
+
+**Runner Selection Problems**:
+- Use `features.use_ript_vla_runner: true` in config to enable RIPT-VLA runner
+- Verify both runners are available: `PI0LiberoRunner` and `LIBEROEnvRunner`
+- Check import errors with component validation tests
+
+**Parallel Environment Memory Issues**:
+- **Root Cause**: SubprocVectorEnv can cause GPU memory overflow with large models
+- **Detection**: Monitor GPU memory usage during parallel environment creation
+- **Solution**: RIPT-VLA runner automatically handles memory optimization
+- **Manual Override**: Adjust `num_parallel_envs` in config files
+
+**Configuration Type Errors**:
+- **Issue**: YAML parsing can convert scientific notation to strings
+- **Solution**: Stage 11 includes automatic type conversion for learning rates and numeric values
+- **Example**: `lr: 1e-5` is automatically converted from string to float
+
+### Legacy Issues (Still Relevant)
+
+**Import Errors**:
+If you encounter `ModuleNotFoundError: No module named 'lerobot.constants'`:
+- Ensure `/zhaohan/ZJH/lerobot` is in Python path
+- Check that compatibility layer files exist in `lerobot/lerobot/`
+
+**RIPT Training Issues**:
+If RIPT training fails:
+- Verify all RIPT dependencies are installed
+- Check LIBERO environment setup and EGL/OpenGL configuration
+- Ensure checkpoint paths in config files are correct
+- **Stage Selection**: 
+  - Stage 11 for latest RIPT-VLA integration
+  - Stage 9-10 for configuration-based training
+  - Stage 7-8 for development and debugging
+
+**FileGlobalCounter Issues**:
+If distributed coordination fails:
+- Ensure sufficient disk space for counter files in `./distributed_counters/`
+- Check file permissions for counter file creation
+- Use `test_file_counter_integration.py` to validate setup
+
+**Path Configuration**:
+- JAX checkpoint paths must be preserved for `norm_stats.json` access
+- PyTorch checkpoints require accompanying tokenizer files
+- RIPT training scripts must be run from project root directory (`/zhaohan/ZJH/openpi_pytorch`)
+
+## Development Notes
+
+### Current Implementation Status
+The repository has reached production readiness with Stage 11 RIPT-VLA integration:
+
+**Stage 11 Features (✅ Complete)**:
+- RIPT-VLA parallel environment integration
+- Simplified training architecture inspired by RIPT-VLA
+- True SubprocVectorEnv parallel execution with 3.00x speedup
+- Intelligent runner selection and backward compatibility
+- Comprehensive parallel functionality testing
+
+**Core Features (✅ Complete)**:
+- PI0/PI0-fast model implementations with JAX-to-PyTorch conversion
+- RIPT RL training framework with CFG-style advantage weighting  
+- Enhanced smart sampling with state history tracking
+- YAML-based configuration management system
+- Multi-GPU distributed training with PyTorch DDP
+
+### Production Training Recommendations
+- **Latest (Stage 11)**: Use RIPT-VLA style training for best performance and simplicity
+- **Parallel Training**: Use Stage 11 parallel configurations for 3x speedup
+- **Development**: Use Stage 7-8 scripts for rapid iteration
+- **Configuration**: Use Stage 9 for parameterized experiments  
+- **Distributed**: Use Stage 10 for multi-GPU distributed training
+- **System Validation**: Always run `test_parallel_functionality.py` and `test_stage11_integration.py` before production deployments
+
+### Configuration Recommendations
+- **Simplified Training**: Use `11_train_ript_vla_style.py` with `stage11_test.yaml`
+- **Parallel Testing**: Use `stage11_parallel_test.yaml` for 3-environment parallel execution
+- **RIPT-VLA Runner**: Use `stage11_ript_vla.yaml` for full RIPT-VLA integration
+- **Legacy Support**: Use `pi0/ript/config/single_gpu_test.yaml` for backward compatibility
+
+### Memory Optimization Techniques
+The Stage 11 system automatically handles memory optimization:
+
+1. **Parallel Environment Detection**: Automatically detects optimal parallel environment count
+2. **Memory Analysis**: Real-time GPU memory monitoring and threshold management
+3. **Intelligent Fallbacks**: Seamless switching between parallel and batch processing
+4. **Process Management**: Automatic subprocess cleanup and resource management
+
+### Enhanced Testing Framework
+Stage 11 includes comprehensive testing infrastructure:
+
+**Parallel Functionality Testing** (`test_parallel_functionality.py`):
+- SubprocVectorEnv parallel execution validation
+- Performance benchmarking and speedup measurement
+- Memory usage analysis and optimization verification
+- Process lifecycle management testing
+
+**Integration Testing** (`test_stage11_*.py`):
+- Component integration validation
+- Runner selection logic testing
+- Configuration system validation
+- Backward compatibility verification
+
+**Usage Examples**:
+```bash
+# Test parallel functionality (recommended for new setups)
+python test_parallel_functionality.py
+
+# Comprehensive Stage 11 validation
+python test_stage11_integration.py
+
+# Quick system validation
+python quick_single_gpu_test.py --config_path pi0/rift/config/stage11_test.yaml
+```

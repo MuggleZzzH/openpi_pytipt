@@ -1,0 +1,621 @@
+import os
+import sys
+import torch
+import numpy as np
+from typing import List, Dict, Any, Tuple, Optional, Union, Callable
+from datetime import datetime
+import imageio
+from pathlib import Path
+import json
+import multiprocessing
+import gc
+
+# 导入LIBERO相关的变换函数 —— 若失败直接抛异常，与官方脚本保持一致
+try:
+    import robosuite.utils.transform_utils as T
+except ImportError as e:
+    raise ImportError("robosuite is required for LIBEROEnvRunner but not found") from e
+
+# 导入并行环境支持
+try:
+    from libero.libero.envs import SubprocVectorEnv
+    VECTOR_ENV_AVAILABLE = True
+except ImportError:
+    print("⚠️ SubprocVectorEnv不可用，将使用串行环境")
+    VECTOR_ENV_AVAILABLE = False
+
+# 调试设置
+DEBUG_SAVE_IMAGES = False  # 禁用单独图像保存，只保留视频
+DEBUG_SAVE_VIDEO = os.environ.get("PI0_DEBUG_SAVE_VIDEO", "true").lower() in ("true", "1", "yes")
+DEBUG_IMAGE_DIR = os.environ.get("PI0_DEBUG_IMAGE_DIR", "ript/debug_images")
+
+class LIBEROEnvRunner:
+    """LIBERO环境运行器，提供PI0策略在LIBERO环境中的运行机制"""
+    
+    def __init__(self, policy=None, benchmark_name=None, rollouts_per_env=1, 
+                 num_parallel_envs=1, max_episode_length=500, task_names_to_use=None,
+                 config=None, rank=0, world_size=1, norm_stats_path=None):
+        """初始化LIBERO环境运行器"""
+        # 存储参数
+        self.policy = policy
+        self.benchmark_name = benchmark_name
+        self.rollouts_per_env = rollouts_per_env
+        self.num_parallel_envs = num_parallel_envs
+        self.max_episode_length = max_episode_length
+        self.task_names_to_use = task_names_to_use or []
+        self.task_names = task_names_to_use or []  # 兼容性别名，供rollout_generator使用
+        self.max_steps = max_episode_length if max_episode_length is not None else 500
+        
+        # ✅ 存储分布式训练参数
+        self.config = config
+        self.rank = rank
+        self.world_size = world_size
+        
+        # 🔥 新增：任务轮询机制
+        self.assigned_tasks = task_names_to_use or []  # 分配给当前进程的任务列表
+        self.task_cursor = 0                          # 任务轮询索引
+        self.current_task = None                      # 当前正在处理的任务
+        
+        # 初始化当前任务
+        if self.assigned_tasks:
+            self.current_task = self.assigned_tasks[0]
+            if self.rank == 0:
+                print(f"🎯 LIBEROEnvRunner初始化: 分配任务 {self.assigned_tasks}, 当前任务: {self.current_task}")
+        else:
+            if self.rank == 0:
+                print(f"⚠️ LIBEROEnvRunner初始化: Rank {self.rank} 没有分配任务")
+        
+        # 调试选项
+        self.debug_save_images = DEBUG_SAVE_IMAGES
+        self.debug_save_video = DEBUG_SAVE_VIDEO
+        self.debug_image_dir = DEBUG_IMAGE_DIR
+        
+        # 加载归一化统计信息
+        self._load_norm_stats(norm_stats_path)
+        
+    def _load_norm_stats(self, norm_stats_path: Optional[str] = None):
+        """Load normalization statistics from norm_stats.json"""
+        if norm_stats_path is None:
+            # 尝试在常见位置找到norm_stats.json
+            possible_paths = [
+                "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch/norm_stats.json",
+                "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json", 
+                "./checkpoints/pi0_libero_pytorch/norm_stats.json",
+                "./norm_stats.json"
+            ]
+            
+            for path in possible_paths:
+                if Path(path).exists():
+                    norm_stats_path = path
+                    break
+        
+        if norm_stats_path and Path(norm_stats_path).exists():
+            print(f"LIBEROEnvRunner: Loading norm_stats from: {norm_stats_path}")
+            with open(norm_stats_path) as f:
+                norm_stats = json.load(f)
+                
+            # 提取状态和动作的归一化参数
+            self.state_mean = np.array(norm_stats["norm_stats"]["state"]["mean"][:8], dtype=np.float32)
+            self.state_std = np.array(norm_stats["norm_stats"]["state"]["std"][:8], dtype=np.float32)
+            self.action_mean = np.array(norm_stats["norm_stats"]["actions"]["mean"][:7], dtype=np.float32)
+            self.action_std = np.array(norm_stats["norm_stats"]["actions"]["std"][:7], dtype=np.float32)
+            
+            print(f"✅ LIBEROEnvRunner: Loaded normalization stats for action post-processing")
+        else:
+            raise FileNotFoundError("norm_stats.json not found in expected locations; cannot proceed")
+
+    # 🔥 新增：任务轮询核心方法
+    def set_current_task_by_cursor(self):
+        """根据cursor设置当前任务"""
+        if not self.assigned_tasks:
+            self.current_task = None
+            return None
+        
+        # 使用模运算实现循环轮询
+        self.current_task = self.assigned_tasks[self.task_cursor % len(self.assigned_tasks)]
+        return self.current_task
+    
+    def advance_task_cursor(self):
+        """推进任务cursor到下一个任务"""
+        if not self.assigned_tasks:
+            return None
+        
+        self.task_cursor += 1
+        new_task = self.set_current_task_by_cursor()
+        
+        # 调试输出
+        if self.rank == 0 or len(self.assigned_tasks) > 1:  # 主进程或多任务时输出
+            print(f"🔄 Rank {self.rank}: 任务cursor推进到 {self.task_cursor}, 当前任务: {new_task}")
+        
+        return new_task
+    
+    def get_current_task(self):
+        """获取当前任务"""
+        return self.current_task
+    
+    def has_tasks(self):
+        """检查是否有分配的任务"""
+        return len(self.assigned_tasks) > 0
+    
+    def construct_pi0_observation(self, obs, task_description):
+        """构造PI0需要的观测格式，完全模仿2_test_pi0_on_libero.py的做法"""
+        # 获取设备
+        device = self.policy.config.device if hasattr(self.policy, 'config') else 'cuda:0'
+        
+        # 状态处理
+        import robosuite.utils.transform_utils as T
+        
+        axis_angle = T.quat2axisangle(obs["robot0_eef_quat"])
+            
+        unnorm_state = np.concatenate([
+            obs["robot0_eef_pos"],                    # 3D: end-effector position
+            axis_angle, # 3D: rotation as axis-angle  
+            obs["robot0_gripper_qpos"],               # 2D: gripper joint positions
+        ], dtype=np.float32)
+        print(">> gripper_qpos shape:", np.asarray(obs["robot0_gripper_qpos"]).shape)
+        # 状态归一化
+        state = (unnorm_state - self.state_mean) / (self.state_std + 1e-6)
+        
+        # 图像处理
+        base_0_rgb = obs["agentview_image"][:, :, ::-1].copy()
+        left_wrist_0_rgb = obs["robot0_eye_in_hand_image"][:, :, ::-1].copy()
+        
+        # 构造观测格式
+        observation = {
+            "image": {
+                "base_0_rgb": torch.from_numpy(base_0_rgb).to(device)[None],
+                "left_wrist_0_rgb": torch.from_numpy(left_wrist_0_rgb).to(device)[None],
+            },
+            "state": torch.from_numpy(state).to(device)[None],
+            "prompt": [task_description],
+        }
+        
+        return observation
+    
+    def denormalize_action(self, action: np.ndarray) -> np.ndarray:
+        """Denormalize action using loaded statistics"""
+        return action * (self.action_std + 1e-6) + self.action_mean
+    
+    def get_unnormalized_state(self, obs) -> np.ndarray:
+        """从观测中提取未归一化的状态（用于动作偏移）"""
+        try:
+            if isinstance(obs, list) and len(obs) > 0:
+                obs = obs[0]  # 取第一个环境的观测
+            
+            if not isinstance(obs, dict) or not obs:
+                raise RuntimeError("Required observation dict missing or empty")
+            
+            # 使用 end-effector 信息
+            if "robot0_eef_pos" in obs and "robot0_eef_quat" in obs:
+                eef_pos = np.array(obs["robot0_eef_pos"], dtype=np.float32)
+                eef_quat = np.array(obs["robot0_eef_quat"], dtype=np.float32)
+                
+                if eef_pos.size != 3 or eef_quat.size != 4:
+                    raise RuntimeError("Observation fields robot0_eef_pos or robot0_eef_quat have incorrect dimensions")
+                
+                # 转换四元数为轴角
+                try:
+                    axis_angle = T.quat2axisangle(eef_quat).astype(np.float32)
+                except Exception as e:
+                    raise RuntimeError(f"Failed to convert quaternion to axis-angle: {e}")
+                
+                # 获取 gripper 状态
+                if "robot0_gripper_qpos" not in obs:
+                    raise RuntimeError("Observation missing required field robot0_gripper_qpos")
+                try:
+                    gripper_qpos = float(obs["robot0_gripper_qpos"][0])
+                except (IndexError, TypeError, ValueError) as e:
+                    raise RuntimeError(f"Invalid robot0_gripper_qpos value: {e}")
+                
+                # 构造未归一化的状态
+                unnorm_state = np.concatenate([eef_pos[:3], axis_angle[:3], [gripper_qpos]]).astype(np.float32)
+                return unnorm_state
+                
+            # 官方脚本要求上述关键字段均存在，若缺失则立即报错
+            else:
+                raise RuntimeError("Observation missing required end-effector fields")
+                
+        except Exception as e:
+            raise
+    
+    def make_env(self, env_name: str):
+        """创建LIBERO环境"""
+        try:
+            import gym
+            from cleandiffuser.env import libero  # 确保环境注册
+            
+            # 使用与参考实现2_test_pi0_on_libero.py完全相同的环境配置
+            benchmark_to_env_id = {
+                'libero_spatial': 'libero-spatial-v0',
+                'libero_object': 'libero-object-v0',
+                'libero_goal': 'libero-goal-v0',
+                'libero_10': 'libero-10-v0',
+                'libero_90': 'libero-90-v0'
+            }
+
+            if self.benchmark_name not in benchmark_to_env_id:
+                raise ValueError(f"Unknown benchmark_name: {self.benchmark_name}")
+
+            env_id = benchmark_to_env_id[self.benchmark_name]
+            task_id = 9  # 与参考实现保持一致
+            
+            # 创建环境
+            env = gym.make(
+                env_id,
+                task_id=task_id,
+                image_size=224,  # 匹配PI0的输入尺寸
+                camera_names=["agentview", "robot0_eye_in_hand"],  # 匹配原始demo
+                seed=0,  # 使用与参考实现相同的随机种子
+            )
+            
+            # 获取任务描述
+            if hasattr(env, 'task_description'):
+                task_description = env.task_description
+            else:
+                task_description = env_name
+                
+            return env, task_description
+            
+        except Exception as e:
+            raise RuntimeError(f"创建环境失败: {e}") from e
+    
+    def create_env(self, env_name: str):
+        """创建单个环境（用于并行环境）"""
+        env, task_description = self.make_env(env_name)
+        return env, env_name, 1
+    
+    def create_parallel_envs(self, env_name: str):
+        """创建并行环境，模仿原版RIPT的实现"""
+        if not VECTOR_ENV_AVAILABLE or self.num_parallel_envs <= 1:
+            # 如果不支持并行环境或只需要1个环境，使用单个环境
+            if self.rank == 0:
+                print(f"使用单个环境 (num_parallel_envs={self.num_parallel_envs})")
+            env, task_description = self.make_env(env_name)
+            return env, env_name, 1
+        
+        # 设置多进程启动方法
+        if multiprocessing.get_start_method(allow_none=True) != "spawn":
+            multiprocessing.set_start_method("spawn", force=True)
+            if self.rank == 0:
+                print("设置multiprocessing启动方法为'spawn'")
+        
+        # 计算实际并行环境数量
+        env_num = min(self.num_parallel_envs, self.rollouts_per_env)
+        
+        if self.rank == 0:
+            print(f"创建 {env_num} 个并行环境用于任务 {env_name}")
+        
+        # 创建环境工厂函数
+        def env_factory():
+            try:
+                env, _ = self.make_env(env_name)
+                return env
+            except Exception as e:
+                print(f"环境工厂函数创建环境失败: {e}")
+                raise
+        
+        # 创建并行环境
+        try:
+            parallel_env = SubprocVectorEnv([env_factory for _ in range(env_num)])
+            if self.rank == 0:
+                print(f"✅ 成功创建 {env_num} 个并行环境")
+            return parallel_env, env_name, env_num
+        except Exception as e:
+            if self.rank == 0:
+                print(f"❌ 并行环境创建失败: {e}")
+                print("回退到单个环境")
+            env, task_description = self.make_env(env_name)
+            return env, env_name, 1
+        
+    def run_policy_in_env(self, env_name, all_init_states=None, debug_save_video=None, created_env=None):
+        """在环境中运行策略，生成轨迹 - 支持并行和串行环境"""
+        save_video = debug_save_video if debug_save_video is not None else self.debug_save_video
+        
+        if created_env is None:
+            # 自动创建并行环境
+            env, env_id, env_num = self.create_parallel_envs(env_name)
+        else:
+            env, env_id, env_num = created_env
+        
+        if all_init_states is None:
+            # 如果没有提供初始状态，生成默认状态
+            all_init_states = np.zeros((self.rollouts_per_env, 8), dtype=np.float32)
+        
+        try:
+            if env_num > 1 and hasattr(env, 'reset') and hasattr(env, 'step_async'):
+                # 使用真正的并行环境
+                yield from self._run_parallel_episodes(env, env_name, all_init_states, env_num, save_video)
+            else:
+                # 使用串行环境（兼容模式）
+                yield from self._run_serial_episodes(env, env_name, all_init_states, save_video)
+        
+        finally:
+            # 清理环境
+            try:
+                if hasattr(env, 'close'):
+                    env.close()
+                gc.collect()
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"环境清理时出错: {e}")
+    
+    def _run_parallel_episodes(self, env, env_name, all_init_states, env_num, save_video):
+        """运行并行episodes"""
+        if self.rank == 0:
+            print(f"🚀 开始并行执行 {env_num} 个环境")
+        
+        # 计算需要的轮次
+        eval_loop_num = (self.rollouts_per_env + env_num - 1) // env_num
+        count = 0
+        
+        while count < eval_loop_num:
+            # 选择当前轮次的初始状态
+            start_idx = count * env_num
+            end_idx = min(start_idx + env_num, len(all_init_states))
+            indices = np.arange(start_idx, end_idx) % len(all_init_states)
+            current_init_states = all_init_states[indices]
+            
+            if self.rank == 0:
+                print(f"并行轮次 {count+1}/{eval_loop_num}, 状态索引: {indices}")
+            
+            # 并行执行episodes
+            try:
+                results = self._run_single_parallel_batch(env, env_name, current_init_states, env_num, save_video)
+                
+                # 返回结果
+                for result in results:
+                    yield result
+                    
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"并行批次执行失败: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            count += 1
+    
+    def _run_single_parallel_batch(self, env, env_name, init_states, env_num, save_video):
+        """执行单个并行批次"""
+        # 重置所有环境
+        obs_list = env.reset()
+        if not isinstance(obs_list, list):
+            obs_list = [obs_list]
+        
+        # 对每个环境进行热身
+        dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
+        for warmup_step in range(20):
+            actions = [dummy_action] * len(obs_list)
+            obs_list, _, _, _ = env.step(actions)
+        
+        # 初始化episode数据
+        episodes_data = []
+        for i in range(len(obs_list)):
+            episodes_data.append({
+                'observations': [obs_list[i]],
+                'actions': [],
+                'rewards': [],
+                'dones': [],
+                'infos': [],
+                'success': False,
+                'total_reward': 0.0,
+                'step': 0,
+                'action_buffer': None,
+                'action_index': 0
+            })
+        
+        max_steps = self.max_steps
+        all_done = False
+        
+        # 并行执行steps
+        while not all_done:
+            actions_to_execute = []
+            
+            # 为每个环境准备动作
+            for i, obs in enumerate(obs_list):
+                episode = episodes_data[i]
+                
+                if episode['dones'] and len(episode['dones']) > 0 and episode['dones'][-1]:
+                    # 如果环境已完成，使用dummy动作
+                    actions_to_execute.append(dummy_action)
+                    continue
+                
+                # 检查是否需要推理新的动作序列
+                if (episode['action_buffer'] is None or 
+                    episode['action_index'] >= episode['action_buffer'].shape[0]):
+                    
+                    # 推理新动作
+                    pi0_obs = self.construct_pi0_observation(obs, env_name)
+                    raw_action = self.policy.select_action(pi0_obs)
+                    action = raw_action[0, :, :7]  # shape: (50, 7)
+                    
+                    # 处理动作
+                    if isinstance(action, torch.Tensor):
+                        action_after_cpu = action.cpu().numpy()
+                    else:
+                        action_after_cpu = action
+                    
+                    # 反归一化和状态偏移
+                    action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
+                    
+                    # 获取状态偏移
+                    unnorm_state = np.concatenate([
+                        obs["robot0_eef_pos"],
+                        T.quat2axisangle(obs["robot0_eef_quat"]),
+                        obs["robot0_gripper_qpos"],
+                    ], dtype=np.float32)
+                    
+                    action_buffer[:, :6] += unnorm_state[None, :6]
+                    
+                    episode['action_buffer'] = action_buffer
+                    episode['action_index'] = 0
+                
+                # 获取当前动作
+                current_action = episode['action_buffer'][episode['action_index'], :7]
+                actions_to_execute.append(current_action)
+                episode['action_index'] += 1
+            
+            # 并行执行动作
+            obs_list, rewards, dones, infos = env.step(actions_to_execute)
+            
+            # 更新episode数据
+            all_done = True
+            for i in range(len(obs_list)):
+                episode = episodes_data[i]
+                
+                # 记录数据
+                episode['observations'].append(obs_list[i])
+                episode['actions'].append(actions_to_execute[i])
+                episode['rewards'].append(rewards[i])
+                episode['dones'].append(dones[i])
+                episode['infos'].append(infos[i])
+                episode['total_reward'] += rewards[i]
+                episode['step'] += 1
+                
+                # 检查成功状态
+                if infos[i].get("success", False) or episode['total_reward'] > 0.5:
+                    episode['success'] = True
+                
+                # 检查是否完成
+                if not dones[i] and episode['step'] < max_steps:
+                    all_done = False
+        
+        # 返回结果
+        results = []
+        for i, episode in enumerate(episodes_data):
+            episode_data = {
+                "observations": episode['observations'],
+                "actions": episode['actions'],
+                "rewards": episode['rewards'],
+                "dones": episode['dones'],
+                "infos": episode['infos'],
+                "task": env_name,
+            }
+            results.append((episode['success'], episode['total_reward'], episode_data))
+        
+        return results
+    
+    def _run_serial_episodes(self, env, env_name, all_init_states, save_video):
+        """运行串行episodes（原有实现的简化版本）"""
+        if self.rank == 0:
+            print(f"使用串行模式执行 {len(all_init_states)} 个episodes")
+        
+        for i, init_state in enumerate(all_init_states):
+            rollout_images = []
+            
+            # 重置环境
+            obs = env.reset()
+            
+            # 热身步骤
+            dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
+            for warmup_step in range(20):
+                obs, _, _, _ = env.step(dummy_action)
+            
+            # 初始化episode数据
+            step = 0
+            done = False
+            total_reward = 0
+            success = False
+            observations = [obs]
+            actions = []
+            rewards = []
+            dones = []
+            infos = []
+            
+            # 收集初始图像
+            if save_video:
+                initial_img = obs["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                rollout_images.append(initial_img)
+            
+            try:
+                action_buffer = None
+                action_index = 0
+                
+                # 执行episode
+                while not done and step < self.max_steps:
+                    # 推理动作
+                    if action_buffer is None or action_index >= action_buffer.shape[0]:
+                        pi0_observation = self.construct_pi0_observation(obs, env_name)
+                        raw_action = self.policy.select_action(pi0_observation)
+                        action = raw_action[0, :, :7]
+                        
+                        if isinstance(action, torch.Tensor):
+                            action_after_cpu = action.cpu().numpy()
+                        else:
+                            action_after_cpu = action
+                        
+                        # 反归一化和状态偏移
+                        action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
+                        
+                        unnorm_state = np.concatenate([
+                            obs["robot0_eef_pos"],
+                            T.quat2axisangle(obs["robot0_eef_quat"]),
+                            obs["robot0_gripper_qpos"],
+                        ], dtype=np.float32)
+                        
+                        action_buffer[:, :6] += unnorm_state[None, :6]
+                        action_index = 0
+                    
+                    # 执行动作
+                    current_action = action_buffer[action_index, :7]
+                    next_obs, reward, done, info = env.step(current_action)
+                    
+                    # 记录数据
+                    observations.append(next_obs)
+                    actions.append(current_action)
+                    rewards.append(reward)
+                    dones.append(done)
+                    infos.append(info)
+                    total_reward += reward
+                    
+                    # 收集图像
+                    if save_video:
+                        frame_img = next_obs["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                        rollout_images.append(frame_img)
+                    
+                    # 更新状态
+                    obs = next_obs
+                    step += 1
+                    action_index += 1
+                    
+                    # 检查成功
+                    if info.get("success", False) or total_reward > 0.5:
+                        success = True
+                    
+                    if done:
+                        break
+            
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"串行episode执行出错: {e}")
+            
+            # 保存视频
+            if save_video and rollout_images:
+                try:
+                    video_dir = Path("pi0/ript/debug_images/videos")
+                    video_dir.mkdir(parents=True, exist_ok=True)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    success_str = "success" if success else "failure"
+                    video_path = video_dir / f"{timestamp}_episode_{i}_{success_str}.mp4"
+                    
+                    writer = imageio.get_writer(str(video_path), fps=30)
+                    for frame in rollout_images:
+                        writer.append_data(frame)
+                    writer.close()
+                    
+                    if self.rank == 0:
+                        print(f"✅ 已保存视频: {video_path}")
+                except Exception as e:
+                    if self.rank == 0:
+                        print(f"保存视频出错: {e}")
+            
+            # 返回结果
+            episode_data = {
+                "observations": observations,
+                "actions": actions,
+                "rewards": rewards,
+                "dones": dones,
+                "infos": infos,
+                "task": env_name,
+            }
+            
+            yield (success, total_reward, episode_data)

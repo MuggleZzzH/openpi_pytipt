@@ -1,0 +1,99 @@
+# 严格按照RIPT-VLA原版逻辑的分布式训练配置
+# 基于 /zhaohan/ZJH/ript-vla 原版实现逻辑
+
+exp_name: pi0_strict_ript_distributed
+
+# --- 路径配置 ---
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./pi0/ript/output/strict_ript_distributed"
+norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json"
+
+# --- 任务配置 (严格原版逻辑) ---
+task:
+  # 🔥 原版逻辑：任务列表通过task_names_to_use指定
+  task_names_to_use:
+    - "LIBERO_SPATIAL_pick_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_from_table_center_and_place_it_on_the_plate"  
+    - "LIBERO_SPATIAL_pick_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate" 
+    - "LIBERO_SPATIAL_pick_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate"
+    - "LIBERO_SPATIAL_pick_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
+  
+  # 🔥 每个任务的并行环境数量
+  num_parallel_envs: 1  # 原版：多任务时使用1个并行环境
+  
+  # 最大episode长度
+  max_episode_length: 200
+
+# --- 算法配置 (严格原版RIPT-VLA逻辑) ---
+algo:
+  # 🔥 RLOO (Leave-One-Out) 批次大小
+  rloo_batch_size: 2    # 原版默认值
+  
+  # 🔥 数据批次大小 (从dataloader获取的样本数)
+  data_batch_size: 4    # 每次从dataloader获取的样本数
+  
+  # 🔥 原版逻辑参数
+  enable_dynamic_sampling: false      # 原版没有动态采样
+  enable_rollout_stats_tracking: true # 原版有统计跟踪
+  rollout_skip_threshold: 3           # 跳过全成功状态的阈值
+  
+  # PPO相关参数 (虽然我们用简化版CFG)
+  ppo_clip_range: 0.2
+  num_ppo_epochs: 1
+  gradient_accumulation_steps: 1
+  grad_norm_clip: 1.0
+
+# --- 训练配置 (严格原版逻辑) ---  
+training:
+  # 🔥 总训练步数 (不是epoch，而是steps)
+  num_train_steps: 10   # 调试用小数值，实际可以设置更大
+  
+  # 随机种子
+  seed: 42
+  
+  # 保存频率
+  save_freq: 5
+  save_best: true
+  
+  # 优化器配置
+  optimizer:
+    type: "Adam"
+    lr: 1e-5
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+
+# --- 分布式配置 ---
+distributed:
+  backend: "nccl"
+  gradient_checkpointing: false
+  zero_optimization: false
+  fp16: false
+  bf16: false
+
+# --- 日志配置 ---
+logging:
+  use_wandb: false  # 简化版本关闭wandb
+  log_freq: 1
+  log_gradients: false
+
+# --- 原版特有配置 ---
+rollout:
+  enabled: false  # 评估rollout，训练期间关闭
+  interval: 1
+
+# --- 数据集配置 (原版逻辑) ---
+train_dataloader:
+  batch_size: 4  # 总批次大小，会被world_size分割
+  num_workers: 0
+  pin_memory: true
+  drop_last: false
+
+# --- 环境配置 ---
+env:
+  use_libero: true
+  benchmark_name: "libero_spatial"

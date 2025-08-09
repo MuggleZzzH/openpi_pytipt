@@ -1,0 +1,48 @@
+# Stage 11 RIPT-VLA改进配置 - 提高训练效果
+# 增加训练步数和episode长度，优化学习参数
+
+exp_name: stage11_ript_vla_improved
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/stage11_ript_vla_improved"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"
+  num_parallel_envs: 4  # 增加并行环境数
+  max_episode_length: 200  # 增加episode长度，给机器人更多时间完成任务
+
+# === 算法配置 ===
+algo:
+  rloo_batch_size: 8  # 增加批次大小，提供更好的优势估计
+  lr: 2e-5  # 略微增加学习率
+  gradient_accumulation_steps: 1
+  # RolloutGenerator配置
+  enable_dynamic_sampling: true
+  rollout_skip_threshold: 3
+  enable_rollout_stats_tracking: true
+  rollout_stats_path: "./output/stage11_ript_vla_improved/rollout_stats.json"
+  use_val_init: false
+
+# === 数据集配置 ===
+dataset:
+  num_init_states: 50  # 增加初始状态数量，提供更多样化的起始条件
+  state_dim: 8
+
+# === 训练配置 ===
+training:
+  num_train_steps: 10  # 增加训练步数
+  seed: 42
+  save_freq: 2  # 每2步保存一次
+
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+
+# === 特性开关 ===
+features:
+  use_ript_vla_runner: true

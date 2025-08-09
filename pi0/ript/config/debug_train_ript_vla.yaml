@@ -1,0 +1,92 @@
+# Debug config for PI0 RIPT training with RIPT-VLA Runner
+# 专门测试新的RIPT-VLA并行环境实现
+
+exp_name: pi0_debug_ript_vla_runner
+
+# --- Paths ---
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./pi0/ript/output/debug_ript_vla"
+norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch/norm_stats.json"
+
+# --- Task and Environment (RIPT-VLA优化) ---
+task:
+  benchmark_name: "libero_goal"
+  task_name: "put_the_bowl_on_the_stove"  # 使用任务名称而不是数字
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"  # 使用实际存在的任务
+  
+  # 🚀 测试并行环境
+  num_parallel_envs: 2  # 2个并行环境测试
+  max_episode_length: 100  # 适中长度
+
+# --- RL Algorithm (适合并行测试) ---
+algo:
+  rloo_batch_size: 2   # 匹配并行环境数
+  num_epochs: 1        # 单epoch调试
+  data_batch_size: 2   # 匹配batch size
+  rollouts_per_env: 1  # 每个环境1个rollout测试
+  gradient_accumulation_steps: 1
+  lr: 1e-5
+  grad_norm_clip: 1.0
+  enable_dynamic_sampling: false
+  enable_rollout_stats_tracking: false
+  use_val_init: false
+
+# --- Training (快速调试) ---
+training:
+  num_train_steps: 1  # 只做1步训练测试
+  seed: 42
+  save_freq: 100
+  save_best: false
+  use_mixed_precision: false
+  optimizer:
+    type: "Adam"
+    weight_decay: 0.0
+
+# --- Distributed (单GPU) ---
+distributed:
+  backend: "nccl"
+  gradient_checkpointing: false
+  zero_optimization: false
+  fp16: false
+  bf16: false
+  sharded_ddp: false
+
+# --- Logging (详细调试) ---
+logging:
+  use_wandb: false  # 禁用wandb专注调试
+  log_freq: 1
+  log_gradients: false
+
+# --- Rollout ---
+rollout:
+  enabled: false
+
+# --- 数据加载器 ---
+train_dataloader:
+  batch_size: 2
+  num_workers: 1
+  pin_memory: true
+  drop_last: false
+
+# --- 环境配置 ---
+env:
+  use_libero: true
+  benchmark_name: "libero_goal"
+
+# --- 🚀 Features (启用RIPT-VLA Runner) ---
+features:
+  # 🚀 启用RIPT-VLA Runner - 新的并行环境实现
+  use_ript_vla_runner: true  # ✅ 启用新runner
+  
+  # 传统功能（关闭以避免冲突）
+  enable_task_polling: false
+  enable_parallel_envs: false
+  enable_smart_sampling: false
+  enable_true_parallel_envs: false
+
+# --- 调试配置 ---
+debug:
+  save_rollout_videos: true
+  verbose_logging: true
+  debug_mode: true

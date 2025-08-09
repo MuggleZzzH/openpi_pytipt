@@ -1,0 +1,98 @@
+# 多任务分布式训练配置 - 完整测试任务轮询机制
+exp_name: pi0_multi_task_distributed_test
+
+# --- 路径配置 ---
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./pi0/ript/output/multi_task_distributed"  
+norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json"
+
+# --- 分布式配置 ---
+distributed:
+  enabled: true
+  backend: 'nccl'
+  timeout_seconds: 3600
+  find_unused_parameters: false
+  bucket_cap_mb: 15
+
+# --- 数据并行配置 ---
+data_parallel:
+  sync_every_n_steps: 3
+  enable_gradient_checkpointing: true
+  async_data_loading: false
+
+# --- 任务分片配置 ---
+task_distribution:
+  enable_task_sharding: true          # 🔥 启用任务分片
+  balance_tasks_across_gpus: true
+  min_tasks_per_gpu: 1
+
+# --- 🔥 多任务配置 ---
+task:
+  benchmark_name: "libero_spatial" 
+  task_name: null                     # 不使用单任务
+  task_names_to_use: [0, 1, 2, 3, 4, 5, 6, 7, 8]  # 🔥 9个任务完整测试
+  num_parallel_envs: 2                # 减少并行环境数节省内存
+  rollouts_per_env: 2                 # 每环境2个轨迹
+  max_episode_length: 50              # 短episode快速测试
+
+# --- 算法配置（任务轮询优化） ---
+algo:
+  rloo_batch_size: 2                  # 与并行环境数匹配
+  num_epochs: 1                       # 单epoch快速测试
+  data_batch_size: 4                  # 🔥 精确控制：每次收集4条轨迹
+  gradient_accumulation_steps: 1      # 简化梯度累积
+  lr: 1e-5
+  grad_norm_clip: 1.0
+  
+  enable_dynamic_sampling: true
+  enable_rollout_stats_tracking: true
+  rollout_skip_threshold: 2
+  rollout_stats_path: "./pi0/ript/output/multi_task_distributed/rollout_stats.json"
+  use_val_init: false
+
+# --- 训练配置（任务轮询测试） ---  
+training:
+  num_train_steps: 9                  # 🔥 9步测试完整轮询：每GPU轮询所有任务
+  seed: 42
+  save_freq: 10
+  save_best: false
+  use_mixed_precision: true
+  
+  optimizer:
+    type: "AdamW"
+    weight_decay: 0.005
+
+# --- 日志配置 ---
+logging:
+  use_wandb: false
+  log_freq: 1
+  log_gradients: false
+  log_dir: "./pi0/ript/output/multi_task_distributed/logs"
+
+# --- 增强采样配置 ---
+enhanced_sampling:
+  enable_smart_filtering: true
+  max_sampling_attempts: 5            # 减少尝试次数
+  debug_sampling: true                # 🔥 启用调试输出查看任务轮询
+  save_videos: false                  # 不保存视频节省时间
+  video_dir: "rollout_videos_multi_task"
+
+# --- 性能优化配置 ---
+performance:
+  enable_torch_compile: false
+  max_memory_per_gpu_gb: 14           # 为多任务预留内存
+  prefetch_factor: 1
+  num_workers: 1
+  pin_memory: false
+  
+# --- 容错和恢复配置 ---
+fault_tolerance:
+  enable_checkpointing: false
+  auto_resume: false
+
+# --- 调试配置 ---
+debug:
+  profile_performance: false
+  log_memory_usage: true
+  save_intermediate_results: false
+  distributed_debug: true             # 🔥 启用分布式调试输出
