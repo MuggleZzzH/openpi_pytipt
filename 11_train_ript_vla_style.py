@@ -411,15 +411,28 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         
         # 6. 保存检查点
         if (step + 1) % config['training'].get('save_freq', 10) == 0:
-            checkpoint_path = output_dir / f"checkpoint_step_{step + 1}.pt"
+            # 轻量权重（仅模型，便于部署与占用小）
+            weights_path = output_dir / f"weights_step_{step + 1}.pt"
             torch.save({
                 'step': step + 1,
                 'policy_state_dict': policy.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
                 'config': config,
                 'training_metrics': all_training_metrics,
-            }, checkpoint_path)
-            print(f"✓ 检查点已保存: {checkpoint_path}")
+            }, weights_path)
+            print(f"✓ 轻量权重已保存: {weights_path}")
+
+            # 可选：按较低频率保存含优化器的完整检查点，便于恢复训练
+            save_opt_every = config.get('training', {}).get('save_optimizer_freq', None)
+            if save_opt_every and ((step + 1) % int(save_opt_every) == 0):
+                checkpoint_path = output_dir / f"checkpoint_step_{step + 1}.pt"
+                torch.save({
+                    'step': step + 1,
+                    'policy_state_dict': policy.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': config,
+                    'training_metrics': all_training_metrics,
+                }, checkpoint_path)
+                print(f"✓ 完整检查点已保存: {checkpoint_path}")
     
     # 保存最终结果
     final_results_path = output_dir / "final_training_results.json"
@@ -435,6 +448,28 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             'total_steps': len(all_training_metrics)
         }, f, indent=2)
     
+    # 最终轻量权重（仅模型）
+    final_weights_path = output_dir / "final_weights.pt"
+    torch.save({
+        'step': len(all_training_metrics),
+        'policy_state_dict': policy.state_dict(),
+        'config': config,
+        'training_metrics': all_training_metrics,
+    }, final_weights_path)
+    print(f"✓ 最终轻量权重已保存: {final_weights_path}")
+
+    # 可选：保存最终完整检查点（含优化器）便于恢复训练
+    if config.get('training', {}).get('save_optimizer_final', False):
+        final_checkpoint_path = output_dir / "final_checkpoint.pt"
+        torch.save({
+            'step': len(all_training_metrics),
+            'policy_state_dict': policy.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': config,
+            'training_metrics': all_training_metrics,
+        }, final_checkpoint_path)
+        print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
+
     print(f"\n🎉 RIPT-VLA风格训练完成!")
     print(f"📊 最终结果已保存: {final_results_path}")
     print(f"✨ 使用了简化的直接架构，减少了抽象层复杂度")
