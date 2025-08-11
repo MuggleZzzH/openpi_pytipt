@@ -143,6 +143,13 @@ class PI0Policy(PreTrainedPolicy):
         present_img_keys = [key for key in IMAGE_KEYS if key in observation["image"]]
         missing_img_keys = [key for key in IMAGE_KEYS if key not in present_img_keys]
 
+        # 兜底：如果没有任何相机键，创建占位符供missing_img_keys使用
+        dummy_img = None
+        if len(present_img_keys) == 0:
+            # 用配置的目标尺寸构造占位符
+            C, H, W = 3, self.config.resize_imgs_with_padding[0], self.config.resize_imgs_with_padding[1]
+            dummy_img = torch.full((bsize, C, H, W), -1.0, dtype=dtype, device=observation["state"].device)
+
         for key in present_img_keys:
             # resize, pad, and normalize
             img = observation["image"][key]
@@ -155,7 +162,8 @@ class PI0Policy(PreTrainedPolicy):
             if torch.is_floating_point(img) and img.max() <= 1.0 + 1e-3:
                 img = img * 255.0
 
-            img = img.to(dtype) / 127.5 - 1.0
+            # 图像处理使用fp32确保视觉编码稳定性（特别是混精训练时）
+            img = img.to(torch.float32) / 127.5 - 1.0
             img = resize_with_pad(
                 img, *self.config.resize_imgs_with_padding, pad_value=-1.0
             )
@@ -163,10 +171,11 @@ class PI0Policy(PreTrainedPolicy):
             img_masks.append(torch.ones((bsize,), dtype=torch.bool, device=img.device))
 
         for key in missing_img_keys:
-            # zero padding
-            img = torch.full_like(img, fill_value=-1.0)
-            images.append(img)
-            img_masks.append(torch.zeros((bsize,), dtype=torch.bool, device=img.device))
+            # 使用最后处理的图像或占位符创建缺失相机的填充
+            reference_img = dummy_img if len(present_img_keys) == 0 else img
+            missing_img = torch.full_like(reference_img, fill_value=-1.0)
+            images.append(missing_img)
+            img_masks.append(torch.zeros((bsize,), dtype=torch.bool, device=missing_img.device))
 
         images = torch.stack(images, dim=1)  # (*b, n, c, h, w)
         img_masks = torch.stack(img_masks, dim=1)  # (*b, n)
@@ -558,21 +567,25 @@ class PI0FlowMatching(nn.Module):
         time = torch.tensor(1.0, dtype=dtype, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
+            
+            # 构造is_positive标志张量 (关键修复: nn.Embedding需要LongTensor)
+            cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
+            uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
 
             if cfg_scale > 1.0:
                 # CFG: predict both conditional and unconditional velocities
                 v_t_cond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=1
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
                 )
                 v_t_uncond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=0
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
                 )
                 # Apply CFG guidance
                 v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
             else:
-                # Standard unconditional generation
+                # Standard unconditional generation - 使用is_positive=0保持训练一致性
                 v_t = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
                 )
 
             # Euler step

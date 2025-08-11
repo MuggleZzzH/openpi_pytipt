@@ -587,8 +587,9 @@ class LIBEROEnvRunner:
                         # 使用正确的PI0观测格式
                         pi0_observation = self.construct_pi0_observation(obs, task_description)
                         
-                        # 选择动作
-                        raw_action = self.policy.select_action(pi0_observation)
+                        # 选择动作 - 使用CFG引导提升推理质量
+                        cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                        raw_action = self.policy.select_action(pi0_observation, cfg_scale=cfg_scale)
                         action = raw_action[0, :, :7]  # shape: (50, 7)
                         
                         # 转换为numpy并处理维度
@@ -1174,8 +1175,9 @@ class LIBEROEnvRunner:
             
             # 合并批量观测（如果可能）
             if len(batch_obs) == 1:
-                # 单个观测直接推理
-                raw_action = self.policy.select_action(batch_obs[0])
+                # 单个观测直接推理 - 使用CFG引导
+                cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
                 action = raw_action[0, :, :7]  # (50, 7)
                 
                 if isinstance(action, torch.Tensor):
@@ -1189,7 +1191,8 @@ class LIBEROEnvRunner:
                 # 多个观测分别推理 (目前PI0不支持真正的批量推理)
                 batch_actions = []
                 for pi0_obs in batch_obs:
-                    raw_action = self.policy.select_action(pi0_obs)
+                    cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                    raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
                     action = raw_action[0, :, :7]
                     
                     if isinstance(action, torch.Tensor):
@@ -1216,7 +1219,8 @@ class LIBEROEnvRunner:
             if prompts_for_obs is not None and idx < len(prompts_for_obs):
                 prompt_text = prompts_for_obs[idx]
             pi0_obs = self.construct_pi0_observation(obs, prompt_text or env_name)
-            raw_action = self.policy.select_action(pi0_obs)
+            cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+            raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]
             
             if isinstance(action, torch.Tensor):
