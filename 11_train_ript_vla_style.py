@@ -125,19 +125,45 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     policy_path = config['policy_path']
     policy = PI0Policy.from_pretrained(policy_path)
     
+    # 🔥 关键修复：强制启用CFG（解决原始checkpoint兼容性问题）
+    print("🔧 强制启用CFG功能...")
+    policy.model.cfg_enabled = True
+    if hasattr(policy, 'config'):
+        policy.config.cfg_enabled = True
+    print("✅ CFG已启用，训练和推理都将使用CFG分支")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     policy = policy.to(device)
     print(f"✓ 策略加载成功，设备: {device}")
     
-    # 直接创建优化器（像RIPT-VLA一样）
+    # 🔥 修复：只训练专家头部，冻结PaliGemma前缀（提升稳定性）
+    print("🔧 配置训练参数范围...")
+    
+    # 1. 冻结PaliGemma前缀
+    for p in policy.model.paligemma_with_expert.parameters():
+        p.requires_grad = False
+    
+    # 2. 只收集需要训练的参数
+    trainable_params = []
+    trainable_params += list(policy.model.action_in_proj.parameters())
+    trainable_params += list(policy.model.action_time_mlp_in.parameters())
+    trainable_params += list(policy.model.action_time_mlp_out.parameters())
+    trainable_params += list(policy.model.action_out_proj.parameters())
+    trainable_params += list(policy.model.state_proj.parameters())
+    
+    # 3. CFG embedding参数
+    if hasattr(policy.model, "cfg_emb"):
+        trainable_params += list(policy.model.cfg_emb.parameters())
+        print("✅ CFG embedding参数已加入训练")
+    
+    # 4. 创建优化器
     print("正在创建优化器...")
     lr = config['algo'].get('lr', 1e-5)
-    optimizer = torch.optim.AdamW(
-        policy.parameters(),
-        lr=lr,
-        weight_decay=0.01
-    )
+    optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.01)
+    
+    total_params = sum(p.numel() for p in trainable_params)
     print(f"✓ 优化器创建成功，学习率: {lr}")
+    print(f"🎯 只训练专家头部，参数数量: {total_params:,}")
     
     return policy, optimizer, device
 
@@ -320,6 +346,51 @@ def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advan
         traceback.print_exc()
         return 0.0
 
+def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
+    """🔥 新增：评估不同CFG强度的效果"""
+    cfg_scales = [1.0, 1.5, 3.0, 5.0]
+    best_cfg = 1.0
+    best_success_rate = 0.0
+    
+    results = {}
+    print(f"\n🔍 开始CFG强度扫描评估...")
+    
+    for cfg_scale in cfg_scales:
+        print(f"📊 测试CFG={cfg_scale}...")
+        # 临时设置CFG强度
+        original_cfg = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+        env_runner.config.collection_cfg_scale = cfg_scale
+        
+        # 运行评估episodes
+        success_count = 0
+        for ep_idx in range(eval_episodes):
+            try:
+                # 使用现有的rollout收集函数
+                episodes = collect_rollouts_ript_vla_style(
+                    env_runner, task_name, 1, enable_dynamic_sampling=False
+                )
+                if episodes and len(episodes) > 0:
+                    if episodes[0].get('success', False):
+                        success_count += 1
+            except Exception as e:
+                print(f"   评估episode {ep_idx} 失败: {e}")
+                continue
+        
+        success_rate = success_count / eval_episodes
+        results[cfg_scale] = success_rate
+        
+        if success_rate > best_success_rate:
+            best_success_rate = success_rate
+            best_cfg = cfg_scale
+        
+        # 恢复原设置
+        env_runner.config.collection_cfg_scale = original_cfg
+        
+        print(f"   CFG={cfg_scale}: 成功率={success_rate:.2%} ({success_count}/{eval_episodes})")
+    
+    print(f"🎯 最佳CFG强度: {best_cfg} (成功率: {best_success_rate:.2%})")
+    return best_cfg, results
+
 def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     """
     主训练循环（RIPT-VLA风格）
@@ -409,7 +480,19 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
         
-        # 6. 保存检查点
+        # 6. CFG评估（每10步进行一次）
+        if (step + 1) % 10 == 0:
+            try:
+                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
+                step_metrics['best_cfg_scale'] = best_cfg
+                step_metrics['cfg_sweep_results'] = cfg_results
+                print(f"🎯 推荐CFG强度: {best_cfg}")
+                # 可选：动态调整收集时使用的CFG强度
+                env_runner.config.collection_cfg_scale = best_cfg
+            except Exception as e:
+                print(f"⚠️ CFG评估失败: {e}")
+        
+        # 7. 保存检查点
         if (step + 1) % config['training'].get('save_freq', 10) == 0:
             # 轻量权重（仅模型，便于部署与占用小）
             weights_path = output_dir / f"weights_step_{step + 1}.pt"

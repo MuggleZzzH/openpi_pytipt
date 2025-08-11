@@ -111,7 +111,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         if not episodes:
             raise ValueError("Empty episodes list provided")
 
-        all_states, all_images, all_actions = [], [], []
+        all_states, all_images, all_wrist_images, all_actions = [], [], [], []
         all_action_is_pad, all_tasks = [], []
 
         target_seq_len = getattr(self.policy.config, 'n_action_steps', 50)
@@ -127,7 +127,7 @@ class PI0_CFG_Adapter(RLModelInterface):
                     raise ValueError(f"Episode {i} empty observations")
 
                 # 收集
-                states_seq, images_seq, actions_seq = [], [], []
+                states_seq, base_images_seq, wrist_images_seq, actions_seq = [], [], [], []
                 max_steps = min(len(observations), len(actions))
                 sample_idx = list(range(max_steps))  # 全量保存，便于视频
 
@@ -137,8 +137,10 @@ class PI0_CFG_Adapter(RLModelInterface):
 
                     # 状态(8维)
                     states_seq.append(self._extract_state_from_obs(obs_t, i, t))
-                    # 图像(HWC)
-                    images_seq.append(self._extract_image_from_obs(obs_t, i, t))
+                    # 🔥 修复：分别提取两个相机的图像
+                    base_img, wrist_img = self._extract_dual_images_from_obs(obs_t, i, t)
+                    base_images_seq.append(base_img)
+                    wrist_images_seq.append(wrist_img)
 
                     # 动作(7维)
                     act_t = np.array(act_t[0] if (isinstance(act_t, list) and len(act_t) > 0) else act_t,
@@ -159,10 +161,12 @@ class PI0_CFG_Adapter(RLModelInterface):
                 action_is_pad[:valid_len] = False
 
                 final_state = np.asarray(states_seq[-1], dtype=np.float32) if states_seq else np.zeros(8, np.float32)
-                final_image = images_seq[-1] if images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
+                final_base_image = base_images_seq[-1] if base_images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
+                final_wrist_image = wrist_images_seq[-1] if wrist_images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
 
                 all_states.append(final_state)
-                all_images.append(final_image)
+                all_images.append(final_base_image)  # 保持向后兼容
+                all_wrist_images.append(final_wrist_image)  # 新增wrist图像
                 all_actions.append(final_action)
                 all_action_is_pad.append(action_is_pad)
 
@@ -173,13 +177,17 @@ class PI0_CFG_Adapter(RLModelInterface):
                 print(f"Error processing episode {i}: {e}")
                 all_states.append(np.zeros(8, np.float32))
                 all_images.append(np.ones((224, 224, 3), np.uint8) * 128)
+                all_wrist_images.append(np.ones((224, 224, 3), np.uint8) * 128)  # 添加wrist兜底
                 all_actions.append(np.zeros((target_seq_len, 7), np.float32))
                 all_action_is_pad.append(np.ones((target_seq_len,), dtype=bool))
                 all_tasks.append("default task")
 
         batch = {
             "state": torch.from_numpy(np.stack(all_states)).to(device, dtype=torch.float32),            # (B,8)
-            "image": {"base_0_rgb": torch.from_numpy(np.stack(all_images)).to(device, dtype=torch.uint8)},  # (B,H,W,3)
+            "image": {
+                "base_0_rgb": torch.from_numpy(np.stack(all_images)).to(device, dtype=torch.uint8),       # (B,H,W,3)
+                "left_wrist_0_rgb": torch.from_numpy(np.stack(all_wrist_images)).to(device, dtype=torch.uint8),  # (B,H,W,3) 🔥 新增
+            },
             "action": torch.from_numpy(np.stack(all_actions)).to(device, dtype=torch.float32),          # (B,T,7)
             "action_is_pad": torch.from_numpy(np.stack(all_action_is_pad)).to(device),                  # (B,T) bool
             "prompt": all_tasks,
@@ -385,6 +393,96 @@ class PI0_CFG_Adapter(RLModelInterface):
             print(f"提取状态时出错 (episode {episode_idx}, step {step_idx}): {e}")
             return np.zeros(8, np.float32)
     
+    def _extract_dual_images_from_obs(self, obs, episode_idx, step_idx):
+        """🔥 新增：从观测中提取两个相机的图像信息"""
+        try:
+            # 🔧 修复：处理SubprocVectorEnv返回的numpy.array包装的观测
+            if isinstance(obs, np.ndarray) and obs.dtype == object:
+                if obs.size == 1:
+                    obs = obs.item()  # 提取单个元素
+                elif obs.size > 0:
+                    obs = obs[0]  # 取第一个元素
+            
+            if isinstance(obs, list) and len(obs) > 0:
+                obs = obs[0]  # 取第一个环境的观测
+            
+            # 默认图像（兜底）
+            default_img = np.ones((224, 224, 3), np.uint8) * 128
+            base_img = default_img.copy()
+            wrist_img = default_img.copy()
+            
+            if isinstance(obs, dict):
+                # 提取base_0_rgb (agentview_image)
+                if "agentview_image" in obs:
+                    raw_img = obs["agentview_image"]
+                    if isinstance(raw_img, np.ndarray) and raw_img.size > 0:
+                        base_img = self._process_single_image(raw_img, "base")
+                
+                # 提取left_wrist_0_rgb (robot0_eye_in_hand_image)
+                if "robot0_eye_in_hand_image" in obs:
+                    raw_img = obs["robot0_eye_in_hand_image"]
+                    if isinstance(raw_img, np.ndarray) and raw_img.size > 0:
+                        wrist_img = self._process_single_image(raw_img, "wrist")
+            
+            return base_img, wrist_img
+            
+        except Exception as e:
+            print(f"提取双图像时出错 (episode {episode_idx}, step {step_idx}): {e}")
+            default_img = np.ones((224, 224, 3), np.uint8) * 128
+            return default_img.copy(), default_img.copy()
+    
+    def _process_single_image(self, img, cam_type):
+        """处理单个图像的通用逻辑"""
+        try:
+            # 🔧 修复图像格式检查：处理CHW和HWC两种格式
+            if img.ndim == 3:
+                # 检查是CHW格式 (3, H, W) 还是HWC格式 (H, W, 3)
+                if img.shape[0] == 3 and img.shape[-1] != 3:  # CHW格式
+                    # 转换CHW → HWC
+                    img = img.transpose(1, 2, 0)
+                elif img.shape[-1] != 3:  # 既不是CHW也不是HWC
+                    print(f"✗ 未知{cam_type}图像格式: {img.shape}")
+                    raise ValueError(f"Unexpected {cam_type} image format: {img.shape}")
+                
+                # BGR → RGB转换
+                img_rgb = img[:, :, ::-1].copy()
+                
+                # 确保数据类型和范围正确
+                if img_rgb.dtype != np.uint8:
+                    if img_rgb.max() <= 1.0:  # 归一化的图像
+                        img_rgb = (img_rgb * 255).astype(np.uint8)
+                    else:
+                        img_rgb = img_rgb.astype(np.uint8)
+                
+                # 确保图像尺寸正确
+                if img_rgb.shape[:2] != (224, 224):
+                    try:
+                        from skimage.transform import resize
+                        img_rgb = resize(img_rgb, (224, 224), preserve_range=True).astype(np.uint8)
+                    except ImportError:
+                        # 如果没有skimage，使用简单的裁剪/填充
+                        h, w = img_rgb.shape[:2]
+                        if h != 224 or w != 224:
+                            # 简单居中裁剪或填充到224x224
+                            resized = np.ones((224, 224, 3), dtype=np.uint8) * 128
+                            start_h = max(0, (224 - h) // 2)
+                            start_w = max(0, (224 - w) // 2)
+                            end_h = min(224, start_h + h)
+                            end_w = min(224, start_w + w)
+                            src_h = min(h, 224)
+                            src_w = min(w, 224)
+                            resized[start_h:end_h, start_w:end_w] = img_rgb[:src_h, :src_w]
+                            img_rgb = resized
+                
+                return img_rgb
+            else:
+                print(f"✗ {cam_type}图像维度错误: {img.shape}")
+                return np.ones((224, 224, 3), np.uint8) * 128
+                
+        except Exception as e:
+            print(f"处理{cam_type}图像时出错: {e}")
+            return np.ones((224, 224, 3), np.uint8) * 128
+
     def _extract_image_from_obs(self, obs, episode_idx, step_idx):
         """从观测中提取图像信息"""
         try:

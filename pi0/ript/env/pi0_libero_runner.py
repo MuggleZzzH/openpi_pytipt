@@ -402,17 +402,25 @@ class LIBEROEnvRunner:
                 except Exception as e:
                     raise RuntimeError(f"Failed to convert quaternion to axis-angle: {e}")
                 
-                # 获取 gripper 状态
+                # 获取 gripper 状态（🔥 修复：保持8维一致性）
                 if "robot0_gripper_qpos" not in obs:
                     raise RuntimeError("Observation missing required field robot0_gripper_qpos")
                 try:
-                    gripper_qpos = float(obs["robot0_gripper_qpos"][0])
+                    gripper_qpos_raw = obs["robot0_gripper_qpos"]
+                    gripper_qpos = np.array(gripper_qpos_raw, dtype=np.float32)
+                    if gripper_qpos.size < 2:
+                        # 如果gripper状态不足2维，填充为2维
+                        full_gripper = np.zeros(2, dtype=np.float32)
+                        full_gripper[:gripper_qpos.size] = gripper_qpos.flatten()[:gripper_qpos.size]
+                        gripper_qpos = full_gripper
+                    else:
+                        gripper_qpos = gripper_qpos[:2]  # 取前2维，保持和construct_pi0_observation一致
                 except (IndexError, TypeError, ValueError) as e:
                     raise RuntimeError(f"Invalid robot0_gripper_qpos value: {e}")
                 
-                # 构造未归一化的状态
-                unnorm_state = np.concatenate([eef_pos[:3], axis_angle[:3], [gripper_qpos]]).astype(np.float32)
-                return unnorm_state
+                # 🔥 修复：返回8维状态，与construct_pi0_observation完全一致
+                unnorm_state = np.concatenate([eef_pos[:3], axis_angle[:3], gripper_qpos]).astype(np.float32)
+                return unnorm_state  # 8维：3+3+2
                 
             # 官方脚本要求上述关键字段均存在，若缺失则立即报错
             else:
@@ -587,8 +595,8 @@ class LIBEROEnvRunner:
                         # 使用正确的PI0观测格式
                         pi0_observation = self.construct_pi0_observation(obs, task_description)
                         
-                        # 选择动作 - 使用CFG引导提升推理质量
-                        cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                        # 选择动作 - 使用配置的CFG参数
+                        cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
                         raw_action = self.policy.select_action(pi0_observation, cfg_scale=cfg_scale)
                         action = raw_action[0, :, :7]  # shape: (50, 7)
                         
@@ -1175,8 +1183,8 @@ class LIBEROEnvRunner:
             
             # 合并批量观测（如果可能）
             if len(batch_obs) == 1:
-                # 单个观测直接推理 - 使用CFG引导
-                cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                # 单个观测直接推理 - 使用配置的CFG参数
+                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
                 raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
                 action = raw_action[0, :, :7]  # (50, 7)
                 
@@ -1191,7 +1199,7 @@ class LIBEROEnvRunner:
                 # 多个观测分别推理 (目前PI0不支持真正的批量推理)
                 batch_actions = []
                 for pi0_obs in batch_obs:
-                    cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+                    cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
                     raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
                     action = raw_action[0, :, :7]
                     
@@ -1219,7 +1227,7 @@ class LIBEROEnvRunner:
             if prompts_for_obs is not None and idx < len(prompts_for_obs):
                 prompt_text = prompts_for_obs[idx]
             pi0_obs = self.construct_pi0_observation(obs, prompt_text or env_name)
-            cfg_scale = getattr(self.config, 'cfg_guidance_scale', 3.0) if self.config else 3.0
+            cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
             raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]
             

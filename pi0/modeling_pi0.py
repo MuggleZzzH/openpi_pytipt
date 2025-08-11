@@ -577,24 +577,21 @@ class PI0FlowMatching(nn.Module):
             cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
             uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
 
-            # 关键修复: 只有在启用CFG且cfg_scale>1.0时才使用CFG路径
-            use_cfg = (cfg_scale is not None) and (cfg_scale > 1.0) and getattr(self, "cfg_enabled", False)
+            # 🔥 标准CFG实现：始终计算两个分支并合成
+            # cfg_scale=0→纯无条件, =1→纯条件, >1→增强引导
             
-            if use_cfg:
-                # CFG: predict both conditional and unconditional velocities
-                v_t_cond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
-                )
-                v_t_uncond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
-                )
-                # Apply CFG guidance
-                v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
-            else:
-                # Pure unconditional path: do NOT perturb with cfg_emb at all
-                v_t = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
-                )
+            # 条件分支
+            v_t_cond = self.predict_velocity(
+                state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
+            )
+            
+            # 无条件分支
+            v_t_uncond = self.predict_velocity(
+                state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
+            )
+            
+            # 标准CFG合成公式
+            v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
 
             # Euler step
             x_t += dt * v_t
