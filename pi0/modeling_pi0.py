@@ -282,6 +282,7 @@ class PI0Policy(PreTrainedPolicy):
             tokenized_prompt = self.language_tokenizer.__call__(
                 prompt,
                 padding="max_length",
+                truncation=True,  # 避免长描述造成意外差异
                 padding_side="right",
                 max_length=self.config.tokenizer_max_length,
                 return_tensors="pt",
@@ -348,7 +349,11 @@ class PI0FlowMatching(nn.Module):
             self.config.proj_width, self.config.max_action_dim
         )
 
-        # CFG conditioning embedding layer
+        # Backward-compat for old checkpoints (trained w/o CFG)
+        # If your config doesn't set this, it defaults to False for original checkpoint compatibility
+        self.cfg_enabled = bool(getattr(self.config, "cfg_enabled", False))
+        
+        # CFG conditioning embedding layer (only used when cfg_enabled=True)
         self.cfg_emb = nn.Embedding(2, self.config.proj_width)  # 0=unconditional, 1=conditional
 
         self.action_time_mlp_in = nn.Linear(
@@ -427,8 +432,8 @@ class PI0FlowMatching(nn.Module):
         # embed state
         state_emb = self.state_proj(state)
         
-        # CFG: embed conditional indicator if provided
-        if is_positive is not None:
+        # CFG: only add embedding if CFG is enabled AND is_positive is provided
+        if (is_positive is not None) and getattr(self, "cfg_enabled", False):
             cfg_emb = self.cfg_emb(is_positive).to(dtype=dtype)
             # Add CFG embedding to state embedding
             state_emb = state_emb + cfg_emb
@@ -568,11 +573,14 @@ class PI0FlowMatching(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             
-            # 构造is_positive标志张量 (关键修复: nn.Embedding需要LongTensor)
+            # 构造is_positive标志张量 (CFG需要LongTensor)
             cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
             uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
 
-            if cfg_scale > 1.0:
+            # 关键修复: 只有在启用CFG且cfg_scale>1.0时才使用CFG路径
+            use_cfg = (cfg_scale is not None) and (cfg_scale > 1.0) and getattr(self, "cfg_enabled", False)
+            
+            if use_cfg:
                 # CFG: predict both conditional and unconditional velocities
                 v_t_cond = self.predict_velocity(
                     state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
@@ -583,9 +591,9 @@ class PI0FlowMatching(nn.Module):
                 # Apply CFG guidance
                 v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
             else:
-                # Standard unconditional generation - 使用is_positive=0保持训练一致性
+                # Pure unconditional path: do NOT perturb with cfg_emb at all
                 v_t = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
                 )
 
             # Euler step
