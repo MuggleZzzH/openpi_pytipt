@@ -282,7 +282,7 @@ class PI0Policy(PreTrainedPolicy):
             tokenized_prompt = self.language_tokenizer.__call__(
                 prompt,
                 padding="max_length",
-                truncation=True,  # 避免长描述造成意外差异
+                # truncation=True,  # 避免长描述造成意外差异
                 padding_side="right",
                 max_length=self.config.tokenizer_max_length,
                 return_tensors="pt",
