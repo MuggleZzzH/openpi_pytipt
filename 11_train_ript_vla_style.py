@@ -410,9 +410,23 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     policy, optimizer, device = create_policy_and_optimizer(config)
     
     # 创建CFG适配器（必需，用于损失计算）
+    # 🔥 新增：窗口化配置支持
+    dataset_config = config.get('dataset', {})
+    windowing_mode = dataset_config.get('windowing_mode', 'last')
+    window_stride = dataset_config.get('window_stride', 10)
+    max_windows_per_episode = dataset_config.get('max_windows_per_episode', 1)
+    
+    print(f"\n🔧 CFG窗口化配置:")
+    print(f"  模式: {windowing_mode}")
+    print(f"  步长: {window_stride}")
+    print(f"  每episode最大窗口数: {max_windows_per_episode}")
+    
     cfg_adapter = PI0_CFG_Adapter(
         policy=policy,
-        norm_stats_path=f"{config['policy_path']}/norm_stats.json"
+        norm_stats_path=f"{config['policy_path']}/norm_stats.json",
+        windowing_mode=windowing_mode,
+        window_stride=window_stride,
+        max_windows_per_episode=max_windows_per_episode
     )
     
     # 创建环境runner

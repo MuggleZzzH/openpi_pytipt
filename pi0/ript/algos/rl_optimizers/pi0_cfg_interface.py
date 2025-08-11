@@ -29,17 +29,29 @@ class PI0_CFG_Adapter(RLModelInterface):
     for explicit log_prob calculations or a value network.
     """
 
-    def __init__(self, policy: PI0Policy, norm_stats_path: Optional[str] = None, **kwargs):
+    def __init__(self, policy: PI0Policy, norm_stats_path: Optional[str] = None, 
+                 windowing_mode: str = 'last', window_stride: int = 10, 
+                 max_windows_per_episode: int = 1, **kwargs):
         """
         Initialize the adapter with a PI0Policy instance.
         Args:
             policy: An instance of PI0Policy.
             norm_stats_path: Path to norm_stats.json file for normalization. 
                            If None, will try to find it automatically.
+            windowing_mode: Windowing strategy - 'last'|'random'|'slide' (default: 'last' for compatibility)
+            window_stride: Stride for sliding window mode (default: 10)
+            max_windows_per_episode: Maximum windows per episode (default: 1)
         """
         # The base model is the PI0Policy itself.
         super().__init__(model=policy, **kwargs)
         self.policy = policy
+        
+        # 🔥 新增：窗口化采样配置
+        self.windowing_mode = windowing_mode
+        self.window_stride = window_stride
+        self.max_windows_per_episode = max_windows_per_episode
+        
+        print(f"🔧 CFG窗口化配置: mode={windowing_mode}, stride={window_stride}, max_windows={max_windows_per_episode}")
         
         # 视频收集相关
         self.video_frames = {}  # {episode_idx: [frames]}
@@ -99,12 +111,17 @@ class PI0_CFG_Adapter(RLModelInterface):
         self,
         episodes: List[Dict[str, Any]],
         device: Optional[torch.device] = None,
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], List[int]]:
         """
-        将 episodes 打包为 PI0Policy 期望的 batch：
-        - action 形状保持 (B, T, 7)，不在这里填到 32 维；
-        - 提供 action_is_pad: (B, T) 布尔，True 表示该时间步是 padding；
-        - 状态统一 8 维 (3 pos + 3 axis-angle + 2 gripper)；
+        将 episodes 打包为 PI0Policy 期望的 batch，支持窗口化采样：
+        - 根据windowing_mode从每条轨迹产生多个窗口样本
+        - action 形状保持 (B, T, 7)，B现在是总窗口数
+        - 提供 action_is_pad: (B, T) 布尔，True 表示该时间步是 padding
+        - 状态统一 8 维 (3 pos + 3 axis-angle + 2 gripper)
+        
+        Returns:
+            batch: 窗口化后的训练批次，B维=总窗口数
+            owner_indices: 每个窗口对应的原始episode索引，用于优势映射
         """
         if device is None:
             device = self.device
@@ -113,10 +130,11 @@ class PI0_CFG_Adapter(RLModelInterface):
 
         all_states, all_images, all_wrist_images, all_actions = [], [], [], []
         all_action_is_pad, all_tasks = [], []
+        owner_indices = []  # 🔥 新增：记录每个窗口来自哪个episode
 
-        target_seq_len = getattr(self.policy.config, 'n_action_steps', 50)
+        target_seq_len = getattr(self.policy.config, 'n_action_steps', 50)  # 🔥 窗口大小=50
         diffusion_steps = getattr(self.policy.config, 'num_steps', 10)
-        print(f"Using target_seq_len={target_seq_len} (n_action_steps), diffusion_steps={diffusion_steps}")
+        print(f"🔧 窗口化采样: target_seq_len={target_seq_len}, mode={self.windowing_mode}")
 
         for i, ep in enumerate(episodes):
             try:
@@ -126,18 +144,18 @@ class PI0_CFG_Adapter(RLModelInterface):
                 if not observations:
                     raise ValueError(f"Episode {i} empty observations")
 
-                # 收集
+                # 🔥 新增：提取完整轨迹数据
                 states_seq, base_images_seq, wrist_images_seq, actions_seq = [], [], [], []
                 max_steps = min(len(observations), len(actions))
-                sample_idx = list(range(max_steps))  # 全量保存，便于视频
-
-                for t in sample_idx:
+                
+                # 提取完整序列数据
+                for t in range(max_steps):
                     obs_t = observations[t] if t < len(observations) else {}
                     act_t = actions[t] if t < len(actions) else np.zeros(7, np.float32)
 
                     # 状态(8维)
                     states_seq.append(self._extract_state_from_obs(obs_t, i, t))
-                    # 🔥 修复：分别提取两个相机的图像
+                    # 分别提取两个相机的图像
                     base_img, wrist_img = self._extract_dual_images_from_obs(obs_t, i, t)
                     base_images_seq.append(base_img)
                     wrist_images_seq.append(wrist_img)
@@ -151,36 +169,33 @@ class PI0_CFG_Adapter(RLModelInterface):
                         act_t = buf
                     actions_seq.append(act_t)
 
-                # 固定长度 + 掩码
-                valid_len = min(len(actions_seq), target_seq_len)
-                final_action = np.zeros((target_seq_len, 7), dtype=np.float32)
-                if valid_len > 0:
-                    final_action[:valid_len] = np.asarray(actions_seq[-valid_len:], dtype=np.float32)
-
-                action_is_pad = np.ones((target_seq_len,), dtype=bool)
-                action_is_pad[:valid_len] = False
-
-                final_state = np.asarray(states_seq[-1], dtype=np.float32) if states_seq else np.zeros(8, np.float32)
-                final_base_image = base_images_seq[-1] if base_images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
-                final_wrist_image = wrist_images_seq[-1] if wrist_images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
-
-                all_states.append(final_state)
-                all_images.append(final_base_image)  # 保持向后兼容
-                all_wrist_images.append(final_wrist_image)  # 新增wrist图像
-                all_actions.append(final_action)
-                all_action_is_pad.append(action_is_pad)
-
+                # 🔥 窗口化采样：根据模式产生多个窗口
+                windows = self._sample_windows_from_episode(
+                    states_seq, base_images_seq, wrist_images_seq, actions_seq, target_seq_len
+                )
+                
                 task_str = tasks[0] if isinstance(tasks, list) else str(tasks)
-                all_tasks.append(task_str)
+                
+                # 为每个窗口添加数据和owner索引
+                for window in windows:
+                    all_states.append(window['state'])
+                    all_images.append(window['base_image'])
+                    all_wrist_images.append(window['wrist_image'])
+                    all_actions.append(window['actions'])
+                    all_action_is_pad.append(window['action_is_pad'])
+                    all_tasks.append(task_str)
+                    owner_indices.append(i)  # 记录窗口来源
 
             except Exception as e:
                 print(f"Error processing episode {i}: {e}")
+                # 兜底：至少产生一个默认窗口
                 all_states.append(np.zeros(8, np.float32))
                 all_images.append(np.ones((224, 224, 3), np.uint8) * 128)
-                all_wrist_images.append(np.ones((224, 224, 3), np.uint8) * 128)  # 添加wrist兜底
+                all_wrist_images.append(np.ones((224, 224, 3), np.uint8) * 128)
                 all_actions.append(np.zeros((target_seq_len, 7), np.float32))
                 all_action_is_pad.append(np.ones((target_seq_len,), dtype=bool))
                 all_tasks.append("default task")
+                owner_indices.append(i)
 
         batch = {
             "state": torch.from_numpy(np.stack(all_states)).to(device, dtype=torch.float32),            # (B,8)
@@ -193,14 +208,152 @@ class PI0_CFG_Adapter(RLModelInterface):
             "prompt": all_tasks,
         }
 
-        bs = len(episodes)
-        assert batch["state"].shape[0] == bs
-        assert batch["image"]["base_0_rgb"].shape[0] == bs
-        assert batch["action"].shape[0] == bs
-        assert batch["action_is_pad"].shape[0] == bs
-        print(f"Processed batch: state {batch['state'].shape}, image {batch['image']['base_0_rgb'].shape}, "
-            f"action {batch['action'].shape}, action_is_pad {batch['action_is_pad'].shape}")
-        return batch
+        num_windows = len(all_states)
+        assert batch["state"].shape[0] == num_windows
+        assert batch["image"]["base_0_rgb"].shape[0] == num_windows
+        assert batch["action"].shape[0] == num_windows
+        assert batch["action_is_pad"].shape[0] == num_windows
+        assert len(owner_indices) == num_windows
+        
+        print(f"🔧 窗口化批次: {len(episodes)} episodes → {num_windows} windows")
+        print(f"   state {batch['state'].shape}, image {batch['image']['base_0_rgb'].shape}")
+        print(f"   action {batch['action'].shape}, action_is_pad {batch['action_is_pad'].shape}")
+        
+        return batch, owner_indices
+    
+    def _sample_windows_from_episode(self, states_seq, base_images_seq, wrist_images_seq, actions_seq, target_seq_len):
+        """🔥 新增：根据窗口化模式从一条轨迹中采样多个窗口"""
+        if len(actions_seq) == 0:
+            # 空轨迹，返回一个默认窗口
+            return [self._create_empty_window(target_seq_len)]
+        
+        windows = []
+        
+        if self.windowing_mode == 'last':
+            # 原有逻辑：只取最后一段
+            window = self._create_window_from_range(
+                states_seq, base_images_seq, wrist_images_seq, actions_seq, 
+                -target_seq_len, len(actions_seq), target_seq_len
+            )
+            windows.append(window)
+            
+        elif self.windowing_mode == 'random':
+            # 随机采样：从轨迹中随机取一个窗口
+            if len(actions_seq) <= target_seq_len:
+                # 轨迹太短，整条轨迹就是一个窗口
+                window = self._create_window_from_range(
+                    states_seq, base_images_seq, wrist_images_seq, actions_seq,
+                    0, len(actions_seq), target_seq_len
+                )
+                windows.append(window)
+            else:
+                # 随机选择起始位置
+                import random
+                max_start = len(actions_seq) - target_seq_len
+                start_idx = random.randint(0, max_start)
+                window = self._create_window_from_range(
+                    states_seq, base_images_seq, wrist_images_seq, actions_seq,
+                    start_idx, start_idx + target_seq_len, target_seq_len
+                )
+                windows.append(window)
+                
+        elif self.windowing_mode == 'slide':
+            # 滑动窗口：按步长采样多个窗口
+            if len(actions_seq) <= target_seq_len:
+                # 轨迹太短，只有一个窗口
+                window = self._create_window_from_range(
+                    states_seq, base_images_seq, wrist_images_seq, actions_seq,
+                    0, len(actions_seq), target_seq_len
+                )
+                windows.append(window)
+            else:
+                # 滑动采样
+                window_count = 0
+                for start_idx in range(0, len(actions_seq) - target_seq_len + 1, self.window_stride):
+                    if window_count >= self.max_windows_per_episode:
+                        break
+                    
+                    window = self._create_window_from_range(
+                        states_seq, base_images_seq, wrist_images_seq, actions_seq,
+                        start_idx, start_idx + target_seq_len, target_seq_len
+                    )
+                    windows.append(window)
+                    window_count += 1
+                
+                # 如果没有采样到任何窗口（理论上不会发生），回退到last模式
+                if not windows:
+                    window = self._create_window_from_range(
+                        states_seq, base_images_seq, wrist_images_seq, actions_seq,
+                        -target_seq_len, len(actions_seq), target_seq_len
+                    )
+                    windows.append(window)
+        
+        else:
+            raise ValueError(f"Unknown windowing_mode: {self.windowing_mode}")
+        
+        return windows
+    
+    def _create_window_from_range(self, states_seq, base_images_seq, wrist_images_seq, actions_seq, start_idx, end_idx, target_seq_len):
+        """从指定范围创建一个窗口 - 修复时序对齐问题
+        
+        正确的时序对齐：obs[t] → actions[t:t+H]
+        即：用窗口起点的观测，去监督接下来这H步动作
+        """
+        # 处理负索引
+        if start_idx < 0:
+            start_idx = max(0, len(actions_seq) + start_idx)
+        if end_idx < 0:
+            end_idx = len(actions_seq) + end_idx
+        
+        # 确保范围有效
+        start_idx = max(0, min(start_idx, len(actions_seq)))
+        end_idx = max(start_idx, min(end_idx, len(actions_seq)))
+        
+        # 🔥 关键修复：正确的时序对齐
+        # 窗口起点的obs -> 该obs之后的actions
+        state_idx = start_idx  # 用窗口起点的obs
+        
+        # 提取窗口动作数据（与start_idx对应的obs之后的actions）
+        window_actions = actions_seq[start_idx:end_idx]
+        valid_len = len(window_actions)
+        
+        # 创建固定长度的动作序列
+        final_actions = np.zeros((target_seq_len, 7), dtype=np.float32)
+        if valid_len > 0:
+            final_actions[:valid_len] = np.asarray(window_actions, dtype=np.float32)
+        
+        # 创建 padding 掩码
+        action_is_pad = np.ones((target_seq_len,), dtype=bool)
+        action_is_pad[:valid_len] = False
+        
+        # 🔥 使用窗口起点的状态和图像
+        if state_idx < len(states_seq):
+            final_state = np.asarray(states_seq[state_idx], dtype=np.float32)
+            final_base_image = base_images_seq[state_idx] if state_idx < len(base_images_seq) else (np.ones((224, 224, 3), np.uint8) * 128)
+            final_wrist_image = wrist_images_seq[state_idx] if state_idx < len(wrist_images_seq) else (np.ones((224, 224, 3), np.uint8) * 128)
+        else:
+            # 兜底：如果索引超出范围，使用默认值
+            final_state = np.zeros(8, np.float32)
+            final_base_image = np.ones((224, 224, 3), np.uint8) * 128
+            final_wrist_image = np.ones((224, 224, 3), np.uint8) * 128
+        
+        return {
+            'state': final_state,
+            'base_image': final_base_image,
+            'wrist_image': final_wrist_image,
+            'actions': final_actions,
+            'action_is_pad': action_is_pad
+        }
+    
+    def _create_empty_window(self, target_seq_len):
+        """创建一个空的默认窗口"""
+        return {
+            'state': np.zeros(8, np.float32),
+            'base_image': np.ones((224, 224, 3), np.uint8) * 128,
+            'wrist_image': np.ones((224, 224, 3), np.uint8) * 128,
+            'actions': np.zeros((target_seq_len, 7), np.float32),
+            'action_is_pad': np.ones((target_seq_len,), dtype=bool)
+        }
     def compute_weighted_loss(
         self,
         episodes: List[Dict[str, Any]],
@@ -208,13 +361,18 @@ class PI0_CFG_Adapter(RLModelInterface):
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
-        CFG风格训练：同时计算条件和无条件损失
+        CFG风格训练支持窗口化：同时计算条件和无条件损失
         
         严格契约模式：所有输入/输出必须满足预定义契约，违反则立即失败
         
+        🔥 新增窗口化支持：
+        - episodes: E个原始轨迹
+        - advantages: (E,) episode级优势
+        - 通过owner_indices映射到B个窗口级优势
+        
         输入契约:
         - episodes: 非空list，每个episode包含必需字段
-        - advantages: (B,) tensor，B与episodes数量匹配
+        - advantages: (E,) tensor，E与episodes数量匹配
         
         输出契约:
         - policy.forward()必须返回包含"losses"字段的dict，shape为(B,T,D)
@@ -230,27 +388,38 @@ class PI0_CFG_Adapter(RLModelInterface):
         assert advantages.dim() == 1, f"advantages必须是1维tensor，当前维度: {advantages.dim()}"
         assert isinstance(advantages, torch.Tensor), f"advantages必须是torch.Tensor类型，当前类型: {type(advantages)}"
 
-        batch = self.process_episodes(episodes, device)
+        # 🔥 窗口化批次处理：现在返回(batch, owner_indices)
+        batch, owner_indices = self.process_episodes(episodes, device)
         
-        # === 批次契约验证 ===
+        # === 窗口化批次验证 ===
         assert "action_is_pad" in batch, "batch中必须包含action_is_pad字段"
         action_is_pad = batch["action_is_pad"]
         assert action_is_pad.dtype == torch.bool, f"action_is_pad必须是bool类型，当前类型: {action_is_pad.dtype}"
         assert action_is_pad.dim() == 2, f"action_is_pad必须是2维tensor (B,T)，当前维度: {action_is_pad.dim()}"
-        assert action_is_pad.shape[0] == len(episodes), f"action_is_pad批次维度({action_is_pad.shape[0]})必须与episodes数量({len(episodes)})匹配"
+        
+        B = batch["state"].shape[0]  # 现在B=窗口数量
+        assert len(owner_indices) == B, f"owner_indices长度({len(owner_indices)})必须与窗口数量({B})匹配"
         
         # 验证至少有一个有效步
         valid_steps = (~action_is_pad).sum()
         assert valid_steps > 0, "action_is_pad显示所有步骤都是padding，必须至少有一个有效步骤"
         
         # === 关键修复：统一采样noise和time用于CFG双分支 ===
-        B = batch["state"].shape[0]
         n, d = self.policy.config.n_action_steps, self.policy.config.max_action_dim
         dtype = batch["state"].dtype
         
         # 采样一次noise和time，两个分支共享（与最初CFGRL实现对齐）
         noise = torch.randn(B, n, d, device=device, dtype=dtype)
         time = self.policy.model.sample_time(B, device).to(dtype)
+        
+        # 🔥 新增：优势映射 - 从episode级到窗口级
+        window_advantages = torch.zeros(B, device=device, dtype=advantages.dtype)
+        for window_idx, episode_idx in enumerate(owner_indices):
+            window_advantages[window_idx] = advantages[episode_idx]
+        
+        print(f"🔧 优势映射: {len(episodes)} episodes → {B} windows")
+        print(f"   episode优势: {advantages.shape} = {advantages[:5].tolist()[:5]}...")
+        print(f"   窗口优势: {window_advantages.shape} = {window_advantages[:5].tolist()[:5]}...")
         
         # === CFG风格双分支损失计算 ===
         
@@ -278,7 +447,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         per_step_per_dim_pos = loss_dict_pos["losses"]
         assert isinstance(per_step_per_dim_pos, torch.Tensor), f"losses必须是torch.Tensor，条件分支类型: {type(per_step_per_dim_pos)}"
         assert per_step_per_dim_pos.dim() == 3, f"losses必须是3维tensor (B,T,D)，条件分支维度: {per_step_per_dim_pos.dim()}"
-        assert per_step_per_dim_pos.shape[0] == len(episodes), f"losses批次维度({per_step_per_dim_pos.shape[0]})必须与episodes数量({len(episodes)})匹配"
+        assert per_step_per_dim_pos.shape[0] == B, f"losses批次维度({per_step_per_dim_pos.shape[0]})必须与窗口数量({B})匹配"
         assert per_step_per_dim_pos.shape[1] == action_is_pad.shape[1], f"losses时间维度({per_step_per_dim_pos.shape[1]})必须与action_is_pad时间维度({action_is_pad.shape[1]})匹配"
 
         # 2. 无条件分支（无指示）- 使用相同的noise和time
@@ -314,8 +483,8 @@ class PI0_CFG_Adapter(RLModelInterface):
         # 获取有效步掩码，排除padding步
         mask = (~action_is_pad).float()  # (B,T)
         
-        # CFG权重计算：二值权重
-        w = (advantages.to(device).float() > 0).float().unsqueeze(1).expand_as(mask)  # (B,T)
+        # 🔥 CFG权重计算：使用窗口级优势
+        w = (window_advantages.to(device).float() > 0).float().unsqueeze(1).expand_as(mask)  # (B,T)
         
         # 样本级组合后统一平均（关键修复：统一分母）
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
