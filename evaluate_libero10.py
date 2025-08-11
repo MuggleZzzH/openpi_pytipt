@@ -124,7 +124,7 @@ class LIBERO10Evaluator:
                 benchmark_name=self.config['task']['benchmark_name'],
                 num_parallel_envs=self.config['task']['num_parallel_envs'],
                 max_episode_length=self.config['task']['max_episode_length'],
-                save_video=self.config['features']['save_video'],
+                # save_video=self.config['features']['save_video'],
                 video_dir=str(self.session_dir / "videos")
             )
             print("✓ 环境运行器设置成功")
