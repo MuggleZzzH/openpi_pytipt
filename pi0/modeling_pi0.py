@@ -53,7 +53,7 @@ class PI0Policy(PreTrainedPolicy):
 
     @torch.no_grad
     def select_action(
-        self, observation: dict[str, Tensor], noise: Tensor | None = None
+        self, observation: dict[str, Tensor], noise: Tensor | None = None, cfg_scale: float = 1.0
     ):
         """
         Observation: {
@@ -68,6 +68,7 @@ class PI0Policy(PreTrainedPolicy):
             "lang_masks": float32 [*b, l],
         }
         either provide `prompt` or (`lang_tokens`, `lang_masks`).
+        cfg_scale: CFG guidance scale for conditional generation
         """
         self.eval()
 
@@ -75,12 +76,12 @@ class PI0Policy(PreTrainedPolicy):
         state = self.prepare_state(observation)
         lang_tokens, lang_masks = self.prepare_language(observation)
         actions = self.model.sample_actions(
-            images, img_masks, lang_tokens, lang_masks, state, noise=noise
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, cfg_scale=cfg_scale
         )
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise=None, time=None
+        self, batch: dict[str, Tensor], noise=None, time=None, is_positive=None
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass to compute the loss
 
@@ -94,6 +95,7 @@ class PI0Policy(PreTrainedPolicy):
             "lang_masks": float32 [*b, l],
             "action": float32 [*b, ha, da]
         }
+        is_positive: int32 [*b] optional CFG conditioning (1=positive, 0=unconditional)
         """
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -101,10 +103,11 @@ class PI0Policy(PreTrainedPolicy):
         actions, action_dim = self.prepare_action(batch)
         noise = batch.get("noise", None)
         time = batch.get("time", None)
+        is_positive = batch.get("is_positive", is_positive)
 
         loss_dict = {}
         losses = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, is_positive
         )
 
         actions_is_pad = batch.get("action_is_pad", None)
@@ -336,6 +339,9 @@ class PI0FlowMatching(nn.Module):
             self.config.proj_width, self.config.max_action_dim
         )
 
+        # CFG conditioning embedding layer
+        self.cfg_emb = nn.Embedding(2, self.config.proj_width)  # 0=unconditional, 1=conditional
+
         self.action_time_mlp_in = nn.Linear(
             self.config.proj_width * 2, self.config.proj_width
         )
@@ -396,13 +402,14 @@ class PI0FlowMatching(nn.Module):
         )
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep):
+    def embed_suffix(self, state, noisy_actions, timestep, is_positive=None):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
 
         Args:
             state (torch.Tensor):         float32 (*b, s) robot state
             noisy_actions (torch.Tensor): float32 (*b, n, m) noisy actions
             timestep (torch.Tensor):      float32 (*b,) timestep in [0, 1] range
+            is_positive (torch.Tensor):   int32 (*b,) conditional indicator (1=positive, 0=unconditional)
         """
         bsize = state.shape[0]
         device = state.device
@@ -410,6 +417,12 @@ class PI0FlowMatching(nn.Module):
 
         # embed state
         state_emb = self.state_proj(state)
+        
+        # CFG: embed conditional indicator if provided
+        if is_positive is not None:
+            cfg_emb = self.cfg_emb(is_positive).to(dtype=dtype)
+            # Add CFG embedding to state embedding
+            state_emb = state_emb + cfg_emb
 
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -457,6 +470,7 @@ class PI0FlowMatching(nn.Module):
         actions,
         noise=None,
         time=None,
+        is_positive=None,
     ) -> Tensor:
         bsize = state.shape[0]
         dtype = state.dtype
@@ -482,7 +496,7 @@ class PI0FlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, time
+            state, x_t, time, is_positive
         )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -505,9 +519,12 @@ class PI0FlowMatching(nn.Module):
         return losses
 
     def sample_actions(
-        self, images, img_masks, lang_tokens, lang_masks, state, noise=None
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, cfg_scale=1.0
     ) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+        """Do a full inference forward and compute the action with CFG support
+        
+        cfg_scale: CFG guidance scale. 1.0 = no guidance, >1.0 = stronger guidance
+        """
         bsize = state.shape[0]
         device = state.device
         dtype = state.dtype
@@ -542,9 +559,21 @@ class PI0FlowMatching(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
 
-            v_t = self.predict_velocity(
-                state, prefix_pad_masks, past_key_values, x_t, expanded_time
-            )
+            if cfg_scale > 1.0:
+                # CFG: predict both conditional and unconditional velocities
+                v_t_cond = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=1
+                )
+                v_t_uncond = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=0
+                )
+                # Apply CFG guidance
+                v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
+            else:
+                # Standard unconditional generation
+                v_t = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
+                )
 
             # Euler step
             x_t += dt * v_t
@@ -552,10 +581,10 @@ class PI0FlowMatching(nn.Module):
 
         return x_t
 
-    def predict_velocity(self, state, prefix_pad_masks, past_key_values, x_t, timestep):
+    def predict_velocity(self, state, prefix_pad_masks, past_key_values, x_t, timestep, is_positive=None):
         """predict velocity at time t using the suffix model."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, timestep
+            state, x_t, timestep, is_positive
         )
 
         suffix_len = suffix_pad_masks.shape[1]

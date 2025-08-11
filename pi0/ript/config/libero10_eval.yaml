@@ -1,0 +1,58 @@
+# LIBERO-10 (LIBERO_GOAL) 完整评估配置
+# 用于验证PI0 checkpoint在所有10个任务上的性能
+
+exp_name: libero10_checkpoint_evaluation
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/libero10_eval"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"  # LIBERO_GOAL基准
+  # 所有10个LIBERO_GOAL任务
+  task_names_to_use:
+    - "LIBERO_GOAL_move_the_blue_mug_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_green_bowl_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_red_plate_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_yellow_bottle_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_black_can_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_black_bowl_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_silver_pot_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_pink_cup_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_white_box_to_the_target_pose"
+    - "LIBERO_GOAL_move_the_banana_to_the_target_pose"
+  num_parallel_envs: 1  # 单环境确保评估一致性
+  max_episode_length: 600  # LIBERO标准episode长度
+
+# === 评估配置 ===
+evaluation:
+  rollouts_per_task: 50  # 每个任务评估50次 (参考ript-vla_copy)
+  save_videos: true      # 保存成功/失败案例视频
+  save_success_videos: 5 # 每个任务保存5个成功视频
+  save_failure_videos: 5 # 每个任务保存5个失败视频
+  detailed_logging: true # 详细日志记录
+  
+# === 算法配置 (仅推理) ===
+algo:
+  eval_only: true       # 仅评估模式
+  deterministic: true   # 确定性推理
+  temperature: 0.0      # 贪婪采样
+  
+# === 数据集配置 ===
+dataset:
+  num_init_states: 10   # 每个任务使用10个不同初始状态
+  state_dim: 8
+  
+# === 日志配置 ===
+logging:
+  use_wandb: false      # 关闭wandb，使用本地日志
+  log_freq: 10
+  save_detailed_metrics: true
+
+# === 特性开关 ===
+features:
+  save_video: true                   # 保存评估视频
+  enable_parallel_envs: false        # 评估时关闭并行环境
+  enable_deterministic_eval: true    # 确定性评估
+  calculate_detailed_stats: true     # 计算详细统计信息

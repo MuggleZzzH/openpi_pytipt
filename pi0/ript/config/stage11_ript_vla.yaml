@@ -17,7 +17,7 @@ task:
 
 # === 算法配置 ===
 algo:
-  rloo_batch_size: 6  # 匹配并行环境数
+  rloo_batch_size: 4  # 匹配并行环境数
   lr: 1e-5
   gradient_accumulation_steps: 1
   # RolloutGenerator配置

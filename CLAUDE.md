@@ -46,6 +46,8 @@ This is a simplified PyTorch implementation of LeRobot's PI0 and PI0-fast Vision
 
 The repository has recently been enhanced with production-ready features including:
 
+- **CFG (Classifier-Free Guidance) Integration**: PI0 models now support conditional/unconditional generation with CFG-style training for improved quality
+- **Stage 12 Multi-Task Evolution**: Progressive development towards libero-10 multi-task training with enhanced RLOO advantage computation
 - **Advanced Parallel Environment Support**: Intelligent parallel environment management with automatic memory optimization and batch processing fallbacks to prevent GPU memory overflow
 - **Enhanced Testing Infrastructure**: Comprehensive test suites (`test_enhanced_features.py`, `quick_single_gpu_test.py`) that validate all system components
 - **File-based Distributed Coordination**: `FileGlobalCounter` system for robust multi-process coordination using file locks
@@ -54,7 +56,7 @@ The repository has recently been enhanced with production-ready features includi
 
 ## Staged Development Architecture
 
-The codebase follows a **11-stage progressive development approach** from basic inference to production-ready distributed training:
+The codebase follows a **12-stage progressive development approach** from basic inference to production-ready distributed training:
 
 - **Stages 1-6**: `scripts/` directory - Basic inference and environment integration
 - **Stage 7**: `7_train_with_rl_core.py` - Core RL training implementation
@@ -62,6 +64,7 @@ The codebase follows a **11-stage progressive development approach** from basic 
 - **Stage 9**: `9_train_with_config.py` - YAML configuration system
 - **Stage 10**: `10_train_with_distributed.py` - Multi-GPU distributed training
 - **Stage 11**: `11_train_ript_vla_style.py` - RIPT-VLA style simplified training with enhanced parallel environment support
+- **Stage 12**: Multi-task evolution towards libero-10 with enhanced RLOO advantage computation and CFG integration
 
 Each stage builds incrementally on the previous ones, maintaining backward compatibility while adding sophisticated features.
 
@@ -176,6 +179,9 @@ python 10_train_with_distributed.py --config_path pi0/ript/config/distributed_tr
 
 # RIPT-VLA style simplified training with enhanced parallel environment support
 python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_ript_vla.yaml
+
+# Stage 12: Multi-task libero-10 evolution with CFG (in development)
+python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_ript_vla.yaml
 ```
 
 Debug training with minimal configuration:
@@ -211,6 +217,10 @@ python test_parallel_envs.py              # Test parallel environment functional
 # Performance analysis (when investigating issues)
 python test_ript_vs_original.py     # Compare RIPT vs reference implementation
 python analyze_inference_differences.py # Detailed inference analysis
+
+# CFG (Classifier-Free Guidance) testing
+python test_cfg_implementation.py   # Test CFG conditional/unconditional generation
+python -c "from pi0.modeling_pi0 import PI0Policy; policy = PI0Policy.from_pretrained('/path/to/checkpoint'); print('✓ CFG-enabled PI0 loaded')"
 ```
 
 ### Development Environment Setup
@@ -262,10 +272,11 @@ ript = json.load(open('ript/debug_analysis/session_*/checkpoint2_obs_step0.json'
 The RIPT framework implements CFG-style reinforcement learning for PI0 policies with a sophisticated multi-stage architecture:
 
 1. **Flow Matching + CFG-RL**: PI0 uses time-based interpolation for action generation, optimized with classifier-free guidance style advantage weighting
-2. **Distributed Training**: Multi-process coordination through file-based counters and PyTorch DDP
-3. **LIBERO Integration**: 32D policy actions mapped to 7D LIBERO environment actions (6-DOF pose + gripper)
-4. **Advantage Computation**: Leave-One-Out baseline for trajectory-level advantage estimation without value networks
-5. **Smart Sampling**: Enhanced sampling system with state history tracking and intelligent state selection
+2. **CFG Dual-Branch Training**: Conditional and unconditional loss computation with configurable weighting (α=0.1 default)
+3. **Distributed Training**: Multi-process coordination through file-based counters and PyTorch DDP
+4. **LIBERO Integration**: 32D policy actions mapped to 7D LIBERO environment actions (6-DOF pose + gripper)
+5. **Advantage Computation**: Leave-One-Out baseline for trajectory-level advantage estimation without value networks
+6. **Smart Sampling**: Enhanced sampling system with state history tracking and intelligent state selection
 
 ### Progressive Training Pipeline Evolution
 The training system evolved through multiple stages:
@@ -294,8 +305,8 @@ The PI0 model processes multi-modal inputs through standardized interfaces:
 
 **Core Prediction Interface** (`pi0/modeling_pi0.py:55`):
 ```python
-# Main inference method
-action = policy.select_action(observation)
+# Main inference method with CFG support
+action = policy.select_action(observation, cfg_scale=3.0)  # CFG guidance scale
 
 # Expected observation format:
 observation = {
@@ -305,6 +316,13 @@ observation = {
     },
     "state": torch.tensor,               # (B, state_dim) float32 robot state
     "prompt": ["task description"],      # List of task instructions
+}
+
+# CFG Training batch format:
+batch = {
+    **observation,
+    "action": torch.tensor,              # (B, T, action_dim) target actions
+    "is_positive": torch.tensor,         # (B,) int32 conditional indicator (1=positive, 0=unconditional)
 }
 ```
 
@@ -433,21 +451,29 @@ debug_2test_images/                      # Reference implementation image debug
 ## Development Notes
 
 ### Current Implementation Status
-The repository has reached production readiness with all 10 development stages completed:
+The repository has reached production readiness with 11 core development stages completed and Stage 12 in active development:
 
 **Core Features (✅ Complete)**:
 - PI0/PI0-fast model implementations with JAX-to-PyTorch conversion
-- RIPT RL training framework with CFG-style advantage weighting  
+- RIPT RL training framework with CFG-style advantage weighting
+- CFG (Classifier-Free Guidance) conditional/unconditional generation support  
 - Enhanced smart sampling with state history tracking
 - YAML-based configuration management system
 - Multi-GPU distributed training with PyTorch DDP
 - Comprehensive debugging and diagnostic tools
+
+**Stage 12 Development (🚧 In Progress)**:
+- Multi-task libero-10 training architecture
+- Enhanced RLOO advantage computation with sample-level filtering
+- Demo-batch × RLOO group dual-layer organization
+- Dynamic sampling optimization and stabilization
 
 **Quality Assurance Findings**:
 - Environment data is identical between implementations
 - Action outputs differ by 5-11cm despite identical inputs
 - Issue isolated to model inference layer, not environment or RL training
 - Systematic debugging infrastructure enables rapid problem diagnosis
+- CFG implementation provides improved training stability and quality
 
 ### Production Training Recommendations
 - **Development**: Use Stage 7-8 scripts for rapid iteration
@@ -550,8 +576,26 @@ Modern configuration system with granular feature control:
 - `save_video`: Enable video recording during training for debugging and analysis
 - Backward compatibility with all existing configurations
 
-### Stage 11 Enhanced Features
-The latest stage includes several breakthrough improvements:
+### Stage 12 Multi-Task Evolution (In Progress)
+The latest development stage focuses on evolving from single-task to libero-10 multi-task training:
+
+**Key Objectives**:
+- Transition from single-task "put_the_bowl_on_the_stove" to libero-10 multi-task scenarios
+- Enhanced RLOO advantage computation with sample-level filtering
+- Integration of demo-batch × RLOO group dual-layer batch organization
+- Task-aware initial state data sources and multi-task environment reuse
+
+**Implementation Strategy** (STAGE12_INCREMENTAL_CHECKLIST.md):
+1. **Disable Dynamic Sampling**: Prevent "total_steps=0" issues by disabling aggressive batch-level filtering
+2. **Integrate RolloutGenerator**: Replace batch-level filtering with sample-level collection and statistics
+3. **Enhanced RLOO Computation**: Implement sample-level advantage computation with group-based baselines
+4. **Multi-Task Environment**: Support libero-10 task distribution and task-aware state sampling
+5. **Demo-Batch Organization**: Implement dual-layer batch structure for improved training stability
+
+**Current Status**: 
+- CFG implementation completed and integrated
+- Dynamic sampling issues identified and solutions planned
+- Progressive rollout of multi-task capabilities in development
 
 **Independent Environment Factory**: Solves the fundamental SubprocVectorEnv serialization problem by creating truly independent environment creation functions that don't reference the main process's policy object.
 

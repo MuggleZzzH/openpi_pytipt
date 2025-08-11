@@ -101,230 +101,98 @@ class PI0_CFG_Adapter(RLModelInterface):
         device: Optional[torch.device] = None,
     ) -> Dict[str, Any]:
         """
-        Process a list of episode dictionaries into a single batch usable by PI0Policy.
-        优化版本，更好地处理 Pi0LiberoRunner 生成的 episode 数据。
-        
-        Args:
-            episodes: A list of episode dictionaries collected from the runner.
-            device: The device to place tensors on.
-        Returns:
-            A batch dictionary ready for `policy.forward()`.
+        将 episodes 打包为 PI0Policy 期望的 batch：
+        - action 形状保持 (B, T, 7)，不在这里填到 32 维；
+        - 提供 action_is_pad: (B, T) 布尔，True 表示该时间步是 padding；
+        - 状态统一 8 维 (3 pos + 3 axis-angle + 2 gripper)；
         """
         if device is None:
             device = self.device
-
-        # Validate input
         if not episodes:
             raise ValueError("Empty episodes list provided")
 
-        all_obs_states = []
-        all_obs_images = []
-        all_actions = []
-        all_tasks = []
+        all_states, all_images, all_actions = [], [], []
+        all_action_is_pad, all_tasks = [], []
 
-        # Process each episode
-        for i, episode in enumerate(episodes):
+        target_seq_len = getattr(self.policy.config, 'n_action_steps', 50)
+        diffusion_steps = getattr(self.policy.config, 'num_steps', 10)
+        print(f"Using target_seq_len={target_seq_len} (n_action_steps), diffusion_steps={diffusion_steps}")
+
+        for i, ep in enumerate(episodes):
             try:
-                # 验证 episode 结构
-                required_keys = ['observations', 'actions', 'task']
-                missing_keys = [key for key in required_keys if key not in episode]
-                if missing_keys:
-                    raise KeyError(f"Episode {i} missing keys: {missing_keys}")
-                
-                # 获取 episode 数据
-                observations = episode['observations']
-                actions = episode['actions'] 
-                tasks = episode['task']
-                
+                observations = ep['observations']
+                actions = ep['actions']
+                tasks = ep.get('task', "default task")
                 if not observations:
-                    raise ValueError(f"Episode {i} has empty observations")
-                    
-                # 处理每个时间步的数据
-                episode_states = []
-                episode_images = []
-                episode_actions = []
-                
-                # 取样本：确保固定的序列长度
+                    raise ValueError(f"Episode {i} empty observations")
+
+                # 收集
+                states_seq, images_seq, actions_seq = [], [], []
                 max_steps = min(len(observations), len(actions))
-                # 🔧 修复：分离扩散步数和动作序列长度
-                # 使用 n_action_steps 作为动作序列长度，而不是 num_steps（扩散去噪步数）
-                target_seq_len = getattr(self.policy.config, 'n_action_steps', 50)  
-                diffusion_steps = getattr(self.policy.config, 'num_steps', 10)
-                print(f"Using target_seq_len={target_seq_len} from PI0 config (n_action_steps)")
-                print(f"Diffusion denoising steps={diffusion_steps} from PI0 config (num_steps)")
-                
-                # 为了生成完整的调试视频，我们需要保存所有步骤的图像
-                # 但对于模型训练，仍然使用固定的序列长度
-                debug_save_all_steps = True  # 启用完整轨迹调试保存
-                
-                if debug_save_all_steps:
-                    # 调试模式：保存所有步骤的图像数据
-                    sample_indices = list(range(max_steps))
-                    print(f"调试模式：保存完整轨迹 {max_steps} 步用于视频生成")
-                elif max_steps >= target_seq_len:
-                    # 如果有足够的步数，取最后 target_seq_len 步
-                    sample_indices = list(range(max_steps - target_seq_len, max_steps))
-                else:
-                    # 如果步数不足，取所有步数并补齐
-                    sample_indices = list(range(max_steps))
-                
-                for step_idx in sample_indices:
-                    # 处理观测数据
-                    if step_idx < len(observations):
-                        step_obs = observations[step_idx]
-                        
-                        # 处理状态数据
-                        state = self._extract_state_from_obs(step_obs, i, step_idx)
-                        episode_states.append(state)
-                        
-                        # 处理图像数据
-                        image = self._extract_image_from_obs(step_obs, i, step_idx)
-                        episode_images.append(image)
-                    else:
-                        # 如果观测数据不足，使用默认值
-                        episode_states.append(np.zeros(7, dtype=np.float32))
-                        episode_images.append(np.ones((224, 224, 3), dtype=np.uint8) * 128)
-                    
-                    # 处理动作数据
-                    if step_idx < len(actions):
-                        step_action = actions[step_idx]
-                        if isinstance(step_action, list) and len(step_action) > 0:
-                            # 取第一个环境的动作（对于单环境或第一个环境）
-                            action = np.array(step_action[0], dtype=np.float32)
-                        else:
-                            action = np.array(step_action, dtype=np.float32)
-                        
-                        # 确保动作是 7 维的（LIBERO 格式）
-                        if action.size != 7:
-                            if action.size > 7:
-                                action = action[:7]
-                            else:
-                                padded_action = np.zeros(7, dtype=np.float32)
-                                padded_action[:action.size] = action
-                                action = padded_action
-                        
-                        episode_actions.append(action)
-                    else:
-                        episode_actions.append(np.zeros(7, dtype=np.float32))
-                
-                # 对整个 episode 的数据做聚合，确保固定的序列长度
-                if episode_states:
-                    if debug_save_all_steps:
-                        # 调试模式：保存所有图像用于视频生成，但只用最后的状态和动作用于训练
-                        print(f"调试：保存了 {len(episode_images)} 张图像用于视频生成")
-                        
-                        # 对于模型训练，仍使用最后的状态和最后target_seq_len个动作
-                        final_state = np.array(episode_states[-1])  # 取最后一个状态
-                        final_image = episode_images[-1]  # 取最后一个图像用于模型输入
-                        
-                        # 确保动作序列长度为 target_seq_len（用于模型训练）
-                        if len(episode_actions) >= target_seq_len:
-                            # 取最后 target_seq_len 个动作用于训练
-                            final_action = np.array(episode_actions[-target_seq_len:])
-                        else:
-                            # 不足的话进行填充
-                            padded_actions = []
-                            for i in range(target_seq_len):
-                                if i < len(episode_actions):
-                                    padded_actions.append(episode_actions[i])
-                                else:
-                                    # 用最后一个动作填充
-                                    padded_actions.append(episode_actions[-1] if episode_actions else np.zeros(7, dtype=np.float32))
-                            final_action = np.array(padded_actions)
-                        
-                        print(f"调试：训练数据 - 状态形状: {final_state.shape}, 图像形状: {final_image.shape}, 动作形状: {final_action.shape}")
-                    else:
-                        # 原始模式：只处理采样的步骤
-                        final_state = np.array(episode_states[-1])  # 取最后一个状态
-                        final_image = episode_images[-1]  # 取最后一个图像
-                        
-                        # 确保动作序列长度为 target_seq_len
-                        if len(episode_actions) >= target_seq_len:
-                            final_action = np.array(episode_actions[:target_seq_len])  # 取前 target_seq_len 个
-                        else:
-                            # 不足的话进行填充
-                            padded_actions = []
-                            for i in range(target_seq_len):
-                                if i < len(episode_actions):
-                                    padded_actions.append(episode_actions[i])
-                                else:
-                                    # 用最后一个动作填充
-                                    padded_actions.append(episode_actions[-1] if episode_actions else np.zeros(7, dtype=np.float32))
-                            final_action = np.array(padded_actions)
-                else:
-                    final_state = np.zeros(7, dtype=np.float32)
-                    final_image = np.ones((224, 224, 3), dtype=np.uint8) * 128
-                    final_action = np.zeros((target_seq_len, 7), dtype=np.float32)
-                
-                all_obs_states.append(final_state)
-                all_obs_images.append(final_image)
+                sample_idx = list(range(max_steps))  # 全量保存，便于视频
+
+                for t in sample_idx:
+                    obs_t = observations[t] if t < len(observations) else {}
+                    act_t = actions[t] if t < len(actions) else np.zeros(7, np.float32)
+
+                    # 状态(8维)
+                    states_seq.append(self._extract_state_from_obs(obs_t, i, t))
+                    # 图像(HWC)
+                    images_seq.append(self._extract_image_from_obs(obs_t, i, t))
+
+                    # 动作(7维)
+                    act_t = np.array(act_t[0] if (isinstance(act_t, list) and len(act_t) > 0) else act_t,
+                                    dtype=np.float32)
+                    if act_t.size != 7:
+                        buf = np.zeros(7, dtype=np.float32)
+                        buf[:min(7, act_t.size)] = act_t[:min(7, act_t.size)]
+                        act_t = buf
+                    actions_seq.append(act_t)
+
+                # 固定长度 + 掩码
+                valid_len = min(len(actions_seq), target_seq_len)
+                final_action = np.zeros((target_seq_len, 7), dtype=np.float32)
+                if valid_len > 0:
+                    final_action[:valid_len] = np.asarray(actions_seq[-valid_len:], dtype=np.float32)
+
+                action_is_pad = np.ones((target_seq_len,), dtype=bool)
+                action_is_pad[:valid_len] = False
+
+                final_state = np.asarray(states_seq[-1], dtype=np.float32) if states_seq else np.zeros(8, np.float32)
+                final_image = images_seq[-1] if images_seq else (np.ones((224, 224, 3), np.uint8) * 128)
+
+                all_states.append(final_state)
+                all_images.append(final_image)
                 all_actions.append(final_action)
-                
-                # 在调试模式下，生成episode视频
-                if debug_save_all_steps and len(episode_images) > 10:
-                    try:
-                        self._generate_episode_video(episode_images, i, tasks[0] if tasks else "unknown_task")
-                    except Exception as video_e:
-                        print(f"生成episode视频失败: {video_e}")
-                
-                # 处理任务描述
-                if tasks:
-                    task_str = tasks[0] if isinstance(tasks, list) else str(tasks)
-                else:
-                    task_str = "default task"
+                all_action_is_pad.append(action_is_pad)
+
+                task_str = tasks[0] if isinstance(tasks, list) else str(tasks)
                 all_tasks.append(task_str)
-                
+
             except Exception as e:
                 print(f"Error processing episode {i}: {e}")
-                print(f"Episode keys: {episode.keys() if isinstance(episode, dict) else 'Not a dict'}")
-                # 使用默认值继续
-                all_obs_states.append(np.zeros(7, dtype=np.float32))
-                all_obs_images.append(np.ones((224, 224, 3), dtype=np.uint8) * 128)
-                all_actions.append(np.zeros((1, 7), dtype=np.float32))
+                all_states.append(np.zeros(8, np.float32))
+                all_images.append(np.ones((224, 224, 3), np.uint8) * 128)
+                all_actions.append(np.zeros((target_seq_len, 7), np.float32))
+                all_action_is_pad.append(np.ones((target_seq_len,), dtype=bool))
                 all_tasks.append("default task")
 
-        try:
-            # 🔧 关键修复：将7维LIBERO动作填充到32维PI0动作
-            padded_actions = []
-            for action_seq in all_actions:
-                # action_seq shape: (sequence_length, 7)
-                seq_len = action_seq.shape[0]
-                # 创建 (sequence_length, 32) 的零填充动作
-                padded_action_seq = np.zeros((seq_len, 32), dtype=np.float32)
-                # 将前7维复制过去
-                padded_action_seq[:, :7] = action_seq
-                padded_actions.append(padded_action_seq)
-            
-            # Create the final batch dictionary with nested structure expected by PI0
-            batch = {
-                'state': torch.from_numpy(np.stack(all_obs_states)).to(device, dtype=torch.float32),
-                'image': {
-                    'base_0_rgb': torch.from_numpy(np.stack(all_obs_images)).to(device, dtype=torch.uint8)
-                },
-                'action': torch.from_numpy(np.stack(padded_actions)).to(device, dtype=torch.float32),
-                'prompt': all_tasks,
-            }
-            
-            # Validate batch dimensions
-            batch_size = len(episodes)
-            assert batch['state'].shape[0] == batch_size
-            assert batch['image']['base_0_rgb'].shape[0] == batch_size
-            assert batch['action'].shape[0] == batch_size
-            assert len(batch['prompt']) == batch_size
-            
-            print(f"Processed batch - states: {batch['state'].shape}, "
-                  f"images: {batch['image']['base_0_rgb'].shape}, "
-                  f"actions: {batch['action'].shape} (padded to 32 dims)")
-            
-            return batch
-            
-        except Exception as e:
-            print(f"Error creating batch: {e}")
-            print(f"States shapes: {[s.shape for s in all_obs_states]}")
-            print(f"Images shapes: {[img.shape for img in all_obs_images]}")
-            print(f"Actions shapes: {[a.shape for a in all_actions]}")
-            raise
+        batch = {
+            "state": torch.from_numpy(np.stack(all_states)).to(device, dtype=torch.float32),            # (B,8)
+            "image": {"base_0_rgb": torch.from_numpy(np.stack(all_images)).to(device, dtype=torch.uint8)},  # (B,H,W,3)
+            "action": torch.from_numpy(np.stack(all_actions)).to(device, dtype=torch.float32),          # (B,T,7)
+            "action_is_pad": torch.from_numpy(np.stack(all_action_is_pad)).to(device),                  # (B,T) bool
+            "prompt": all_tasks,
+        }
 
+        bs = len(episodes)
+        assert batch["state"].shape[0] == bs
+        assert batch["image"]["base_0_rgb"].shape[0] == bs
+        assert batch["action"].shape[0] == bs
+        assert batch["action_is_pad"].shape[0] == bs
+        print(f"Processed batch: state {batch['state'].shape}, image {batch['image']['base_0_rgb'].shape}, "
+            f"action {batch['action'].shape}, action_is_pad {batch['action_is_pad'].shape}")
+        return batch
     def compute_weighted_loss(
         self,
         episodes: List[Dict[str, Any]],
@@ -332,167 +200,100 @@ class PI0_CFG_Adapter(RLModelInterface):
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """
-        Computes the advantage-weighted L2 loss for a batch of trajectories.
-        This is the core of the CFG-style training update.
-        Enhanced with comprehensive NaN/Inf detection and error handling.
-
-        Args:
-            episodes: A list of episode dictionaries.
-            advantages: A tensor of shape (batch_size,) containing the advantage for each episode.
-            device: The device to place tensors on.
-
-        Returns:
-            A scalar tensor representing the final weighted loss for backpropagation.
+        CFG风格训练：同时计算条件和无条件损失
+        - 条件损失：使用正优势加权，告诉模型这些是好样本
+        - 无条件损失：提供基线，防止模式崩溃
+        - 组合损失：条件 + α * 无条件 (α通常为0.1)
         """
         if device is None:
             device = self.device
 
-        # Validate inputs
-        if not episodes:
-            print("❌ 空的episode列表，返回零损失")
+        if not episodes or advantages is None or len(advantages) == 0:
             return torch.tensor(0.0, device=device, requires_grad=True)
-        
-        if advantages is None or len(advantages) == 0:
-            print("❌ 空的优势张量，返回零损失")
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        
         if len(episodes) != len(advantages):
-            print(f"❌ episodes数量({len(episodes)})与advantages数量({len(advantages)})不匹配")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+            n = min(len(episodes), len(advantages))
+            episodes = episodes[:n]
+            advantages = advantages[:n]
 
-        # Check for NaN/Inf in advantages before processing
-        if torch.isnan(advantages).any() or torch.isinf(advantages).any():
-            print("⚠️ 检测到优势中的NaN/Inf值，进行清理")
-            advantages = torch.nan_to_num(advantages, nan=0.0, posinf=1.0, neginf=-1.0)
+        batch = self.process_episodes(episodes, device)
+        
+        # === CFG风格双分支损失计算 ===
+        
+        # 1. 条件分支（正样本指示）
+        batch_positive = batch.copy()
+        batch_positive["is_positive"] = torch.ones(len(episodes), device=device, dtype=torch.int32)
+        
+        out_positive = self.policy.forward(batch_positive)
+        if isinstance(out_positive, tuple):
+            loss_scalar_pos, loss_dict_pos = out_positive
+        elif isinstance(out_positive, dict):
+            loss_scalar_pos, loss_dict_pos = out_positive.get("loss", None), out_positive
+        else:
+            loss_scalar_pos, loss_dict_pos = out_positive, {}
 
-        # 关键修改：为每个轨迹分别计算损失，以获得正确的形状
-        print(f"开始为 {len(episodes)} 个轨迹分别计算损失")
-        per_trajectory_losses = []
+        # 2. 无条件分支（无指示）
+        batch_uncond = batch.copy()
+        batch_uncond["is_positive"] = torch.zeros(len(episodes), device=device, dtype=torch.int32)
         
-        # 添加进度条以更清晰地显示处理进度
-        from tqdm import tqdm
-        
-        try:
-            for i, episode in tqdm(enumerate(episodes), total=len(episodes), desc="计算轨迹损失", leave=False):
-                # 将单个轨迹转换为批次格式
-                single_batch = self.process_episodes([episode], device)
-                
-                # 只在有问题时才输出详细调试信息
-                debug_needed = False
-                for key, value in single_batch.items():
-                    if torch.is_tensor(value):
-                        # Check for NaN/Inf in input tensors
-                        if torch.isnan(value).any() or torch.isinf(value).any():
-                            if not debug_needed:  # 只输出一次header
-                                print(f"\n⚠️ 轨迹 {i}: 检测到异常值")
-                                debug_needed = True
-                            print(f"  - 张量 {key} 含有NaN/Inf值")
-                            if key == 'observation.image':
-                                single_batch[key] = torch.nan_to_num(value, nan=0.5, posinf=1.0, neginf=0.0)
-                            else:
-                                single_batch[key] = torch.nan_to_num(value, nan=0.0, posinf=1.0, neginf=-1.0)
-                
-                # 为单个轨迹计算损失
-                # 🔧 Debug: 检查传递给PI0的batch结构
-                if i == 0:  # 只打印第一个轨迹的调试信息
-                    print(f"传递给PI0的batch结构:")
-                    for key, value in single_batch.items():
-                        if isinstance(value, dict):
-                            print(f"  {key}: dict with keys {list(value.keys())}")
-                            for k2, v2 in value.items():
-                                print(f"    {k2}: {type(v2)} {getattr(v2, 'shape', 'N/A')}")
-                        else:
-                            print(f"  {key}: {type(value)} {getattr(value, 'shape', 'N/A')}")
-                
-                policy_outputs = self.policy.forward(single_batch)
-                
-                # 处理不同的policy输出格式
-                if isinstance(policy_outputs, tuple):
-                    single_loss = policy_outputs[0]
-                elif isinstance(policy_outputs, torch.Tensor):
-                    single_loss = policy_outputs
-                elif isinstance(policy_outputs, dict) and 'loss' in policy_outputs:
-                    single_loss = policy_outputs['loss']
-                else:
-                    print(f"❌ 轨迹 {i}: 未知的策略输出格式: {type(policy_outputs)}")
-                    single_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                
-                if single_loss is None:
-                    print(f"❌ 轨迹 {i}: 策略返回None损失")
-                    single_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                
-                # 确保损失是标量
-                if single_loss.dim() > 0:
-                    single_loss = single_loss.mean()
-                
-                # 检查NaN/Inf
-                if torch.isnan(single_loss) or torch.isinf(single_loss):
-                    print(f"⚠️ 轨迹 {i}: 检测到NaN/Inf损失，替换为0")
-                    single_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                
-                per_trajectory_losses.append(single_loss)
-                # 只保留异常情况的日志输出，正常情况静默处理
-                
-            # 将列表转换为张量
-            per_trajectory_loss = torch.stack(per_trajectory_losses)  # Shape: (num_trajectories,)
-            
-            print(f"✓ 轨迹损失计算完成 - 形状: {per_trajectory_loss.shape}")
-            if len(per_trajectory_losses) <= 10:  # 只有轨迹数较少时才显示详细值
-                print(f"  损失值: {[f'{x.item():.4f}' for x in per_trajectory_loss]}")
-            else:
-                print(f"  损失范围: [{per_trajectory_loss.min().item():.4f}, {per_trajectory_loss.max().item():.4f}]")
-            
-        except Exception as e:
-            print(f"❌ 分别计算轨迹损失时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            # 创建安全的默认损失
-            per_trajectory_loss = torch.zeros(len(episodes), device=device, requires_grad=True)
+        out_uncond = self.policy.forward(batch_uncond)
+        if isinstance(out_uncond, tuple):
+            loss_scalar_uncond, loss_dict_uncond = out_uncond
+        elif isinstance(out_uncond, dict):
+            loss_scalar_uncond, loss_dict_uncond = out_uncond.get("loss", None), out_uncond
+        else:
+            loss_scalar_uncond, loss_dict_uncond = out_uncond, {}
 
-        # 4. Weight the loss by the advantage
-        # advantages tensor shape is (batch_size,)
-        print(f"优势形状: {advantages.shape}, 值: {advantages}")
-        
-        try:
-            # 现在形状应该匹配了！
-            if per_trajectory_loss.shape[0] != advantages.shape[0]:
-                print(f"❌ 损失和优势形状仍然不匹配: {per_trajectory_loss.shape[0]} vs {advantages.shape[0]}")
-                print("这不应该发生，但为了安全起见进行截断")
-                min_size = min(per_trajectory_loss.shape[0], advantages.shape[0])
-                per_trajectory_loss = per_trajectory_loss[:min_size]
-                advantages = advantages[:min_size]
-            else:
-                print(f"✅ 损失和优势形状匹配: {per_trajectory_loss.shape[0]} vs {advantages.shape[0]}")
+        # 3. 计算CFG组合损失
+        if isinstance(loss_dict_pos, dict) and "losses" in loss_dict_pos:
+            # 使用详细损失信息
+            per_step_per_dim_pos = loss_dict_pos["losses"]  # (B, T, D)
+            per_step_per_dim_uncond = loss_dict_uncond.get("losses", per_step_per_dim_pos)
             
-            advantages = advantages.to(device)
-            weighted_loss = per_trajectory_loss * advantages
-            
-            # Check for NaN/Inf in weighted loss
-            if torch.isnan(weighted_loss).any() or torch.isinf(weighted_loss).any():
-                print("⚠️ 加权损失产生NaN/Inf值，进行清理")
-                weighted_loss = torch.nan_to_num(weighted_loss, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-            print(f"✓ 加权损失: {weighted_loss}")
-        
-        except Exception as e:
-            print(f"❌ 计算加权损失时出错: {e}")
-            weighted_loss = torch.zeros(len(episodes), device=device, requires_grad=True)
+            if per_step_per_dim_pos.dim() == 3:
+                per_step_pos = per_step_per_dim_pos.mean(dim=-1)  # (B,T)
+                per_step_uncond = per_step_per_dim_uncond.mean(dim=-1)  # (B,T)
 
-        # 5. Return the mean loss for the batch
-        try:
-            final_loss = weighted_loss.mean()
+                # CFG权重计算：正优势样本用于条件训练
+                w_traj = (advantages.to(device).float() > 0).float()  # (B,) 二值权重
+                w_step_pos = w_traj.unsqueeze(1).expand_as(per_step_pos)  # (B,T)
+                
+                # 条件损失：优势加权
+                denom_pos = w_step_pos.sum().clamp_min(1.0)
+                loss_positive = (per_step_pos * w_step_pos).sum() / denom_pos
+                
+                # 无条件损失：所有样本均等权重
+                loss_unconditional = per_step_uncond.mean()
+                
+                # CFG组合：条件 + α * 无条件
+                cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
+                final_loss = loss_positive + cfg_alpha * loss_unconditional
+                
+                if torch.isnan(final_loss) or torch.isinf(final_loss):
+                    final_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                return final_loss
+
+        # 兜底：使用标量损失
+        base_pos = loss_scalar_pos if (loss_scalar_pos is not None and isinstance(loss_scalar_pos, torch.Tensor)) \
+            else torch.tensor(0.0, device=device, requires_grad=True)
+        base_uncond = loss_scalar_uncond if (loss_scalar_uncond is not None and isinstance(loss_scalar_uncond, torch.Tensor)) \
+            else torch.tensor(0.0, device=device, requires_grad=True)
             
-            # Final NaN/Inf check
-            if torch.isnan(final_loss) or torch.isinf(final_loss):
-                print("⚠️ 最终损失为NaN/Inf，使用零损失")
-                final_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        if base_pos.dim() != 0:
+            base_pos = base_pos.mean()
+        if base_uncond.dim() != 0:
+            base_uncond = base_uncond.mean()
             
-            print(f"✓ 最终损失: {final_loss.item()}")
-            return final_loss
+        # 优势权重
+        w = (advantages.to(device).float() > 0).float()
+        loss_positive = base_pos * (w.mean().clamp_min(1e-6))
+        loss_unconditional = base_uncond
         
-        except Exception as e:
-            print(f"❌ 计算最终损失时出错: {e}")
-            return torch.tensor(0.0, device=device, requires_grad=True)
+        cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
+        final_loss = loss_positive + cfg_alpha * loss_unconditional
+        
+        if torch.isnan(final_loss) or torch.isinf(final_loss):
+            final_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        return final_loss
     
     def compute_act_logits(self, model, episodes: List[Dict[str, Any]], device: Optional[torch.device] = None):
         """
@@ -514,73 +315,45 @@ class PI0_CFG_Adapter(RLModelInterface):
         return self.policy
         
     def _extract_state_from_obs(self, obs, episode_idx, step_idx):
-        """从观测中提取状态信息并应用归一化"""
+        """提取 8 维状态: 3 pos + 3 axis-angle + 2 gripper，并按 norm_stats 归一化"""
         try:
-            # 🔧 修复：处理SubprocVectorEnv返回的numpy.array包装的观测
             if isinstance(obs, np.ndarray) and obs.dtype == object:
-                if obs.size == 1:
-                    obs = obs.item()  # 提取单个元素
-                elif obs.size > 0:
-                    obs = obs[0]  # 取第一个元素
-            
+                obs = (obs.item() if obs.size == 1 else obs[0]) if obs.size > 0 else {}
             if isinstance(obs, list) and len(obs) > 0:
-                obs = obs[0]  # 取第一个环境的观测
-            
+                obs = obs[0]
             if not isinstance(obs, dict) or not obs:
-                return np.zeros(7, dtype=np.float32)
-            
-            # 优先使用 end-effector 信息
+                return np.zeros(8, np.float32)
+
             if "robot0_eef_pos" in obs and "robot0_eef_quat" in obs:
                 eef_pos = np.array(obs["robot0_eef_pos"], dtype=np.float32)
                 eef_quat = np.array(obs["robot0_eef_quat"], dtype=np.float32)
-                
-                if eef_pos.size != 3:
-                    eef_pos = np.zeros(3, dtype=np.float32)
-                if eef_quat.size != 4:
-                    eef_quat = np.array([0, 0, 0, 1], dtype=np.float32)
-                
-                # 转换四元数为轴角
+                if eef_pos.size != 3: eef_pos = np.zeros(3, np.float32)
+                if eef_quat.size != 4: eef_quat = np.array([0,0,0,1], np.float32)
                 try:
                     from pi0.ript.utils.pi0_libero_utils import quat2axisangle
                     axis_angle = quat2axisangle(eef_quat).astype(np.float32)
                 except Exception:
-                    axis_angle = np.zeros(3, dtype=np.float32)
-                
-                # 获取 gripper 状态
-                gripper_qpos = 0.0
-                if "robot0_gripper_qpos" in obs:
-                    try:
-                        gripper_qpos = float(obs["robot0_gripper_qpos"][0])
-                    except (IndexError, TypeError, ValueError):
-                        gripper_qpos = 0.0
-                
-                # 构造未归一化的状态 (按照原始demo的格式)
-                unnorm_state = np.concatenate([eef_pos[:3], axis_angle[:3], [gripper_qpos]]).astype(np.float32)
-                
-                # 应用归一化（就像原始demo中的做法）
-                state = self.normalize_state(unnorm_state)
-                
-            # 备用方案：使用关节位置
-            elif "robot0_joint_pos" in obs:
-                joint_pos = np.array(obs["robot0_joint_pos"], dtype=np.float32)
-                if joint_pos.size >= 7:
-                    unnorm_state = joint_pos[:7]
+                    axis_angle = np.zeros(3, np.float32)
+
+                gr = obs.get("robot0_gripper_qpos", [0.0, 0.0])
+                gr = np.array(gr, dtype=np.float32)
+                if gr.size < 2:
+                    gr = np.pad(gr, (0, 2 - gr.size))
                 else:
-                    unnorm_state = np.zeros(7, dtype=np.float32)
-                    unnorm_state[:joint_pos.size] = joint_pos
-                
-                # 应用归一化 
-                state = self.normalize_state(unnorm_state)
+                    gr = gr[:2]
+
+                unnorm = np.concatenate([eef_pos[:3], axis_angle[:3], gr[:2]], dtype=np.float32)  # (8,)
+                state = self.normalize_state(unnorm)
+
             else:
-                state = np.zeros(7, dtype=np.float32)
-            
-            # 处理异常值
-            state = np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0)
-            return state.astype(np.float32)
-            
+                # 无关键字段则回退为 0（与统计相容）
+                state = np.zeros(8, np.float32)
+
+            return np.nan_to_num(state, nan=0.0, posinf=1.0, neginf=-1.0).astype(np.float32)
+
         except Exception as e:
             print(f"提取状态时出错 (episode {episode_idx}, step {step_idx}): {e}")
-            return np.zeros(7, dtype=np.float32)
+            return np.zeros(8, np.float32)
     
     def _extract_image_from_obs(self, obs, episode_idx, step_idx):
         """从观测中提取图像信息"""
