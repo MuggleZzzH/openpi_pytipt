@@ -38,6 +38,7 @@ algo:
   eval_only: true       # 仅评估模式
   deterministic: true   # 确定性推理
   temperature: 0.0      # 贪婪采样
+  cfg_guidance_scale: 3.0  # CFG引导强度，提升推理质量
   
 # === 数据集配置 ===
 dataset:

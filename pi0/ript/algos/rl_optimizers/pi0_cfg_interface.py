@@ -201,98 +201,128 @@ class PI0_CFG_Adapter(RLModelInterface):
     ) -> torch.Tensor:
         """
         CFG风格训练：同时计算条件和无条件损失
-        - 条件损失：使用正优势加权，告诉模型这些是好样本
-        - 无条件损失：提供基线，防止模式崩溃
-        - 组合损失：条件 + α * 无条件 (α通常为0.1)
+        
+        严格契约模式：所有输入/输出必须满足预定义契约，违反则立即失败
+        
+        输入契约:
+        - episodes: 非空list，每个episode包含必需字段
+        - advantages: (B,) tensor，B与episodes数量匹配
+        
+        输出契约:
+        - policy.forward()必须返回包含"losses"字段的dict，shape为(B,T,D)
+        - action_is_pad必须为(B,T) bool tensor，至少有一个有效步
         """
         if device is None:
             device = self.device
 
-        if not episodes or advantages is None or len(advantages) == 0:
-            return torch.tensor(0.0, device=device, requires_grad=True)
-        if len(episodes) != len(advantages):
-            n = min(len(episodes), len(advantages))
-            episodes = episodes[:n]
-            advantages = advantages[:n]
+        # === 严格输入契约验证 ===
+        assert episodes and len(episodes) > 0, "episodes不能为空"
+        assert advantages is not None and len(advantages) > 0, "advantages不能为空"
+        assert len(episodes) == len(advantages), f"episodes数量({len(episodes)})必须与advantages数量({len(advantages)})匹配"
+        assert advantages.dim() == 1, f"advantages必须是1维tensor，当前维度: {advantages.dim()}"
+        assert isinstance(advantages, torch.Tensor), f"advantages必须是torch.Tensor类型，当前类型: {type(advantages)}"
 
         batch = self.process_episodes(episodes, device)
         
+        # === 批次契约验证 ===
+        assert "action_is_pad" in batch, "batch中必须包含action_is_pad字段"
+        action_is_pad = batch["action_is_pad"]
+        assert action_is_pad.dtype == torch.bool, f"action_is_pad必须是bool类型，当前类型: {action_is_pad.dtype}"
+        assert action_is_pad.dim() == 2, f"action_is_pad必须是2维tensor (B,T)，当前维度: {action_is_pad.dim()}"
+        assert action_is_pad.shape[0] == len(episodes), f"action_is_pad批次维度({action_is_pad.shape[0]})必须与episodes数量({len(episodes)})匹配"
+        
+        # 验证至少有一个有效步
+        valid_steps = (~action_is_pad).sum()
+        assert valid_steps > 0, "action_is_pad显示所有步骤都是padding，必须至少有一个有效步骤"
+        
+        # === 关键修复：统一采样noise和time用于CFG双分支 ===
+        B = batch["state"].shape[0]
+        n, d = self.policy.config.n_action_steps, self.policy.config.max_action_dim
+        dtype = batch["state"].dtype
+        
+        # 采样一次noise和time，两个分支共享（与最初CFGRL实现对齐）
+        noise = torch.randn(B, n, d, device=device, dtype=dtype)
+        time = self.policy.model.sample_time(B, device).to(dtype)
+        
         # === CFG风格双分支损失计算 ===
         
-        # 1. 条件分支（正样本指示）
+        # 1. 条件分支（正样本指示）- 使用共享的noise和time
         batch_positive = batch.copy()
-        batch_positive["is_positive"] = torch.ones(len(episodes), device=device, dtype=torch.int32)
+        batch_positive["is_positive"] = torch.ones(B, device=device, dtype=torch.long)
+        batch_positive["noise"] = noise
+        batch_positive["time"] = time
         
         out_positive = self.policy.forward(batch_positive)
+        
+        # === 严格输出契约验证 - 条件分支 ===
+        assert isinstance(out_positive, (dict, tuple)), f"policy.forward()必须返回dict或tuple，条件分支返回类型: {type(out_positive)}"
+        
         if isinstance(out_positive, tuple):
-            loss_scalar_pos, loss_dict_pos = out_positive
-        elif isinstance(out_positive, dict):
-            loss_scalar_pos, loss_dict_pos = out_positive.get("loss", None), out_positive
+            assert len(out_positive) >= 2, f"tuple返回值必须至少包含2个元素，当前长度: {len(out_positive)}"
+            loss_scalar_pos, loss_dict_pos = out_positive[0], out_positive[1]
         else:
-            loss_scalar_pos, loss_dict_pos = out_positive, {}
+            loss_dict_pos = out_positive
+            loss_scalar_pos = out_positive.get("loss")
+        
+        assert isinstance(loss_dict_pos, dict), f"loss_dict必须是dict类型，条件分支类型: {type(loss_dict_pos)}"
+        assert "losses" in loss_dict_pos, "policy forward输出必须包含'losses'字段"
+        
+        per_step_per_dim_pos = loss_dict_pos["losses"]
+        assert isinstance(per_step_per_dim_pos, torch.Tensor), f"losses必须是torch.Tensor，条件分支类型: {type(per_step_per_dim_pos)}"
+        assert per_step_per_dim_pos.dim() == 3, f"losses必须是3维tensor (B,T,D)，条件分支维度: {per_step_per_dim_pos.dim()}"
+        assert per_step_per_dim_pos.shape[0] == len(episodes), f"losses批次维度({per_step_per_dim_pos.shape[0]})必须与episodes数量({len(episodes)})匹配"
+        assert per_step_per_dim_pos.shape[1] == action_is_pad.shape[1], f"losses时间维度({per_step_per_dim_pos.shape[1]})必须与action_is_pad时间维度({action_is_pad.shape[1]})匹配"
 
-        # 2. 无条件分支（无指示）
+        # 2. 无条件分支（无指示）- 使用相同的noise和time
         batch_uncond = batch.copy()
-        batch_uncond["is_positive"] = torch.zeros(len(episodes), device=device, dtype=torch.int32)
+        batch_uncond["is_positive"] = torch.zeros(B, device=device, dtype=torch.long)
+        batch_uncond["noise"] = noise  # 关键：与条件分支共享相同的noise
+        batch_uncond["time"] = time    # 关键：与条件分支共享相同的time
         
         out_uncond = self.policy.forward(batch_uncond)
+        
+        # === 严格输出契约验证 - 无条件分支 ===
+        assert isinstance(out_uncond, (dict, tuple)), f"policy.forward()必须返回dict或tuple，无条件分支返回类型: {type(out_uncond)}"
+        
         if isinstance(out_uncond, tuple):
-            loss_scalar_uncond, loss_dict_uncond = out_uncond
-        elif isinstance(out_uncond, dict):
-            loss_scalar_uncond, loss_dict_uncond = out_uncond.get("loss", None), out_uncond
+            assert len(out_uncond) >= 2, f"tuple返回值必须至少包含2个元素，当前长度: {len(out_uncond)}"
+            loss_scalar_uncond, loss_dict_uncond = out_uncond[0], out_uncond[1]
         else:
-            loss_scalar_uncond, loss_dict_uncond = out_uncond, {}
+            loss_dict_uncond = out_uncond
+            loss_scalar_uncond = out_uncond.get("loss")
+        
+        assert isinstance(loss_dict_uncond, dict), f"loss_dict必须是dict类型，无条件分支类型: {type(loss_dict_uncond)}"
+        assert "losses" in loss_dict_uncond, "policy forward输出必须包含'losses'字段"
+        
+        per_step_per_dim_uncond = loss_dict_uncond["losses"]
+        assert isinstance(per_step_per_dim_uncond, torch.Tensor), f"losses必须是torch.Tensor，无条件分支类型: {type(per_step_per_dim_uncond)}"
+        assert per_step_per_dim_uncond.dim() == 3, f"losses必须是3维tensor (B,T,D)，无条件分支维度: {per_step_per_dim_uncond.dim()}"
+        assert per_step_per_dim_uncond.shape == per_step_per_dim_pos.shape, f"无条件分支losses形状({per_step_per_dim_uncond.shape})必须与条件分支({per_step_per_dim_pos.shape})完全匹配"
 
         # 3. 计算CFG组合损失
-        if isinstance(loss_dict_pos, dict) and "losses" in loss_dict_pos:
-            # 使用详细损失信息
-            per_step_per_dim_pos = loss_dict_pos["losses"]  # (B, T, D)
-            per_step_per_dim_uncond = loss_dict_uncond.get("losses", per_step_per_dim_pos)
-            
-            if per_step_per_dim_pos.dim() == 3:
-                per_step_pos = per_step_per_dim_pos.mean(dim=-1)  # (B,T)
-                per_step_uncond = per_step_per_dim_uncond.mean(dim=-1)  # (B,T)
-
-                # CFG权重计算：正优势样本用于条件训练
-                w_traj = (advantages.to(device).float() > 0).float()  # (B,) 二值权重
-                w_step_pos = w_traj.unsqueeze(1).expand_as(per_step_pos)  # (B,T)
-                
-                # 条件损失：优势加权
-                denom_pos = w_step_pos.sum().clamp_min(1.0)
-                loss_positive = (per_step_pos * w_step_pos).sum() / denom_pos
-                
-                # 无条件损失：所有样本均等权重
-                loss_unconditional = per_step_uncond.mean()
-                
-                # CFG组合：条件 + α * 无条件
-                cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
-                final_loss = loss_positive + cfg_alpha * loss_unconditional
-                
-                if torch.isnan(final_loss) or torch.isinf(final_loss):
-                    final_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                return final_loss
-
-        # 兜底：使用标量损失
-        base_pos = loss_scalar_pos if (loss_scalar_pos is not None and isinstance(loss_scalar_pos, torch.Tensor)) \
-            else torch.tensor(0.0, device=device, requires_grad=True)
-        base_uncond = loss_scalar_uncond if (loss_scalar_uncond is not None and isinstance(loss_scalar_uncond, torch.Tensor)) \
-            else torch.tensor(0.0, device=device, requires_grad=True)
-            
-        if base_pos.dim() != 0:
-            base_pos = base_pos.mean()
-        if base_uncond.dim() != 0:
-            base_uncond = base_uncond.mean()
-            
-        # 优势权重
-        w = (advantages.to(device).float() > 0).float()
-        loss_positive = base_pos * (w.mean().clamp_min(1e-6))
-        loss_unconditional = base_uncond
+        per_step_pos = per_step_per_dim_pos.mean(dim=-1)  # (B,T)
+        per_step_uncond = per_step_per_dim_uncond.mean(dim=-1)  # (B,T)
         
+        # 获取有效步掩码，排除padding步
+        mask = (~action_is_pad).float()  # (B,T)
+        
+        # CFG权重计算：二值权重
+        w = (advantages.to(device).float() > 0).float().unsqueeze(1).expand_as(mask)  # (B,T)
+        
+        # 样本级组合后统一平均（关键修复：统一分母）
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
-        final_loss = loss_positive + cfg_alpha * loss_unconditional
+        combined = per_step_pos * w + cfg_alpha * per_step_uncond
         
-        if torch.isnan(final_loss) or torch.isinf(final_loss):
-            final_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # === 最终结果验证 ===
+        mask_sum = mask.sum()
+        assert mask_sum > 0, "所有步骤都被mask掉，无法计算有效损失"
+        
+        final_loss = (combined * mask).sum() / mask_sum
+        
+        assert torch.isfinite(final_loss), f"CFG损失计算结果必须是有限数值，当前值: {final_loss}"
+        assert not torch.isnan(final_loss), "CFG损失计算结果不能是NaN"
+        assert not torch.isinf(final_loss), "CFG损失计算结果不能是Inf"
+        
         return final_loss
     
     def compute_act_logits(self, model, episodes: List[Dict[str, Any]], device: Optional[torch.device] = None):

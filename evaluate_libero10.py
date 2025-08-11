@@ -120,12 +120,17 @@ class LIBERO10Evaluator:
         print("🔄 正在设置环境运行器...")
         
         try:
+            # 创建配置对象以传递CFG参数
+            from types import SimpleNamespace
+            runner_config = SimpleNamespace()
+            runner_config.cfg_guidance_scale = self.config.get('algo', {}).get('cfg_guidance_scale', 3.0)
+            
             self.env_runner = LIBEROEnvRunner(
                 benchmark_name=self.config['task']['benchmark_name'],
                 num_parallel_envs=self.config['task']['num_parallel_envs'],
                 max_episode_length=self.config['task']['max_episode_length'],
-                # save_video=self.config['features']['save_video'],
-                video_dir=str(self.session_dir / "videos")
+                config=runner_config,  # 传递CFG配置
+                video_dir=str(self.session_dir / "videos")  # 视频保存目录
             )
             print("✓ 环境运行器设置成功")
             
