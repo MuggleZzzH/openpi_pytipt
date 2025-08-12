@@ -20,14 +20,19 @@ algo:
   rloo_batch_size: 2  # 匹配并行环境数
   lr: 1e-5
   gradient_accumulation_steps: 1
-  collection_cfg_scale: 1.5        # 🔥 新增：收集轨迹时的CFG强度
-  cfg_uncond_weight: 0.1           # 🔥 新增：训练时无条件分支权重
+  collection_cfg_scale: 1.5        # 🔥 收集轨迹时的CFG强度
+  cfg_uncond_weight: 0.1           # 🔥 训练时无条件分支权重
   # RolloutGenerator配置
   enable_dynamic_sampling: false
   rollout_skip_threshold: 3
   enable_rollout_stats_tracking: true
   rollout_stats_path: "./output/stage11_ript_vla/rollout_stats.json"
   use_val_init: false
+
+# === 策略配置 ===
+policy:
+  cfg_enabled: true                # 🚨 关键修复：启用CFG功能
+  train_expert_only: true          # 专家头训练模式
 
 # === 数据集配置 ===
 dataset:

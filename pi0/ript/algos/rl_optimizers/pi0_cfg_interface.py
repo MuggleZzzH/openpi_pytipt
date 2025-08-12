@@ -412,14 +412,22 @@ class PI0_CFG_Adapter(RLModelInterface):
         noise = torch.randn(B, n, d, device=device, dtype=dtype)
         time = self.policy.model.sample_time(B, device).to(dtype)
         
-        # 🔥 新增：优势映射 - 从episode级到窗口级
+        # 🔥 优势映射和归一化处理
         window_advantages = torch.zeros(B, device=device, dtype=advantages.dtype)
         for window_idx, episode_idx in enumerate(owner_indices):
             window_advantages[window_idx] = advantages[episode_idx]
         
+        # 🔥 二值优势：简单判断正负（按用户要求保持二值化）
+        w_pos = (window_advantages > 0).float()
+        
+        # 记录正优势窗口占比
+        positive_ratio = w_pos.mean()
+        
         print(f"🔧 优势映射: {len(episodes)} episodes → {B} windows")
-        print(f"   episode优势: {advantages.shape} = {advantages[:5].tolist()[:5]}...")
-        print(f"   窗口优势: {window_advantages.shape} = {window_advantages[:5].tolist()[:5]}...")
+        print(f"   episode优势: {advantages.shape} = {advantages[:3].tolist()[:3]}...")
+        print(f"   窗口优势: {window_advantages.shape} = {window_advantages[:3].tolist()[:3]}...")
+        print(f"   二值优势: {w_pos[:3].tolist()[:3]}...")
+        print(f"   正优势窗口占比: {positive_ratio:.2%}")
         
         # === CFG风格双分支损失计算 ===
         
@@ -483,18 +491,20 @@ class PI0_CFG_Adapter(RLModelInterface):
         # 获取有效步掩码，排除padding步
         mask = (~action_is_pad).float()  # (B,T)
         
-        # 🔥 CFG权重计算：使用窗口级优势
-        w = (window_advantages.to(device).float() > 0).float().unsqueeze(1).expand_as(mask)  # (B,T)
+        # 🔥 CFG权重计算：使用二值优势
+        w_pos = w_pos.unsqueeze(1).expand_as(mask)  # (B,T) 二值化
         
-        # 样本级组合后统一平均（关键修复：统一分母）
+        # 🔥 关键改进：标准CFGRL公式 - L = w_pos * L_pos + w_uncond * L_uncond
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
-        combined = per_step_pos * w + cfg_alpha * per_step_uncond
+        combined_loss_per_step = w_pos * per_step_pos + cfg_alpha * per_step_uncond
         
-        # === 最终结果验证 ===
-        mask_sum = mask.sum()
-        assert mask_sum > 0, "所有步骤都被mask掉，无法计算有效损失"
+        # 🔥 关键修复：Padding感知的损失归约 - 按有效步数归一化
+        # 每个窗口的有效损失 = 总损失 / 有效步数
+        window_valid_steps = mask.sum(dim=1)  # (B,) 每个窗口的有效步数
+        window_losses = (combined_loss_per_step * mask).sum(dim=1) / (window_valid_steps + 1e-8)  # (B,)
         
-        final_loss = (combined * mask).sum() / mask_sum
+        # 最终损失：所有窗口的平均损失（每个窗口权重相等）
+        final_loss = window_losses.mean()
         
         assert torch.isfinite(final_loss), f"CFG损失计算结果必须是有限数值，当前值: {final_loss}"
         assert not torch.isnan(final_loss), "CFG损失计算结果不能是NaN"

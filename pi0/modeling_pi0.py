@@ -573,25 +573,30 @@ class PI0FlowMatching(nn.Module):
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             
-            # 构造is_positive标志张量 (CFG需要LongTensor)
-            cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
-            uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
-
-            # 🔥 标准CFG实现：始终计算两个分支并合成
-            # cfg_scale=0→纯无条件, =1→纯条件, >1→增强引导
-            
-            # 条件分支
-            v_t_cond = self.predict_velocity(
-                state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
-            )
-            
-            # 无条件分支
-            v_t_uncond = self.predict_velocity(
-                state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
-            )
-            
-            # 标准CFG合成公式
-            v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
+            # 🔥 旧权重兼容性检查：只有cfg_enabled=True的模型才支持CFG推理
+            if not getattr(self, "cfg_enabled", False) or cfg_scale == 1.0:
+                # 单分支推理：旧权重或cfg_scale=1时
+                v_t = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
+                )
+            else:
+                # 双分支CFG推理：只有训练过CFG的新权重才进入此路径
+                # 构造is_positive标志张量 (CFG需要LongTensor)
+                cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
+                uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
+                
+                # 条件分支
+                v_t_cond = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
+                )
+                
+                # 无条件分支
+                v_t_uncond = self.predict_velocity(
+                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
+                )
+                
+                # 标准CFG合成公式
+                v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
 
             # Euler step
             x_t += dt * v_t

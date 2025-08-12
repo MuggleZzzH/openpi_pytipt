@@ -273,42 +273,70 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
         traceback.print_exc()
         return []
 
-def compute_advantages_simple(episodes: List[Dict]) -> torch.Tensor:
+def compute_advantages_rloo(episodes: List[Dict], rloo_batch_size: int = None) -> torch.Tensor:
     """
-    CFG原版优势计算逻辑 - 使用total_reward和Leave-One-Out baseline
-    完全按照原版rl_optimizer_pi0_cfg.py的逻辑实现
+    正宗的RLOO (Reward Ranked Leave-One-Out) 优势计算
+    
+    Args:
+        episodes: 收集的episodes列表
+        rloo_batch_size: RLOO批次大小，用于Leave-One-Out计算
+    
+    Returns:
+        torch.Tensor: 计算得到的优势值
     """
     if not episodes:
         return torch.tensor([])
     
-    # 使用原版的total_reward，不做任何修改
+    # 提取奖励
     rewards = []
     for ep in episodes:
         reward = ep.get('total_reward', 0.0)
         rewards.append(float(reward))
     
-    # 创建奖励张量
     rlhf_reward = torch.tensor(rewards, dtype=torch.float32)
-    
-    # 原版Leave-One-Out优势计算逻辑
     num_rollouts = len(episodes)
-    rollouts_per_batch = len(episodes)  # 简化：批次大小等于总数
     
-    if num_rollouts % rollouts_per_batch != 0 or rollouts_per_batch <= 1:
-        # 简化的优势: reward - mean(reward)
+    # 🔥 关键修复：使用真正的RLOO批次大小而不是总数
+    if rloo_batch_size is None or rloo_batch_size <= 1:
+        # 如果没有指定或batch size过小，退化为简单方法
+        print("⚠️ RLOO batch size未指定或过小，使用简单优势计算")
         advantage = rlhf_reward - rlhf_reward.mean()
     else:
-        num_batches = num_rollouts // rollouts_per_batch
-        rlhf_reward_reshaped = rlhf_reward.reshape(num_batches, rollouts_per_batch)
-        
-        if rollouts_per_batch <= 1:
+        # 🚀 正宗RLOO计算
+        try:
+            # 确保可以整除，如果不能整除则裁剪到最大可整除数量
+            effective_rollouts = (num_rollouts // rloo_batch_size) * rloo_batch_size
+            if effective_rollouts != num_rollouts:
+                print(f"🔧 RLOO调整：{num_rollouts} → {effective_rollouts} rollouts (batch_size={rloo_batch_size})")
+                rlhf_reward = rlhf_reward[:effective_rollouts]
+                num_rollouts = effective_rollouts
+            
+            num_batches = num_rollouts // rloo_batch_size
+            rlhf_reward_reshaped = rlhf_reward.reshape(num_batches, rloo_batch_size)
+            
+            # 标准RLOO：每个样本的baseline = 同批次其他样本的平均值
+            # baseline[i,j] = (sum(batch[i]) - reward[i,j]) / (batch_size - 1)
+            batch_sums = rlhf_reward_reshaped.sum(dim=1, keepdim=True)  # (num_batches, 1)
+            baseline = (batch_sums - rlhf_reward_reshaped) / (rloo_batch_size - 1)  # (num_batches, rloo_batch_size)
+            
+            # 优势 = 自己的奖励 - 其他人的平均奖励
+            advantage = rlhf_reward_reshaped - baseline  # (num_batches, rloo_batch_size)
+            advantage = advantage.flatten()  # 展平为一维
+            
+            # NaN和Inf检查
+            if torch.isnan(advantage).any() or torch.isinf(advantage).any():
+                print("⚠️ RLOO计算产生NaN/Inf，使用安全替换")
+                advantage = torch.nan_to_num(advantage, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            print(f"🎯 正宗RLOO优势计算完成:")
+            print(f"   批次配置: {num_rollouts} rollouts → {num_batches} batches × {rloo_batch_size}")
+            print(f"   优势统计: mean={advantage.mean():.4f}, std={advantage.std():.4f}")
+            print(f"   正优势比例: {(advantage > 0).float().mean():.2%}")
+            
+        except Exception as e:
+            print(f"❌ RLOO计算失败: {e}，回退到简单方法")
             advantage = rlhf_reward - rlhf_reward.mean()
-        else:
-            baseline = (rlhf_reward_reshaped.sum(1, keepdim=True) - rlhf_reward_reshaped) / (rollouts_per_batch - 1)
-            advantage = rlhf_reward_reshaped - baseline
-            advantage = advantage.flatten()
     
-    print(f"🔧 CFG原版优势计算结果: {advantage}")
     return advantage
 
 def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advantages, device):
@@ -463,8 +491,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             print("⚠️ 未收集到有效episodes，跳过此步")
             continue
         
-        # 2. 计算优势（简化计算）
-        advantages = compute_advantages_simple(episodes)
+        # 2. 计算优势（正宗RLOO方法）
+        advantages = compute_advantages_rloo(episodes, rloo_batch_size=rloo_batch_size)
         
         # 3. 更新策略（直接更新，无复杂组件）
         loss = update_policy_ript_vla_style(

@@ -354,7 +354,6 @@ class LIBEROEnvRunner:
             axis_angle, # 3D: rotation as axis-angle  
             obs["robot0_gripper_qpos"],               # 2D: gripper joint positions
         ], dtype=np.float32)
-        print(">> gripper_qpos shape:", np.asarray(obs["robot0_gripper_qpos"]).shape)
         # 状态归一化
         state = (unnorm_state - self.state_mean) / (self.state_std + 1e-6)
         
@@ -609,7 +608,8 @@ class LIBEROEnvRunner:
                         # 反归一化动作
                         action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
                         
-                        # 获取当前未归一化状态用于偏移
+                        # 🔥 关键修复：窗口一致的残差基准
+                        # 获取当前未归一化状态用于偏移（整个50步序列用同一个基准）
                         import robosuite.utils.transform_utils as T
                         unnorm_state = np.concatenate([
                             obs["robot0_eef_pos"],
@@ -617,10 +617,10 @@ class LIBEROEnvRunner:
                             obs["robot0_gripper_qpos"],
                         ], dtype=np.float32)
                         
-                        # 应用状态偏移（前6维）
+                        # 对整个动作序列应用同一个状态偏移（前6维：位置+旋转）
                         action_buffer[:, :6] += unnorm_state[None, :6]
                         
-                        # 重置动作索引
+                        # 重置动作索引（注意：在整个序列执行期间，不再更新基准）
                         action_index = 0
                     
                     # 从动作队列中取出当前动作执行
@@ -1031,10 +1031,11 @@ class LIBEROEnvRunner:
                     episode = episodes_data[env_idx]
                     obs = obs_list[env_idx]
                     
-                    # 处理动作
+                    # 处理动作与状态偏移
                     action_buffer = batch_actions[batch_idx]
                     
-                    # 获取状态偏移
+                    # 🔥 关键修复：窗口一致的残差基准
+                    # 获取推理时刻的状态偏移（整个50步动作序列使用同一个基准）
                     import robosuite.utils.transform_utils as T
                     unnorm_state = np.concatenate([
                         obs["robot0_eef_pos"],
@@ -1042,6 +1043,7 @@ class LIBEROEnvRunner:
                         obs["robot0_gripper_qpos"],
                     ], dtype=np.float32)
                     
+                    # 对整个动作序列应用同一个状态偏移（前6维：位置+旋转）
                     action_buffer[:, :6] += unnorm_state[None, :6]
                     
                     episode['action_buffer'] = action_buffer
@@ -1171,37 +1173,44 @@ class LIBEROEnvRunner:
         if not observations:
             return []
         
-        try:
-            # 构建批量观测
-            batch_obs = []
-            for idx, obs in enumerate(observations):
-                prompt_text = None
-                if prompts_for_obs is not None and idx < len(prompts_for_obs):
-                    prompt_text = prompts_for_obs[idx]
-                pi0_obs = self.construct_pi0_observation(obs, prompt_text or env_name)
-                batch_obs.append(pi0_obs)
+        
+        # 构建批量观测
+        batch_obs = []
+        for idx, obs in enumerate(observations):
+            prompt_text = None
+            if prompts_for_obs is not None and idx < len(prompts_for_obs):
+                prompt_text = prompts_for_obs[idx]
+            pi0_obs = self.construct_pi0_observation(obs, prompt_text or env_name)
+            batch_obs.append(pi0_obs)
+        
+        # 合并批量观测（如果可能）
+        if len(batch_obs) == 1:
+            # 单个观测直接推理 - 使用配置的CFG参数
+            cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+            raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
+            action = raw_action[0, :, :7]  # (50, 7)
             
-            # 合并批量观测（如果可能）
-            if len(batch_obs) == 1:
-                # 单个观测直接推理 - 使用配置的CFG参数
-                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
-                raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
-                action = raw_action[0, :, :7]  # (50, 7)
-                
-                if isinstance(action, torch.Tensor):
-                    action_after_cpu = action.cpu().numpy()
-                else:
-                    action_after_cpu = action
-                
-                action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
-                return [action_buffer]
+            if isinstance(action, torch.Tensor):
+                action_after_cpu = action.cpu().numpy()
             else:
-                # 多个观测分别推理 (目前PI0不支持真正的批量推理)
+                action_after_cpu = action
+            
+            action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
+            return [action_buffer]
+        else:
+            # 🚀 优化：尝试真正的批推理，失败时回退到循环推理
+            try:
+                batch_observation = self._stack_pi0_observations(batch_obs)
+                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+                
+                # 一次性批推理 - 这是核心优化点
+                raw_actions = self.policy.select_action(batch_observation, cfg_scale=cfg_scale)
+                # raw_actions shape: (B, T, 7)
+                
+                # 分解批量结果
                 batch_actions = []
-                for pi0_obs in batch_obs:
-                    cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
-                    raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
-                    action = raw_action[0, :, :7]
+                for i in range(len(batch_obs)):
+                    action = raw_actions[i, :, :7]  # (50, 7)
                     
                     if isinstance(action, torch.Tensor):
                         action_after_cpu = action.cpu().numpy()
@@ -1211,13 +1220,78 @@ class LIBEROEnvRunner:
                     action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
                     batch_actions.append(action_buffer)
                 
+                if self.rank == 0:
+                    print(f"🚀 批推理成功：{len(batch_obs)} envs -> 1次GPU调用")
                 return batch_actions
                 
-        except Exception as e:
-            if self.rank == 0:
-                print(f"批量推理失败: {e}")
-            # 回退到逐个推理
-            return self._fallback_individual_inference(observations, env_name)
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"⚠️ 批推理失败，回退到循环推理: {e}")
+                # 回退到原有的循环推理
+            
+            # 🔄 回退路径：循环推理（原有逻辑）
+            batch_actions = []
+            for pi0_obs in batch_obs:
+                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+                raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
+                action = raw_action[0, :, :7]
+                
+                if isinstance(action, torch.Tensor):
+                    action_after_cpu = action.cpu().numpy()
+                else:
+                    action_after_cpu = action
+                
+                action_buffer = action_after_cpu * (self.action_std + 1e-6) + self.action_mean
+                batch_actions.append(action_buffer)
+            
+            return batch_actions
+    
+    def _stack_pi0_observations(self, batch_obs):
+        """将多个PI0观测堆叠成批量观测
+        
+        输入: [obs1, obs2, ...] 每个obs是单独的PI0观测字典
+        输出: 批量观测字典，所有张量的batch维度堆叠
+        """
+        if not batch_obs:
+            raise ValueError("batch_obs不能为空")
+        
+        # 获取第一个观测作为模板
+        template_obs = batch_obs[0]
+        batch_size = len(batch_obs)
+        
+        # 构建批量观测字典
+        batched_observation = {}
+        
+        # 处理图像
+        if "image" in template_obs:
+            batched_observation["image"] = {}
+            for img_key in template_obs["image"]:
+                # 堆叠所有图像张量: (B, C, H, W)
+                img_tensors = [obs["image"][img_key] for obs in batch_obs]
+                batched_observation["image"][img_key] = torch.stack(img_tensors, dim=0)
+        
+        # 处理状态
+        if "state" in template_obs:
+            # 堆叠所有状态张量: (B, state_dim)  
+            state_tensors = [obs["state"] for obs in batch_obs]
+            batched_observation["state"] = torch.stack(state_tensors, dim=0)
+        
+        # 处理提示文本
+        if "prompt" in template_obs:
+            # 合并所有提示文本到列表
+            batched_observation["prompt"] = [obs["prompt"][0] if isinstance(obs["prompt"], list) else obs["prompt"] 
+                                           for obs in batch_obs]
+        
+        # 处理语言tokens（如果存在）
+        if "lang_tokens" in template_obs:
+            lang_tokens_list = [obs["lang_tokens"] for obs in batch_obs]
+            batched_observation["lang_tokens"] = torch.stack(lang_tokens_list, dim=0)
+        
+        if "lang_masks" in template_obs:
+            lang_masks_list = [obs["lang_masks"] for obs in batch_obs]
+            batched_observation["lang_masks"] = torch.stack(lang_masks_list, dim=0)
+        
+        return batched_observation
     
     def _fallback_individual_inference(self, observations, env_name, prompts_for_obs=None):
         """回退到逐个推理"""
