@@ -1,0 +1,66 @@
+# Stage 11 增强版配置示例 - RIPT-VLA风格 + 动态采样 + 文件计数器
+# 基于你的改造规划的完整配置模板
+
+# 策略和数据路径
+policy_path: "/path/to/your/pi0_checkpoint"  # 需要包含 norm_stats.json
+norm_stats_path: null  # 如果为null，会自动从policy_path推断
+
+# 输出配置
+output_dir: "outputs/stage11_enhanced"
+exp_name: "ript_vla_enhanced"
+
+# 任务配置
+task:
+  benchmark_name: "libero_goal"  # libero_spatial|object|goal|10|90
+  task_names_to_use: ["libero_goal_default"]
+  num_parallel_envs: 1  # 并行环境数量
+  max_episode_length: 200
+
+# 算法配置
+algo:
+  lr: 1e-5
+  rloo_batch_size: 4  # RLOO批次大小
+  collection_cfg_scale: 1.5  # 初始CFG强度
+
+# 数据集窗口化配置
+dataset:
+  windowing_mode: "last"  # last|random|slide
+  window_stride: 10
+  max_windows_per_episode: 1
+
+# 训练配置
+training:
+  num_train_steps: 50
+  save_freq: 10
+  save_optimizer_freq: 20  # 可选：每N步保存完整检查点
+  save_optimizer_final: true  # 保存最终完整检查点
+
+# 🔥 新增：增强功能配置
+features:
+  # 动态采样配置
+  dynamic_sampling:
+    enabled: true
+    p_min: 0.1      # 最低成功率阈值
+    p_max: 0.9      # 最高成功率阈值
+    smooth_window: 3  # 平滑窗口大小
+  
+  # 全局样本量控制
+  enable_file_counter: true
+  rollout_goal_per_step: 8  # 每步训练的全局目标样本数
+  
+  # 自适应CFG调整
+  adaptive_cfg: true  # 根据成功率窗口自动调整CFG强度
+  
+  # 其他现有功能开关
+  enable_task_polling: false
+  enable_parallel_envs: false
+  enable_true_parallel_envs: false
+  enable_smart_sampling: false
+  save_video: false
+  
+  # 🔥 未来扩展预留（第二阶段）
+  rollout_stats_path: "checkpoints/rollout_stats.json"  # 用于init哈希拒绝
+  early_stop_stuck:
+    enabled: false
+    pos_delta_eps: 1e-4
+    max_idle_steps: 40

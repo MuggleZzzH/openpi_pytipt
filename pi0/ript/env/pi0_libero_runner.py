@@ -111,6 +111,9 @@ class LIBEROEnvRunner:
         self.debug_save_video = bool(yaml_save_video) or DEBUG_SAVE_VIDEO
         self.debug_image_dir = DEBUG_IMAGE_DIR
         
+        # 🔥 新增：文件计数器支持
+        self.file_counter = None
+        
         # 加载归一化统计信息
         self._load_norm_stats(norm_stats_path)
 
@@ -294,8 +297,10 @@ class LIBEROEnvRunner:
         try:
             from pi0.ript.algos.rl_optimizers.file_counter import setup_global_counter
             counter = setup_global_counter(counter_name, work_dir=work_dir)
-            if self.rank == 0:
-                print(f"✅ 文件计数器设置成功: {counter_name}")
+            if counter:
+                self.file_counter = counter  # 🔥 保存到实例变量
+                if self.rank == 0:
+                    print(f"✅ 文件计数器设置成功: {counter_name}")
             return counter
         except ImportError as e:
             if self.rank == 0:
@@ -986,17 +991,11 @@ class LIBEROEnvRunner:
                 'completed': False
             })
             
-            # 🎬 收集初始观测图像用于视频（统一 HWC + BGR->RGB）
+            # 🎬 收集初始观测图像用于视频
             if save_video:
                 try:
-                    img0 = obs_list[i]["agentview_image"]
-                    if isinstance(img0, np.ndarray) and img0.ndim == 3:
-                        if img0.shape[0] == 3 and img0.shape[-1] != 3:  # CHW -> HWC
-                            img_hwc_bgr = img0.transpose(1, 2, 0)
-                        else:  # HWC
-                            img_hwc_bgr = img0
-                        initial_img = img_hwc_bgr[:, :, ::-1].copy()  # BGR -> RGB
-                        episodes_data[i]['rollout_images'].append(initial_img)
+                    initial_img = obs_list[i]["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                    episodes_data[i]['rollout_images'].append(initial_img)
                 except Exception as e:
                     if self.rank == 0:
                         print(f"⚠️ 收集初始图像失败 (环境{i}): {e}")
@@ -1073,19 +1072,7 @@ class LIBEROEnvRunner:
                         # 备用：如果还是没有action_buffer，使用dummy动作
                         actions_to_execute.append(dummy_action)
             
-            # 并行执行动作（执行前裁剪到动作空间边界）
-            try:
-                action_space = getattr(env, 'single_action_space', None)
-                if action_space is None:
-                    action_space = getattr(env, 'action_space', None)
-                if action_space is not None and hasattr(action_space, 'low') and hasattr(action_space, 'high'):
-                    low, high = action_space.low, action_space.high
-                    for ai in range(len(actions_to_execute)):
-                        actions_to_execute[ai] = np.clip(actions_to_execute[ai], low, high)
-            except Exception as e:
-                if self.rank == 0:
-                    print(f"⚠️ 动作裁剪失败，跳过裁剪: {e}")
-
+            # 并行执行动作
             step_out = env.step(actions_to_execute)
             if isinstance(step_out, (list, tuple)) and len(step_out) >= 4:
                 obs_any, rewards_any, dones_any, infos_any = step_out[:4]
@@ -1114,17 +1101,11 @@ class LIBEROEnvRunner:
                 episode['total_reward'] += rewards[i]
                 episode['step'] += 1
                 
-                # 🎬 收集图像用于视频（统一 HWC + BGR->RGB）
+                # 🎬 收集图像用于视频
                 if save_video and episode['rollout_images'] is not None:
                     try:
-                        imgf = obs_list[i]["agentview_image"]
-                        if isinstance(imgf, np.ndarray) and imgf.ndim == 3:
-                            if imgf.shape[0] == 3 and imgf.shape[-1] != 3:  # CHW -> HWC
-                                img_hwc_bgr = imgf.transpose(1, 2, 0)
-                            else:  # HWC
-                                img_hwc_bgr = imgf
-                            frame_img = img_hwc_bgr[:, :, ::-1].copy()  # BGR -> RGB
-                            episode['rollout_images'].append(frame_img)
+                        frame_img = obs_list[i]["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                        episode['rollout_images'].append(frame_img)
                     except Exception as e:
                         if self.rank == 0:
                             print(f"⚠️ 收集图像帧失败 (环境{i}): {e}")

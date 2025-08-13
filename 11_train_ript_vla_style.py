@@ -27,6 +27,7 @@ import yaml
 import traceback
 import time
 from tqdm import tqdm
+from collections import deque
 
 # 修复tokenizers并行化警告和EGL错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -212,23 +213,60 @@ def create_environment_runner(config: Dict[str, Any], policy):
     print("✓ 环境runner创建成功")
     return runner
 
-def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool) -> List[Dict]:
-    """按RIPT-VLA思路的最小动态采样：丢弃全0或全1成功率的批次"""
-    if not enable_dynamic_sampling or not episodes:
+def _dynamic_filter_rollouts(episodes: List[Dict], dynamic_sampling_config: Dict, 
+                             recent_success_rates: deque) -> List[Dict]:
+    """
+    升级版动态采样：区间策略 + 平滑窗口机制
+    
+    Args:
+        episodes: 收集的episodes
+        dynamic_sampling_config: 包含 p_min, p_max, smooth_window 的配置
+        recent_success_rates: 最近成功率的滑动窗口
+    
+    Returns:
+        过滤后的episodes（可能为空）
+    """
+    if not dynamic_sampling_config.get('enabled', False) or not episodes:
         return episodes
+    
+    # 计算当前批次成功率
     successes = [bool(ep.get('success', False)) for ep in episodes]
-    if len(successes) > 0 and (all(successes) or not any(successes)):
-        print(f"⚠️ 动态采样丢弃本批次 (uniform successes: {successes})")
+    current_success_rate = np.mean(successes) if successes else 0.0
+    
+    p_min = dynamic_sampling_config.get('p_min', 0.1)
+    p_max = dynamic_sampling_config.get('p_max', 0.9)
+    
+    # 第一层过滤：当前批次区间检查
+    if current_success_rate < p_min or current_success_rate > p_max:
+        print(f"⚠️ 动态采样第一层拒绝: success_rate={current_success_rate:.3f} 不在 [{p_min}, {p_max}] 区间内")
         return []
+    
+    # 第二层过滤：平滑窗口检查（降低抖动）
+    recent_success_rates.append(current_success_rate)
+    if len(recent_success_rates) >= 2:  # 至少有2个样本才进行窗口检查
+        window_avg = np.mean(recent_success_rates)
+        if window_avg < p_min or window_avg > p_max:
+            print(f"⚠️ 动态采样第二层拒绝: 窗口平均={window_avg:.3f} 不在区间内 (窗口大小={len(recent_success_rates)})")
+            return []
+    
+    print(f"✅ 动态采样通过: 当前={current_success_rate:.3f}, 窗口平均={np.mean(recent_success_rates):.3f}")
     return episodes
 
 
-def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False):
+def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, 
+                                     dynamic_sampling_config: Dict = None, 
+                                     recent_success_rates: deque = None,
+                                     rollout_goal_per_step: int = None):
     """
-    RIPT-VLA风格的rollout收集
+    RIPT-VLA风格的rollout收集 + 文件计数器早停
     直接调用runner，无中间层
     """
     print(f"正在收集 {num_rollouts} 个rollouts...")
+    
+    # 如果设置了全局样本目标，显示当前进度
+    if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+        current_count = env_runner.file_counter.get()
+        print(f"📊 当前全局样本数: {current_count}/{rollout_goal_per_step}")
     
     try:
         # 获取任务的初始状态
@@ -244,7 +282,7 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             all_init_states=all_init_states
         )
         
-        # 收集所有rollouts
+        # 收集rollouts，支持文件计数器早停
         collected_rollouts = []
         rollout_count = 0
         
@@ -257,15 +295,31 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             collected_rollouts.append(episode)
             rollout_count += 1
             
+            # 🔥 新增：文件计数器更新和早停检查
+            if hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+                env_runner.file_counter.update(1)
+                current_global_count = env_runner.file_counter.get()
+                
+                # 早停检查：达到全局目标样本数
+                if rollout_goal_per_step and current_global_count >= rollout_goal_per_step:
+                    print(f"🎯 达到全局样本目标 ({current_global_count}/{rollout_goal_per_step})，提前结束收集")
+                    break
+            
+            # 原有的数量限制
             if rollout_count >= num_rollouts:
                 break
         
-        # 最小动态采样过滤：丢弃全0或全1批次
-        filtered = _dynamic_filter_rollouts(collected_rollouts, enable_dynamic_sampling)
+        # 升级版动态采样过滤
+        if dynamic_sampling_config and recent_success_rates is not None:
+            filtered = _dynamic_filter_rollouts(collected_rollouts, dynamic_sampling_config, recent_success_rates)
+        else:
+            filtered = collected_rollouts
+            
         if not filtered:
             print("⚠️ 本批次被动态采样过滤，返回空集")
         else:
             print(f"✓ 成功收集了 {len(filtered)} 个rollouts (过滤后)")
+            
         return filtered
         
     except Exception as e:
@@ -421,7 +475,7 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
 
 def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     """
-    主训练循环（RIPT-VLA风格）
+    主训练循环（RIPT-VLA风格）+ 动态采样 + 文件计数器
     直接在主函数中处理所有逻辑，减少抽象层
     """
     print("🚀 开始RIPT-VLA风格的训练循环")
@@ -433,6 +487,27 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     output_dir = output_dir / f"{exp_name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"输出目录: {output_dir}")
+    
+    # 🔥 新增：读取增强配置
+    features_config = config.get('features', {})
+    dynamic_sampling_config = features_config.get('dynamic_sampling', {})
+    rollout_goal_per_step = features_config.get('rollout_goal_per_step', None)
+    enable_file_counter = features_config.get('enable_file_counter', False)
+    adaptive_cfg_enabled = features_config.get('adaptive_cfg', False)
+    
+    print(f"\n🔧 增强功能配置:")
+    print(f"  动态采样: {'✅' if dynamic_sampling_config.get('enabled', False) else '❌'}")
+    if dynamic_sampling_config.get('enabled', False):
+        print(f"    区间: [{dynamic_sampling_config.get('p_min', 0.1)}, {dynamic_sampling_config.get('p_max', 0.9)}]")
+        print(f"    平滑窗口: {dynamic_sampling_config.get('smooth_window', 3)}")
+    print(f"  文件计数器: {'✅' if enable_file_counter else '❌'}")
+    if rollout_goal_per_step:
+        print(f"    每步全局目标: {rollout_goal_per_step}")
+    print(f"  自适应CFG: {'✅' if adaptive_cfg_enabled else '❌'}")
+    
+    # 🔥 新增：初始化平滑窗口
+    smooth_window_size = dynamic_sampling_config.get('smooth_window', 3)
+    recent_success_rates = deque(maxlen=smooth_window_size)
     
     # 创建策略和优化器
     policy, optimizer, device = create_policy_and_optimizer(config)
@@ -460,6 +535,15 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 创建环境runner
     env_runner = create_environment_runner(config, policy)
     
+    # 🔥 新增：文件计数器初始化
+    if enable_file_counter:
+        file_counter = env_runner.setup_file_counter(counter_name="rollout", work_dir=str(output_dir))
+        if file_counter:
+            print(f"✅ 文件计数器已启用: {output_dir}/rollout_counter")
+        else:
+            print(f"⚠️ 文件计数器初始化失败，继续使用普通模式")
+            enable_file_counter = False
+    
     # 训练配置
     num_train_steps = config['training']['num_train_steps']
     # 与2_test_pi0_on_libero.py对齐：使用libero_goal基准默认task_id=1
@@ -481,10 +565,12 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         
         print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
         
-        # 1. 收集rollouts（直接调用，无中间层）
+        # 1. 收集rollouts（直接调用，无中间层）+ 新功能集成
         episodes = collect_rollouts_ript_vla_style(
             env_runner, task_name, rloo_batch_size,
-            enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False)
+            dynamic_sampling_config=dynamic_sampling_config,
+            recent_success_rates=recent_success_rates,
+            rollout_goal_per_step=rollout_goal_per_step
         )
         
         if not episodes:
@@ -522,19 +608,48 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
         
-        # 6. CFG评估（每10步进行一次）
+        # 6. 自适应CFG调整（基于成功率窗口）
+        if adaptive_cfg_enabled and len(recent_success_rates) >= 2:
+            try:
+                current_avg = np.mean(recent_success_rates)
+                p_min = dynamic_sampling_config.get('p_min', 0.1)
+                p_max = dynamic_sampling_config.get('p_max', 0.9)
+                current_cfg = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+                
+                # 自适应调整逻辑
+                if current_avg < p_min:
+                    # 成功率过低，降低CFG强度（减少过度引导）
+                    new_cfg = max(1.0, current_cfg - 0.2)
+                    print(f"🔧 自适应CFG: 成功率过低({current_avg:.3f} < {p_min})，降低CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                    env_runner.config.collection_cfg_scale = new_cfg
+                elif current_avg > p_max:
+                    # 成功率过高，增加CFG强度（增强引导）
+                    new_cfg = min(5.0, current_cfg + 0.2)
+                    print(f"🔧 自适应CFG: 成功率过高({current_avg:.3f} > {p_max})，提升CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                    env_runner.config.collection_cfg_scale = new_cfg
+                else:
+                    print(f"✅ 自适应CFG: 成功率适中({current_avg:.3f})，保持CFG={current_cfg:.1f}")
+                
+                step_metrics['adaptive_cfg_scale'] = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+                step_metrics['success_rate_window_avg'] = current_avg
+                
+            except Exception as e:
+                print(f"⚠️ 自适应CFG调整失败: {e}")
+        
+        # 7. CFG评估（每10步进行一次）
         if (step + 1) % 10 == 0:
             try:
                 best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")
-                # 可选：动态调整收集时使用的CFG强度
-                env_runner.config.collection_cfg_scale = best_cfg
+                # 注意：如果启用了自适应CFG，这里不强制覆盖
+                if not adaptive_cfg_enabled:
+                    env_runner.config.collection_cfg_scale = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
         
-        # 7. 保存检查点
+        # 8. 保存检查点
         if (step + 1) % config['training'].get('save_freq', 10) == 0:
             # 轻量权重（仅模型，便于部署与占用小）
             weights_path = output_dir / f"weights_step_{step + 1}.pt"
