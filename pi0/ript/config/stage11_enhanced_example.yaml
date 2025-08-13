@@ -2,7 +2,7 @@
 # 基于你的改造规划的完整配置模板
 
 # 策略和数据路径
-policy_path: "/path/to/your/pi0_checkpoint"  # 需要包含 norm_stats.json
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"  # 需要包含 norm_stats.json
 norm_stats_path: null  # 如果为null，会自动从policy_path推断
 
 # 输出配置

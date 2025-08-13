@@ -13,11 +13,11 @@ task:
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
   num_parallel_envs: 4  # 🚀 测试并行环境
-  max_episode_length: 150  # 短episode快速测试
+  max_episode_length: null  # 短episode快速测试
 
 # === 算法配置 ===
 algo:
-  rloo_batch_size: 4  # 匹配并行环境数
+  rloo_batch_size: 8  # 匹配并行环境数
   lr: 1e-5
   gradient_accumulation_steps: 1
   collection_cfg_scale: 1.5        # 🔥 收集轨迹时的CFG强度
