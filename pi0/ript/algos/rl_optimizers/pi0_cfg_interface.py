@@ -611,36 +611,35 @@ class PI0_CFG_Adapter(RLModelInterface):
             return default_img.copy(), default_img.copy()
     
     def _process_single_image(self, img, cam_type):
-        """处理单个图像的通用逻辑"""
+        """处理单个图像的通用逻辑，与"2_pi0_on_libero.py"的to_hwc_hmirror完全对齐"""
         try:
-            # 🔧 修复图像格式检查：处理CHW和HWC两种格式
+            # 🔧 统一图像处理：先规范到HWC，再做水平镜像（不做通道交换）
             if img.ndim == 3:
-                # 检查是CHW格式 (3, H, W) 还是HWC格式 (H, W, 3)
-                if img.shape[0] == 3 and img.shape[-1] != 3:  # CHW格式
-                    # 转换CHW → HWC
+                # CHW -> HWC（如果需要）
+                if img.shape[0] == 3 and img.shape[-1] != 3:
                     img = img.transpose(1, 2, 0)
                 elif img.shape[-1] != 3:  # 既不是CHW也不是HWC
                     print(f"✗ 未知{cam_type}图像格式: {img.shape}")
                     raise ValueError(f"Unexpected {cam_type} image format: {img.shape}")
                 
-                # 水平镜像处理 (保持HWC格式，左右翻转以匹配训练数据)
-                img_rgb = img[:, ::-1, :].copy()
+                # 水平镜像（翻转宽度维）
+                img_processed = img[:, ::-1, :].copy()
                 
                 # 确保数据类型和范围正确
-                if img_rgb.dtype != np.uint8:
-                    if img_rgb.max() <= 1.0:  # 归一化的图像
-                        img_rgb = (img_rgb * 255).astype(np.uint8)
+                if img_processed.dtype != np.uint8:
+                    if img_processed.max() <= 1.0:  # 归一化的图像
+                        img_processed = (img_processed * 255).astype(np.uint8)
                     else:
-                        img_rgb = img_rgb.astype(np.uint8)
+                        img_processed = img_processed.astype(np.uint8)
                 
                 # 确保图像尺寸正确
-                if img_rgb.shape[:2] != (224, 224):
+                if img_processed.shape[:2] != (224, 224):
                     try:
                         from skimage.transform import resize
-                        img_rgb = resize(img_rgb, (224, 224), preserve_range=True).astype(np.uint8)
+                        img_processed = resize(img_processed, (224, 224), preserve_range=True).astype(np.uint8)
                     except ImportError:
                         # 如果没有skimage，使用简单的裁剪/填充
-                        h, w = img_rgb.shape[:2]
+                        h, w = img_processed.shape[:2]
                         if h != 224 or w != 224:
                             # 简单居中裁剪或填充到224x224
                             resized = np.ones((224, 224, 3), dtype=np.uint8) * 128
@@ -650,10 +649,10 @@ class PI0_CFG_Adapter(RLModelInterface):
                             end_w = min(224, start_w + w)
                             src_h = min(h, 224)
                             src_w = min(w, 224)
-                            resized[start_h:end_h, start_w:end_w] = img_rgb[:src_h, :src_w]
-                            img_rgb = resized
+                            resized[start_h:end_h, start_w:end_w] = img_processed[:src_h, :src_w]
+                            img_processed = resized
                 
-                return img_rgb
+                return img_processed
             else:
                 print(f"✗ {cam_type}图像维度错误: {img.shape}")
                 return np.ones((224, 224, 3), np.uint8) * 128
