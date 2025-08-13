@@ -246,6 +246,19 @@ class LIBEROEnvRunner:
         """检查是否有分配的任务"""
         return len(self.assigned_tasks) > 0
     
+    def to_hwc_hmirror(self, arr: np.ndarray) -> np.ndarray:
+        """
+        统一图像处理函数，与"2_pi0_on_libero.py"完全对齐
+        先规范到HWC格式，再做水平镜像（不做通道交换）
+        """
+        if isinstance(arr, np.ndarray) and arr.ndim == 3:
+            # CHW -> HWC（如果需要）
+            if arr.shape[0] == 3 and arr.shape[-1] != 3:
+                arr = arr.transpose(1, 2, 0)
+            # 水平镜像（翻转宽度维）
+            return arr[:, ::-1, :].copy()
+        return arr
+    
     # 🔥 新增：任务统计和高级功能 (模仿原版RIPT-VLA)
     def update_task_stats(self, task_name: str, success: bool, reward: float):
         """更新任务完成统计"""
@@ -362,9 +375,9 @@ class LIBEROEnvRunner:
         # 状态归一化
         state = (unnorm_state - self.state_mean) / (self.state_std + 1e-6)
         
-        # 图像处理 - 水平镜像（保持HWC格式）
-        base_0_rgb = obs["agentview_image"][:, ::-1, :].copy()
-        left_wrist_0_rgb = obs["robot0_eye_in_hand_image"][:, ::-1, :].copy()
+        # 图像处理 - 使用统一的to_hwc_hmirror函数，与"2_pi0_on_libero.py"完全对齐
+        base_0_rgb = self.to_hwc_hmirror(obs["agentview_image"])
+        left_wrist_0_rgb = self.to_hwc_hmirror(obs["robot0_eye_in_hand_image"])
         
         # 构造观测格式
         observation = {
@@ -578,7 +591,7 @@ class LIBEROEnvRunner:
             
             # 收集初始观测图像用于视频
             if save_video:
-                initial_img = obs["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
+                initial_img = self.to_hwc_hmirror(obs["agentview_image"])
                 rollout_images.append(initial_img)
             
             # 收集轨迹
@@ -677,7 +690,7 @@ class LIBEROEnvRunner:
                     
                     # 收集图像用于视频
                     if save_video:
-                        frame_img = next_obs["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
+                        frame_img = self.to_hwc_hmirror(next_obs["agentview_image"])
                         rollout_images.append(frame_img)
                     
                     # 更新状态和计数器
@@ -1008,7 +1021,7 @@ class LIBEROEnvRunner:
             # 🎬 收集初始观测图像用于视频
             if save_video:
                 try:
-                    initial_img = obs_list[i]["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
+                    initial_img = self.to_hwc_hmirror(obs_list[i]["agentview_image"])
                     episodes_data[i]['rollout_images'].append(initial_img)
                 except Exception as e:
                     if self.rank == 0:
@@ -1145,7 +1158,7 @@ class LIBEROEnvRunner:
                 # 🎬 收集图像用于视频
                 if save_video and episode['rollout_images'] is not None:
                     try:
-                        frame_img = obs_list[i]["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
+                        frame_img = self.to_hwc_hmirror(obs_list[i]["agentview_image"])
                         episode['rollout_images'].append(frame_img)
                     except Exception as e:
                         if self.rank == 0:
