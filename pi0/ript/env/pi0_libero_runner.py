@@ -355,6 +355,71 @@ class LIBEROEnvRunner:
         else:
             raise FileNotFoundError("norm_stats.json not found in expected locations; cannot proceed")
 
+    def get_task_init_states(self, task_id=0):
+        """
+        获取任务的可用初始状态池
+        
+        Args:
+            task_id: 任务ID
+            
+        Returns:
+            list: 可用的初始状态列表，每个状态是一个8维numpy数组
+        """
+        # 方案1: 从benchmark获取（如果可用）
+        if hasattr(self, 'benchmark') and self.benchmark is not None:
+            try:
+                return self.benchmark.get_task_init_states(task_id)
+            except:
+                pass
+        
+        # 方案2: 生成固定的可复现初始状态池
+        import numpy as np
+        np.random.seed(42 + task_id)  # 确保可复现
+        num_states = 100  # 生成100个候选初始状态
+        init_states = []
+        
+        for i in range(num_states):
+            # 生成一个8维的初始状态（3 pos + 3 rot + 2 gripper）
+            state = np.random.randn(8).astype(np.float32)
+            state[:3] *= 0.1  # 位置范围适中
+            state[3:6] *= 0.5  # 旋转范围适中
+            state[6:8] = np.array([0.0, 0.0])  # 夹爪初始闭合
+            init_states.append(state)
+        
+        return init_states
+    
+    def _compute_state_hash(self, state):
+        """计算状态的哈希值"""
+        import hashlib
+        state_bytes = np.array(state).astype(np.float32).tobytes()
+        return hashlib.sha256(state_bytes).hexdigest()
+    
+    def _extract_state_from_obs(self, obs):
+        """从观测中提取8维状态用于哈希计算"""
+        try:
+            if isinstance(obs, dict):
+                # 提取位置、姿态和夹爪状态
+                pos = np.array(obs.get("robot0_eef_pos", [0, 0, 0]), dtype=np.float32)[:3]
+                quat = np.array(obs.get("robot0_eef_quat", [0, 0, 0, 1]), dtype=np.float32)[:4]
+                gripper = np.array(obs.get("robot0_gripper_qpos", [0, 0]), dtype=np.float32)[:2]
+                
+                # 转换四元数到轴角
+                try:
+                    import robosuite.utils.transform_utils as T
+                    axis_angle = T.quat2axisangle(quat).astype(np.float32)
+                except Exception:
+                    axis_angle = np.zeros(3, np.float32)
+                
+                # 组合成8维状态
+                state = np.concatenate([pos, axis_angle, gripper])
+                return state[:8]  # 确保是8维
+            else:
+                # 如果obs不是字典，返回零状态
+                return np.zeros(8, np.float32)
+        except Exception as e:
+            print(f"⚠️ 提取状态时出错: {e}")
+            return np.zeros(8, np.float32)
+
 
     
     def construct_pi0_observation(self, obs, task_description):
@@ -556,7 +621,8 @@ class LIBEROEnvRunner:
             if self.rank == 0:
                 print(f"检测到VectorEnv，使用单个环境模式")
         
-        for i, init_state in enumerate(all_init_states):
+        episodes = []
+        for i, target_init_state in enumerate(all_init_states):
             rollout_images = []
             
             # 重用传入的环境或创建新环境
@@ -565,16 +631,56 @@ class LIBEROEnvRunner:
             else:
                 task_description = env_name
             
-            # 设置初始状态并获取初始观测
-            obs = env.reset()
+            # 🔥 关键修改：尝试设置初始状态
+            if target_init_state is not None:
+                try:
+                    # 方案1: 如果环境支持set_init_state
+                    if hasattr(env, 'set_init_state'):
+                        obs = env.set_init_state(target_init_state)
+                        print(f"✅ 串行模式：成功设置初始状态 {i}")
+                    # 方案2: 如果环境支持reset_to
+                    elif hasattr(env, 'reset_to'):
+                        obs = env.reset_to(target_init_state)
+                        print(f"✅ 串行模式：通过reset_to设置初始状态 {i}")
+                    else:
+                        # 方案3: 回退到普通reset，但记录警告
+                        obs = env.reset()
+                        print(f"⚠️ 串行模式：环境不支持set_init_state，使用随机初始状态")
+                        # 记录实际的初始状态用于后续验证
+                        if is_vector_env and isinstance(obs, list):
+                            actual_obs = obs[0]
+                        else:
+                            actual_obs = obs
+                        actual_init_state = self._extract_state_from_obs(actual_obs)
+                        target_init_state = actual_init_state  # 更新为实际状态
+                except Exception as e:
+                    print(f"⚠️ 设置初始状态失败: {e}，回退到随机reset")
+                    obs = env.reset()
+                    if is_vector_env and isinstance(obs, list):
+                        actual_obs = obs[0]
+                    else:
+                        actual_obs = obs
+                    actual_init_state = self._extract_state_from_obs(actual_obs)
+                    target_init_state = actual_init_state
+            else:
+                # 如果没有指定初始状态，使用默认reset
+                obs = env.reset()
+                if is_vector_env and isinstance(obs, list):
+                    actual_obs = obs[0]
+                else:
+                    actual_obs = obs
+                target_init_state = self._extract_state_from_obs(actual_obs)
             
             # 如果是VectorEnv，取第一个环境的观测
             if is_vector_env and isinstance(obs, list):
                 obs = obs[0]
             
+            # 计算初始状态哈希
+            init_hash = self._compute_state_hash(target_init_state)
+            
             # 热机步骤
             dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-            for warmup_step in range(20):
+            for _ in range(20):
                 if is_vector_env:
                     # VectorEnv期望动作列表
                     step_results = env.step([dummy_action])
@@ -749,9 +855,20 @@ class LIBEROEnvRunner:
                 "dones": dones,
                 "infos": infos,
                 "task": task_description,
+                "init_state": target_init_state,  # 🔥 添加初始状态
+                "init_hash": init_hash,           # 🔥 添加初始状态哈希
+                "temp_init_hash": init_hash,      # 🔥 添加临时哈希用于后续迁移
             }
             
             # 返回轨迹结果
+            episodes.append(episode_data)
+        
+        # 返回所有episodes
+        for i, episode_data in enumerate(episodes):
+            # 计算最终成功率和奖励
+            success = episode_data.get('rewards', [0])[-1] if episode_data.get('rewards') else False
+            success = bool(success > 0) if isinstance(success, (int, float)) else bool(success)
+            total_reward = sum(episode_data.get('rewards', []))
             yield (success, total_reward, episode_data)
     
     # 🔥 新增：并行环境支持 (仅在功能开关启用时可用)
@@ -1375,4 +1492,70 @@ class LIBEROEnvRunner:
             batch_actions.append(action_buffer)
         
         return batch_actions
+    
+    def run_policy_in_env_batch(self, env_name, init_states, batch_size=None):
+        """
+        批量执行多个episode，确保每个使用指定的初始状态
+        
+        Args:
+            env_name: 环境名称
+            init_states: 初始状态列表，长度应为batch_size
+            batch_size: 批量大小，如果None则使用init_states的长度
+        
+        Returns:
+            list: episode列表，长度为batch_size
+        """
+        if batch_size is None:
+            batch_size = len(init_states) if init_states else 8
+        
+        # 确保init_states数量正确
+        if init_states is not None and len(init_states) != batch_size:
+            # 复制或截断到正确大小
+            if len(init_states) < batch_size:
+                init_states = init_states * (batch_size // len(init_states) + 1)
+            init_states = init_states[:batch_size]
+        
+        # 优先使用并行环境（如果可用且配置允许）
+        if self._can_use_parallel_envs(batch_size):
+            return self._run_parallel_episodes_true(
+                env=None,  # 将在内部创建
+                policy=self.policy_wrapper,
+                max_steps=self.max_steps,
+                init_states=init_states,
+                num_episodes=batch_size
+            )
+        else:
+            # 回退到串行执行
+            if self.rank == 0:
+                print(f"📋 批量执行回退到串行模式（batch_size={batch_size}）")
+            
+            # 创建环境
+            env = self._create_single_env(env_name)
+            
+            # 使用串行模式执行
+            episodes = []
+            for success, total_reward, episode_data in self._run_serial_episodes(
+                env, env_name, init_states, save_video=False
+            ):
+                # 添加成功率和总奖励信息
+                episode_data['success'] = success
+                episode_data['total_reward'] = total_reward
+                episodes.append(episode_data)
+            
+            # 清理环境
+            try:
+                env.close()
+            except:
+                pass
+            
+            return episodes
+    
+    def _can_use_parallel_envs(self, batch_size):
+        """检查是否可以使用并行环境"""
+        # 简化判断逻辑
+        features_config = getattr(self.config, 'features', {})
+        enable_parallel = features_config.get('enable_parallel_envs', False)
+        enable_true_parallel = features_config.get('enable_true_parallel_envs', False)
+        
+        return enable_parallel and enable_true_parallel and batch_size > 1
     
