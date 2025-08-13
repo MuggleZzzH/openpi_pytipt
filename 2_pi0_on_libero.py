@@ -73,8 +73,18 @@ while not d:
     print(">> gripper_qpos shape:", np.asarray(o["robot0_gripper_qpos"]).shape)
     state = (unnorm_state - state_mean) / (state_std + 1e-6)
 
-    base_0_rgb = o["agentview_image"][:, :, ::-1].copy()
-    left_wrist_0_rgb = o["robot0_eye_in_hand_image"][:, :, ::-1].copy()
+    # 统一图像处理：先规范到 HWC，再做 BGR->RGB 通道转换
+    def to_hwc_rgb(arr: np.ndarray) -> np.ndarray:
+        if isinstance(arr, np.ndarray) and arr.ndim == 3:
+            # CHW -> HWC
+            if arr.shape[0] == 3 and arr.shape[-1] != 3:
+                arr = arr.transpose(1, 2, 0)
+            # BGR -> RGB（LIBERO返回为BGR顺序）
+            return arr[:, :, ::-1].copy()
+        return arr
+
+    base_0_rgb = to_hwc_rgb(o["agentview_image"])
+    left_wrist_0_rgb = to_hwc_rgb(o["robot0_eye_in_hand_image"])
 
     observation = {
         "image": {
@@ -124,7 +134,8 @@ while not d:
 
     for i in range(50):
         o, r, d, _ = env.step(action[i, :7])
-        frames.append(o["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy())
+        # 保存视频帧：统一到 HWC + BGR->RGB
+        frames.append(to_hwc_rgb(o["agentview_image"]))
         if d:
             break
 
