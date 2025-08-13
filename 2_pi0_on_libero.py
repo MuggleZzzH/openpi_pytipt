@@ -44,7 +44,7 @@ action_std = np.array(norm_stats["norm_stats"]["actions"]["std"][:7], dtype=np.f
 cprint("Creating Libero environment...", "green")
 env = gym.make(
     "libero-goal-v0",  # from ["libero-goal-v0", "libero-object-v0", "libero-spatial-v0", "libero-10-v0", "libero-90-v0"],
-    task_id=1,  # task id from 0 to 9
+    task_id=9,  # task id from 0 to 9
     image_size=224,  # image size (height, width)
     camera_names=["agentview", "robot0_eye_in_hand"],  # camera names
     seed=0,  # random seed
@@ -129,7 +129,7 @@ while not d:
             break
 
 # save video
-writer = imageio.get_writer("pi0_libero_demo1.mp4", fps=30)
+writer = imageio.get_writer("pi0_libero_demo2.mp4", fps=30)
 for frame in frames:
     writer.append_data(frame)
 writer.close()
