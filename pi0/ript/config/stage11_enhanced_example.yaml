@@ -46,7 +46,11 @@ features:
   
   # 全局样本量控制
   enable_file_counter: true
-  rollout_goal_per_step: 8  # 每步训练的全局目标样本数
+  early_stop_percentage: 0.8  # 🔥 新增：早停百分比，用于计算全局阈值
+  
+  # per-init 哈希跳过机制
+  enable_rollout_stats_tracking: true  # 🔥 新增：启用初始状态哈希跳过
+  rollout_stats_path: "rollout_stats.json"  # 历史记录文件路径（相对于输出目录）
   
   # 自适应CFG调整
   adaptive_cfg: true  # 根据成功率窗口自动调整CFG强度
