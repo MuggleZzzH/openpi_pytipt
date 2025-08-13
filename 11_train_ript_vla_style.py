@@ -93,6 +93,59 @@ except ImportError as e:
     print(f"❌ 模块导入失败: {e}")
     sys.exit(1)
 
+def get_config_value(config, key, default=None, sources=['algo', 'features']):
+    """
+    统一配置读取函数，支持多级回退
+    
+    Args:
+        config: 配置字典或对象
+        key: 配置键名
+        default: 默认值
+        sources: 搜索的配置节点列表，按优先级排序
+    
+    Returns:
+        配置值
+    """
+    # 处理OmegaConf和字典两种情况
+    if hasattr(config, 'get'):
+        # 字典式访问
+        for source in sources:
+            if source in config and config[source] is not None and key in config[source]:
+                return config[source][key]
+        # 根节点访问
+        return config.get(key, default)
+    else:
+        # 属性式访问（针对一些旧的config对象）
+        for source in sources:
+            if hasattr(config, source):
+                source_obj = getattr(config, source)
+                if source_obj is not None and hasattr(source_obj, key):
+                    return getattr(source_obj, key)
+        # 根节点访问
+        return getattr(config, key, default)
+
+def set_config_value(config, key, value, target_source='algo'):
+    """
+    统一配置写回函数
+    
+    Args:
+        config: 配置字典或对象
+        key: 配置键名
+        value: 要设置的值
+        target_source: 目标配置节点
+    """
+    if hasattr(config, 'get'):
+        # 字典式访问
+        if target_source not in config:
+            config[target_source] = {}
+        config[target_source][key] = value
+    else:
+        # 属性式访问
+        if not hasattr(config, target_source):
+            setattr(config, target_source, type('Config', (), {})())
+        target_obj = getattr(config, target_source)
+        setattr(target_obj, key, value)
+
 def load_config(config_path: str):
     """加载配置文件（优先使用OmegaConf，便于属性访问）"""
     print(f"正在加载配置文件: {config_path}")
@@ -685,7 +738,7 @@ def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advan
         traceback.print_exc()
         return 0.0
 
-def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
+def evaluate_with_cfg_sweep(policy, env_runner, task_name, config, eval_episodes=3):
     """🔥 新增：评估不同CFG强度的效果"""
     cfg_scales = [1.0, 1.5, 3.0, 5.0]
     best_cfg = 1.0
@@ -697,16 +750,23 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
     for cfg_scale in cfg_scales:
         print(f"📊 测试CFG={cfg_scale}...")
         # 临时设置CFG强度
-        original_cfg = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+        original_cfg = get_config_value(config, 'collection_cfg_scale', 1.5)
+        set_config_value(config, 'collection_cfg_scale', cfg_scale)
         env_runner.config.collection_cfg_scale = cfg_scale
         
         # 运行评估episodes
         success_count = 0
         for ep_idx in range(eval_episodes):
             try:
-                # 使用现有的rollout收集函数
-                episodes = collect_rollouts_ript_vla_style(
-                    env_runner, task_name, 1, enable_dynamic_sampling=False
+                # 使用现有的rollout收集函数 - 正确解包和传参
+                episodes, valid_mask = collect_rollouts_ript_vla_style(
+                    env_runner, task_name, 1,
+                    dynamic_sampling_config=None,  # 评估时关闭动态采样
+                    recent_success_rates=None,
+                    rollout_goal_per_step=None,
+                    rollout_stats=None,
+                    rollout_skip_cnt=None,
+                    rloo_batch_size=1
                 )
                 if episodes and len(episodes) > 0:
                     if episodes[0].get('success', False):
@@ -723,6 +783,7 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
             best_cfg = cfg_scale
         
         # 恢复原设置
+        set_config_value(config, 'collection_cfg_scale', original_cfg)
         env_runner.config.collection_cfg_scale = original_cfg
         
         print(f"   CFG={cfg_scale}: 成功率={success_rate:.2%} ({success_count}/{eval_episodes})")
@@ -756,6 +817,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     world_size = 1  # 当前单机，后续可从分布式环境读取
     early_stop_percentage = features_config.get('early_stop_percentage', 0.8)  # 新增配置项
     
+    # 🔥 新增：统一配置读取 - rollout_stats相关
+    enable_rollout_stats_tracking = get_config_value(config, 'enable_rollout_stats_tracking', False, ['features', 'algo'])
+    rollout_stats_path = get_config_value(config, 'rollout_stats_path', str(output_dir / "rollout_stats.json"), ['features', 'algo'])
+    
     if enable_file_counter:
         total_demo_batch_size = demo_batch_size * world_size
         rollout_goal_per_step = int(total_demo_batch_size * early_stop_percentage)
@@ -778,8 +843,6 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     recent_success_rates = deque(maxlen=smooth_window_size)
     
     # 🔥 新增：per-init 哈希跳过机制初始化
-    enable_rollout_stats_tracking = features_config.get('enable_rollout_stats_tracking', False)
-    rollout_stats_path = features_config.get('rollout_stats_path', str(output_dir / "rollout_stats.json"))
     
     rollout_stats = {}
     rollout_skip_cnt = {}
@@ -924,23 +987,27 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 current_avg = np.mean(recent_success_rates)
                 p_min = dynamic_sampling_config.get('p_min', 0.1)
                 p_max = dynamic_sampling_config.get('p_max', 0.9)
-                current_cfg = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+                current_cfg = get_config_value(config, 'collection_cfg_scale', 1.5)
                 
                 # 自适应调整逻辑
                 if current_avg < p_min:
                     # 成功率过低，降低CFG强度（减少过度引导）
                     new_cfg = max(1.0, current_cfg - 0.2)
                     print(f"🔧 自适应CFG: 成功率过低({current_avg:.3f} < {p_min})，降低CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                    # 统一写回配置
+                    set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
                 elif current_avg > p_max:
                     # 成功率过高，增加CFG强度（增强引导）
                     new_cfg = min(5.0, current_cfg + 0.2)
                     print(f"🔧 自适应CFG: 成功率过高({current_avg:.3f} > {p_max})，提升CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                    # 统一写回配置
+                    set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
                 else:
                     print(f"✅ 自适应CFG: 成功率适中({current_avg:.3f})，保持CFG={current_cfg:.1f}")
                 
-                step_metrics['adaptive_cfg_scale'] = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+                step_metrics['adaptive_cfg_scale'] = get_config_value(config, 'collection_cfg_scale', 1.5)
                 step_metrics['success_rate_window_avg'] = current_avg
                 
             except Exception as e:
@@ -949,7 +1016,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         # 8. CFG评估（每10步进行一次）
         if (step + 1) % 10 == 0:
             try:
-                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
+                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, config, eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")
