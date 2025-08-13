@@ -416,9 +416,17 @@ def update_rollout_stats_with_correct_hash(episodes: List[Dict], batch_states: t
                     del rollout_stats[temp_hash]
                     if temp_hash in rollout_skip_cnt:
                         del rollout_skip_cnt[temp_hash]
-                
-                # 更新正确哈希的统计
-                update_rollout_stats(correct_hash, success, rollout_stats, rollout_skip_cnt)
+                    
+                    # 由于已经迁移了统计，不需要再次更新
+                    print(f"🔄 迁移统计: {temp_hash[:8]}... → {correct_hash[:8]}...")
+                else:
+                    # 🔥 关键修复：只有在没有迁移的情况下才更新统计，避免重复计数
+                    # 检查是否已经用temp_hash更新过统计（在分组路径中可能发生）
+                    if not temp_hash or temp_hash == correct_hash:
+                        update_rollout_stats(correct_hash, success, rollout_stats, rollout_skip_cnt)
+                    # 如果temp_hash存在且不等于correct_hash，说明之前没有更新过统计，现在更新
+                    elif temp_hash and temp_hash not in rollout_stats:
+                        update_rollout_stats(correct_hash, success, rollout_stats, rollout_skip_cnt)
                 
                 # 记录正确的哈希到 episode（用于调试）
                 episode['correct_init_hash'] = correct_hash
@@ -473,18 +481,40 @@ def create_environment_runner(config: Dict[str, Any], policy):
     print("✓ 环境runner创建成功")
     return runner
 
-def _dynamic_filter_rollouts(episodes: List[Dict], dynamic_sampling_config: Dict, 
-                             recent_success_rates: deque) -> List[Dict]:
+def _ript_dynamic_sampling(episodes: List[Dict], enable_dynamic_sampling: bool = True) -> List[Dict]:
     """
-    升级版动态采样：区间策略 + 平滑窗口机制
+    🔥 RIPT原版动态采样：简单的全成功/全失败检查
     
     Args:
-        episodes: 收集的episodes
-        dynamic_sampling_config: 包含 p_min, p_max, smooth_window 的配置
-        recent_success_rates: 最近成功率的滑动窗口
+        episodes: 收集的episodes（通常是8个来自相同init_hash的样本）
+        enable_dynamic_sampling: 是否启用动态采样
     
     Returns:
-        过滤后的episodes（可能为空）
+        过滤后的episodes（如果全成功/全失败则返回空列表）
+    """
+    if not enable_dynamic_sampling or not episodes:
+        return episodes
+    
+    # 提取成功/失败状态
+    successes = [bool(ep.get('success', False)) for ep in episodes]
+    
+    # 🔥 RIPT核心逻辑：检查是否全成功或全失败
+    if len(set(successes)) == 1:  # 只有一种结果（全0或全1）
+        uniform_result = "全成功" if successes[0] else "全失败"
+        print(f"⚠️ RIPT动态采样拒绝: {uniform_result} ({len(episodes)}个样本)，缺乏学习价值")
+        return []  # 丢弃整组
+    
+    # 混合结果，有学习价值
+    success_count = sum(successes)
+    print(f"✅ RIPT动态采样接受: {success_count}/{len(episodes)} 成功，结果混合有学习价值")
+    return episodes
+
+
+def _dynamic_filter_rollouts_legacy(episodes: List[Dict], dynamic_sampling_config: Dict, 
+                             recent_success_rates: deque) -> List[Dict]:
+    """
+    🔄 原来的复杂动态采样（保留作为备用，但不推荐使用）
+    升级版动态采样：区间策略 + 平滑窗口机制
     """
     if not dynamic_sampling_config.get('enabled', False) or not episodes:
         return episodes
@@ -498,7 +528,7 @@ def _dynamic_filter_rollouts(episodes: List[Dict], dynamic_sampling_config: Dict
     
     # 第一层过滤：当前批次区间检查
     if current_success_rate < p_min or current_success_rate > p_max:
-        print(f"⚠️ 动态采样第一层拒绝: success_rate={current_success_rate:.3f} 不在 [{p_min}, {p_max}] 区间内")
+        print(f"⚠️ 复杂动态采样第一层拒绝: success_rate={current_success_rate:.3f} 不在 [{p_min}, {p_max}] 区间内")
         return []
     
     # 第二层过滤：平滑窗口检查（降低抖动）
@@ -506,11 +536,208 @@ def _dynamic_filter_rollouts(episodes: List[Dict], dynamic_sampling_config: Dict
     if len(recent_success_rates) >= 2:  # 至少有2个样本才进行窗口检查
         window_avg = np.mean(recent_success_rates)
         if window_avg < p_min or window_avg > p_max:
-            print(f"⚠️ 动态采样第二层拒绝: 窗口平均={window_avg:.3f} 不在区间内 (窗口大小={len(recent_success_rates)})")
+            print(f"⚠️ 复杂动态采样第二层拒绝: 窗口平均={window_avg:.3f} 不在区间内 (窗口大小={len(recent_success_rates)})")
             return []
     
-    print(f"✅ 动态采样通过: 当前={current_success_rate:.3f}, 窗口平均={np.mean(recent_success_rates):.3f}")
+    print(f"✅ 复杂动态采样通过: 当前={current_success_rate:.3f}, 窗口平均={np.mean(recent_success_rates):.3f}")
     return episodes
+
+
+def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_size, rloo_batch_size,
+                                           enable_ript_dynamic_sampling: bool = True,
+                                           rollout_goal_per_step: int = None,
+                                           rollout_stats: Dict[str, List[int]] = None,
+                                           rollout_skip_cnt: Dict[str, int] = None):
+    """
+    🔥 完全对齐 RIPT 原版：按初始状态分组收集，确保 RLOO 优势计算的正确性
+    
+    核心逻辑：
+    1. 确定需要收集的初始状态数量 (demo_batch_size)
+    2. 对每个初始状态，并行收集 rloo_batch_size 个样本
+    3. 确保每组 rloo_batch_size 个样本来自相同的 init_hash
+    
+    Args:
+        demo_batch_size: 需要多少个不同的初始状态 (每个状态收集 rloo_batch_size 个样本)
+        rloo_batch_size: 每个初始状态收集多少个样本
+    
+    Returns:
+        episodes: 总共 demo_batch_size * rloo_batch_size 个样本，按组织排列
+        valid_mask: 对应的有效性掩码
+    """
+    total_target_samples = demo_batch_size * rloo_batch_size
+    print(f"🎯 RIPT风格收集：{demo_batch_size} 个初始状态 × {rloo_batch_size} 个样本 = {total_target_samples} 个样本")
+    
+    # 如果设置了全局样本目标，显示当前进度
+    if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+        current_count = env_runner.file_counter.get()
+        print(f"📊 当前全局样本数: {current_count}/{rollout_goal_per_step}")
+    
+    all_episodes = []
+    collected_groups = 0
+    
+    try:
+        # 获取任务的初始状态池
+        task_id = 0  # 简化处理，使用第一个任务
+        if hasattr(env_runner, 'benchmark'):
+            all_init_states = env_runner.benchmark.get_task_init_states(task_id)
+            print(f"📋 可用初始状态数量: {len(all_init_states) if all_init_states else 0}")
+        else:
+            all_init_states = None
+        
+        # 🔥 核心循环：按初始状态分组收集
+        for group_idx in range(demo_batch_size):
+            # 检查全局早停条件
+            if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+                current_global_count = env_runner.file_counter.get()
+                if current_global_count >= rollout_goal_per_step:
+                    print(f"🎯 达到全局样本目标 ({current_global_count}/{rollout_goal_per_step})，提前结束收集")
+                    break
+            
+            print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组样本...")
+            
+            # 步骤1: 选择/生成一个初始状态
+            if all_init_states is not None and len(all_init_states) > 0:
+                # 从可用初始状态中随机选择
+                init_state_idx = np.random.randint(0, len(all_init_states))
+                init_state = all_init_states[init_state_idx]
+                print(f"📍 使用初始状态 #{init_state_idx}")
+            else:
+                # 使用默认初始状态或随机生成
+                init_state = None  # 让 runner 自己处理
+                print(f"📍 使用默认初始状态")
+            
+            # 步骤2: 计算初始状态哈希（用于跳过检查）
+            if init_state is not None:
+                state_bytes = np.array(init_state).astype(np.float32).tobytes()
+                init_hash = hashlib.sha256(state_bytes).hexdigest()
+            else:
+                init_hash = f"default_{group_idx}"  # 默认哈希
+            
+            # 步骤3: 检查是否应该跳过这个初始状态
+            enable_init_skip = (rollout_stats is not None and rollout_skip_cnt is not None)
+            if enable_init_skip and should_skip_init_state(init_hash, rollout_stats, rloo_batch_size, 
+                                                          rollout_skip_cnt, rollout_skip_threshold=10):
+                print(f"⏭️ 跳过初始状态 {init_hash[:8]}（历史表现一致）")
+                rollout_skip_cnt[init_hash] = rollout_skip_cnt.get(init_hash, 0) + 1
+                continue  # 跳过这个初始状态，不计入 collected_groups
+            
+            # 步骤4: 为这个初始状态收集 rloo_batch_size 个样本
+            group_episodes = []
+            
+            # 🔥 关键：创建 rloo_batch_size 个相同的初始状态
+            if init_state is not None:
+                # 复制相同的初始状态
+                env_init_states = np.tile(init_state, (rloo_batch_size, 1))
+                print(f"🔄 并行运行 {rloo_batch_size} 个环境（相同初始状态）")
+                
+                # 调用 runner 的并行执行（如果支持）
+                if hasattr(env_runner, 'run_policy_in_env_batch'):
+                    # 使用批量接口
+                    batch_episodes = env_runner.run_policy_in_env_batch(
+                        env_name=task_name,
+                        init_states=env_init_states
+                    )
+                    group_episodes.extend(batch_episodes)
+                else:
+                    # 回退到逐个收集（但使用相同初始状态）
+                    for sample_idx in range(rloo_batch_size):
+                        rollout_generator = env_runner.run_policy_in_env(
+                            env_name=task_name,
+                            all_init_states=[init_state]  # 使用相同的初始状态
+                        )
+                        
+                        # 收集一个样本
+                        for success, total_reward, episode_data in rollout_generator:
+                            episode = {
+                                'success': success,
+                                'total_reward': total_reward,
+                                'init_hash': init_hash,  # 记录真实的初始状态哈希
+                                **episode_data
+                            }
+                            group_episodes.append(episode)
+                            break  # 只收集一个样本
+                        
+                        # 更新文件计数器
+                        if hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+                            env_runner.file_counter.update(1)
+            else:
+                # 没有具体初始状态，逐个收集（但会导致不同初始状态混合）
+                print("⚠️ 没有具体初始状态，可能导致 RLOO 基线估计不准确")
+                rollout_generator = env_runner.run_policy_in_env(
+                    env_name=task_name,
+                    all_init_states=all_init_states
+                )
+                
+                sample_count = 0
+                for success, total_reward, episode_data in rollout_generator:
+                    episode = {
+                        'success': success,
+                        'total_reward': total_reward,
+                        'init_hash': init_hash,
+                        **episode_data
+                    }
+                    group_episodes.append(episode)
+                    sample_count += 1
+                    
+                    # 更新文件计数器
+                    if hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+                        env_runner.file_counter.update(1)
+                    
+                    if sample_count >= rloo_batch_size:
+                        break
+            
+            # 步骤5: RIPT风格动态采样过滤（简单有效）
+            group_accepted = True
+            if enable_ript_dynamic_sampling and len(group_episodes) == rloo_batch_size:
+                # 🔥 使用RIPT原版的简单动态采样
+                filtered_group = _ript_dynamic_sampling(group_episodes, enable_ript_dynamic_sampling)
+                if not filtered_group:
+                    group_accepted = False
+            
+            # 🔥 关键修复：为分组路径添加temp_init_hash字段
+            if group_accepted and group_episodes:
+                for ep in group_episodes:
+                    if 'temp_init_hash' not in ep:
+                        ep['temp_init_hash'] = init_hash  # 确保每个episode都有这个字段
+                    if 'init_hash' not in ep:
+                        ep['init_hash'] = init_hash
+            
+            # 步骤6: 延迟统计更新到correct_hash生成后（避免重复计数）
+            # 注意：这里不再直接更新rollout_stats，而是延迟到CFG处理后统一更新
+            
+            # 步骤7: 添加到总列表（仅接受的组）
+            if group_accepted and len(group_episodes) == rloo_batch_size:
+                all_episodes.extend(group_episodes)
+                collected_groups += 1
+                print(f"✅ 第 {group_idx + 1} 组收集并接受：{len(group_episodes)} 个样本")
+            elif len(group_episodes) == rloo_batch_size:
+                print(f"⚠️ 第 {group_idx + 1} 组收集但被过滤：{len(group_episodes)} 个样本")
+            else:
+                print(f"⚠️ 第 {group_idx + 1} 组样本不足：{len(group_episodes)}/{rloo_batch_size}")
+                # 可以选择填充或跳过
+                if len(group_episodes) > 0 and group_accepted:
+                    # 填充到目标数量
+                    while len(group_episodes) < rloo_batch_size:
+                        group_episodes.append(group_episodes[-1])  # 用最后一个样本填充
+                    all_episodes.extend(group_episodes)
+                    collected_groups += 1
+        
+        print(f"📊 收集完成：{collected_groups} 组 × {rloo_batch_size} = {len(all_episodes)} 个样本")
+        
+        # 🔥 RIPT风格动态采样已在收集过程中实时应用
+        if enable_ript_dynamic_sampling:
+            print(f"📊 RIPT动态采样: 已过滤全成功/全失败的组，保留有学习价值的混合结果")
+        
+        # 步骤8: 生成有效性掩码
+        valid_mask = [True] * len(all_episodes)
+        
+        return all_episodes, valid_mask
+        
+    except Exception as e:
+        print(f"❌ 收集过程出错: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], []
 
 
 def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, 
@@ -521,10 +748,48 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
                                      rollout_skip_cnt: Dict[str, int] = None,
                                      rloo_batch_size: int = None):
     """
-    RIPT-VLA风格的rollout收集 + 文件计数器早停 + per-init哈希跳过
-    直接调用runner，无中间层
+    兼容性包装器：将旧的接口转换为新的RIPT风格分组收集
     """
-    print(f"正在收集 {num_rollouts} 个rollouts...")
+    if rloo_batch_size is None or rloo_batch_size <= 0:
+        rloo_batch_size = 8  # 默认值
+    
+    # 计算需要多少组
+    demo_batch_size = max(1, num_rollouts // rloo_batch_size)
+    
+    # 🔥 从复杂配置中提取简单的布尔开关
+    if dynamic_sampling_config is not None:
+        enable_ript_dynamic_sampling = dynamic_sampling_config.get('enabled', False)
+        if enable_ript_dynamic_sampling:
+            print(f"🔄 使用RIPT风格动态采样 (简单的全成功/全失败检查)")
+    else:
+        enable_ript_dynamic_sampling = True  # 默认启用
+    
+    print(f"🔄 兼容性转换: {num_rollouts} 个样本 → {demo_batch_size} 组 × {rloo_batch_size} 个样本")
+    
+    return collect_rollouts_ript_vla_style_grouped(
+        env_runner=env_runner,
+        task_name=task_name, 
+        demo_batch_size=demo_batch_size,
+        rloo_batch_size=rloo_batch_size,
+        enable_ript_dynamic_sampling=enable_ript_dynamic_sampling,
+        rollout_goal_per_step=rollout_goal_per_step,
+        rollout_stats=rollout_stats,
+        rollout_skip_cnt=rollout_skip_cnt
+    )
+
+
+def collect_rollouts_ript_vla_style_old(env_runner, task_name, num_rollouts, 
+                                     dynamic_sampling_config: Dict = None, 
+                                     recent_success_rates: deque = None,
+                                     rollout_goal_per_step: int = None,
+                                     rollout_stats: Dict[str, List[int]] = None,
+                                     rollout_skip_cnt: Dict[str, int] = None,
+                                     rloo_batch_size: int = None):
+    """
+    原有的逐个收集方式（保留作为备份）
+    ⚠️ 注意：这种方式会导致 RLOO 基线估计不准确，因为不同初始状态的样本被混合在一起
+    """
+    print(f"⚠️ 使用旧版收集方式：逐个收集 {num_rollouts} 个rollouts（可能混合不同初始状态）")
     
     # 如果设置了全局样本目标，显示当前进度
     if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
@@ -599,11 +864,15 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
             if rollout_count >= num_rollouts:
                 break
         
-        # 升级版动态采样过滤
-        if dynamic_sampling_config and recent_success_rates is not None:
-            filtered = _dynamic_filter_rollouts(collected_rollouts, dynamic_sampling_config, recent_success_rates)
+        # 🔄 传统的复杂动态采样过滤（不推荐，但保留兼容性）
+        if dynamic_sampling_config and dynamic_sampling_config.get('use_legacy_filtering', False):
+            # 使用复杂的传统过滤逻辑（需要平滑窗口）
+            recent_success_rates = deque(maxlen=3)  # 临时创建窗口
+            filtered = _dynamic_filter_rollouts_legacy(collected_rollouts, dynamic_sampling_config, recent_success_rates)
         else:
-            filtered = collected_rollouts
+            # 🔥 默认使用RIPT风格的简单动态采样
+            enable_ript_dynamic_sampling = dynamic_sampling_config.get('enabled', True) if dynamic_sampling_config else True
+            filtered = _ript_dynamic_sampling(collected_rollouts, enable_ript_dynamic_sampling)
             
         if not filtered:
             print("⚠️ 本批次被动态采样过滤，返回空集")
@@ -625,7 +894,7 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
                     padded_episode['is_padded'] = True  # 标记为填充样本
                     filtered.append(padded_episode)
                     valid_mask.append(False)  # 标记为无效
-            else:
+        else:
                 print("⚠️ 没有有效样本用于填充")
                 return filtered, []
         
@@ -637,16 +906,132 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
         traceback.print_exc()
         return [], []
 
-def compute_advantages_rloo(episodes: List[Dict], rloo_batch_size: int = None) -> torch.Tensor:
+def compute_advantages_rloo_grouped(episodes: List[Dict], rloo_batch_size: int, 
+                                   demo_batch_size: int = None) -> torch.Tensor:
     """
-    正宗的RLOO (Reward Ranked Leave-One-Out) 优势计算
+    🔥 增强版RLOO优势计算：验证分组结构，确保基线估计准确性
+    
+    专门为按初始状态分组的episodes设计，确保每组内的样本来自相同初始状态
     
     Args:
-        episodes: 收集的episodes列表
-        rloo_batch_size: RLOO批次大小，用于Leave-One-Out计算
+        episodes: 按分组排列的episodes列表 (每组rloo_batch_size个样本来自相同init_hash)
+        rloo_batch_size: 每组的样本数量
+        demo_batch_size: 组的数量（可选，用于验证）
     
     Returns:
         torch.Tensor: 计算得到的优势值
+    """
+    if not episodes:
+        return torch.tensor([])
+    
+    num_rollouts = len(episodes)
+    
+    # 验证分组结构
+    if demo_batch_size is not None:
+        expected_total = demo_batch_size * rloo_batch_size
+        if num_rollouts != expected_total:
+            print(f"⚠️ 分组结构不匹配: 期望 {expected_total} 个样本 ({demo_batch_size}×{rloo_batch_size}), 实际 {num_rollouts} 个")
+    
+    # 提取奖励
+    rewards = []
+    init_hashes = []  # 用于验证分组
+    for ep in episodes:
+        reward = ep.get('total_reward', 0.0)
+        rewards.append(float(reward))
+        # 🔥 关键修复：优先使用correct_init_hash，其次temp_init_hash，最后init_hash
+        hash_to_use = ep.get('correct_init_hash') or ep.get('temp_init_hash') or ep.get('init_hash', 'unknown')
+        init_hashes.append(hash_to_use)
+    
+    rlhf_reward = torch.tensor(rewards, dtype=torch.float32)
+    
+    # 🔍 验证分组的正确性
+    if len(init_hashes) >= rloo_batch_size:
+        print("🔍 验证RLOO分组结构...")
+        groups_verified = 0
+        for group_start in range(0, num_rollouts, rloo_batch_size):
+            group_end = min(group_start + rloo_batch_size, num_rollouts)
+            if group_end - group_start == rloo_batch_size:
+                group_hashes = init_hashes[group_start:group_end]
+                unique_hashes = set(group_hashes)
+                if len(unique_hashes) == 1:
+                    groups_verified += 1
+                else:
+                    print(f"⚠️ 第 {group_start//rloo_batch_size + 1} 组包含多个不同初始状态: {unique_hashes}")
+        
+        total_groups = num_rollouts // rloo_batch_size
+        if groups_verified == total_groups:
+            print(f"✅ 分组验证通过: {groups_verified}/{total_groups} 组结构正确")
+        else:
+            print(f"⚠️ 分组验证失败: 仅 {groups_verified}/{total_groups} 组结构正确")
+    
+    # 🚀 RLOO优势计算
+    if rloo_batch_size <= 1:
+        print("⚠️ RLOO batch size过小，使用简单优势计算")
+        advantage = rlhf_reward - rlhf_reward.mean()
+    else:
+        try:
+            # 确保可以整除
+            effective_rollouts = (num_rollouts // rloo_batch_size) * rloo_batch_size
+            if effective_rollouts != num_rollouts:
+                print(f"🔧 RLOO裁剪：{num_rollouts} → {effective_rollouts} rollouts")
+                rlhf_reward = rlhf_reward[:effective_rollouts]
+                num_rollouts = effective_rollouts
+            
+            num_batches = num_rollouts // rloo_batch_size
+            rlhf_reward_reshaped = rlhf_reward.reshape(num_batches, rloo_batch_size)
+            
+            # 🔥 核心RLOO计算：每个样本与同组其他样本比较
+            batch_sums = rlhf_reward_reshaped.sum(dim=1, keepdim=True)  # (num_batches, 1)
+            baseline = (batch_sums - rlhf_reward_reshaped) / (rloo_batch_size - 1)  # (num_batches, rloo_batch_size)
+            advantage = rlhf_reward_reshaped - baseline  # (num_batches, rloo_batch_size)
+            advantage = advantage.flatten()  # 展平为一维
+            
+            # 安全性检查
+            if torch.isnan(advantage).any() or torch.isinf(advantage).any():
+                print("⚠️ RLOO计算产生NaN/Inf，使用安全替换")
+                advantage = torch.nan_to_num(advantage, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            # 统计信息
+            print(f"🎯 分组RLOO优势计算完成:")
+            print(f"   分组配置: {num_rollouts} rollouts → {num_batches} 组 × {rloo_batch_size} 样本/组")
+            print(f"   优势统计: mean={advantage.mean():.4f}, std={advantage.std():.4f}")
+            print(f"   正优势比例: {(advantage > 0).float().mean():.2%}")
+            
+            # 🔍 按组显示优势分布（前几组）
+            if num_batches <= 5:
+                for batch_idx in range(num_batches):
+                    batch_advantages = advantage[batch_idx * rloo_batch_size:(batch_idx + 1) * rloo_batch_size]
+                    batch_rewards = rlhf_reward_reshaped[batch_idx]
+                    print(f"   组 {batch_idx + 1}: 奖励 {batch_rewards.tolist()}, 优势 {batch_advantages.tolist()}")
+            
+        except Exception as e:
+            print(f"❌ 分组RLOO计算失败: {e}，回退到简单方法")
+            advantage = rlhf_reward - rlhf_reward.mean()
+    
+    return advantage
+
+
+def compute_advantages_rloo(episodes: List[Dict], rloo_batch_size: int = None) -> torch.Tensor:
+    """
+    兼容性包装器：调用增强版分组RLOO计算
+    """
+    if rloo_batch_size is None or rloo_batch_size <= 0:
+        rloo_batch_size = 8  # 默认值
+    
+    # 推断demo_batch_size
+    demo_batch_size = len(episodes) // rloo_batch_size if len(episodes) >= rloo_batch_size else 1
+    
+    return compute_advantages_rloo_grouped(
+        episodes=episodes,
+        rloo_batch_size=rloo_batch_size,
+        demo_batch_size=demo_batch_size
+    )
+
+
+def compute_advantages_rloo_old(episodes: List[Dict], rloo_batch_size: int = None) -> torch.Tensor:
+    """
+    原有的RLOO优势计算（保留作为备份）
+    ⚠️ 注意：这个版本不验证分组结构，可能导致基线估计不准确
     """
     if not episodes:
         return torch.tensor([])
@@ -812,8 +1197,15 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     enable_file_counter = features_config.get('enable_file_counter', False)
     adaptive_cfg_enabled = features_config.get('adaptive_cfg', False)
     
-    # 🔥 修正：按 ript 标准计算全局阈值
-    demo_batch_size = config['algo']['rloo_batch_size']  # 对应 ript 的 demo_batch_size
+    # 🔥 修正：独立配置demo_batch_size，不再等于rloo_batch_size
+    demo_batch_size = get_config_value(config, 'demo_batch_size', None, ['algo', 'dataset'])
+    if demo_batch_size is None:
+        # 尝试从dataset.num_init_states获取
+        demo_batch_size = get_config_value(config, 'num_init_states', 22, ['dataset'])
+        print(f"⚠️ demo_batch_size未配置，使用dataset.num_init_states={demo_batch_size}")
+    else:
+        print(f"✅ 使用配置的demo_batch_size={demo_batch_size}")
+    
     world_size = 1  # 当前单机，后续可从分布式环境读取
     early_stop_percentage = features_config.get('early_stop_percentage', 0.8)  # 新增配置项
     
@@ -822,11 +1214,21 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     rollout_stats_path = get_config_value(config, 'rollout_stats_path', str(output_dir / "rollout_stats.json"), ['features', 'algo'])
     
     if enable_file_counter:
-        total_demo_batch_size = demo_batch_size * world_size
-        rollout_goal_per_step = int(total_demo_batch_size * early_stop_percentage)
-        print(f"🎯 全局阈值计算: {demo_batch_size} × {world_size} × {early_stop_percentage} = {rollout_goal_per_step}")
+        # 正确计算总目标：demo_batch_size(组数) × rloo_batch_size(每组样本数) × world_size
+        total_target_samples = demo_batch_size * rloo_batch_size * world_size
+        rollout_goal_per_step = int(total_target_samples * early_stop_percentage)
+        print(f"🎯 早停阈值计算: {rollout_goal_per_step} = {demo_batch_size}组 × {rloo_batch_size}样本/组 × {world_size}GPU × {early_stop_percentage:.0%}")
     else:
         rollout_goal_per_step = None
+    
+    print(f"\n=== RIPT对齐验证 ===")
+    print(f"demo_batch_size: {demo_batch_size} (每步收集的组数)")
+    print(f"rloo_batch_size: {rloo_batch_size} (每组内样本数)") 
+    print(f"目标样本数/步: {demo_batch_size * rloo_batch_size}")
+    if rollout_goal_per_step:
+        print(f"早停阈值: {rollout_goal_per_step}")
+    else:
+        print("早停阈值: 未启用")
     
     print(f"\n🔧 增强功能配置:")
     print(f"  动态采样: {'✅' if dynamic_sampling_config.get('enabled', False) else '❌'}")
@@ -838,9 +1240,28 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"    每步全局目标: {rollout_goal_per_step}")
     print(f"  自适应CFG: {'✅' if adaptive_cfg_enabled else '❌'}")
     
-    # 🔥 新增：初始化平滑窗口
-    smooth_window_size = dynamic_sampling_config.get('smooth_window', 3)
-    recent_success_rates = deque(maxlen=smooth_window_size)
+    # 🔥 简化：移除复杂的平滑窗口（RIPT原版不需要）
+    # smooth_window_size = dynamic_sampling_config.get('smooth_window', 3)
+    # recent_success_rates = deque(maxlen=smooth_window_size)
+    
+    # 验证环境runner是否支持新功能
+    if hasattr(env_runner, 'run_policy_in_env_batch'):
+        print("✅ 环境runner支持批量执行")
+    else:
+        print("⚠️ 环境runner不支持批量执行，将回退到串行")
+
+    # 验证初始状态池
+    if hasattr(env_runner, 'get_task_init_states'):
+        try:
+            test_states = env_runner.get_task_init_states(0)
+            if test_states:
+                print(f"✅ 初始状态池可用，包含{len(test_states)}个状态")
+            else:
+                print("⚠️ 初始状态池为空")
+        except Exception as e:
+            print(f"⚠️ 获取初始状态池失败: {e}")
+    else:
+        print("⚠️ 环境runner不支持get_task_init_states")
     
     # 🔥 新增：per-init 哈希跳过机制初始化
     
@@ -909,15 +1330,19 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         
         print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
         
-        # 1. 收集rollouts（直接调用，无中间层）+ 新功能集成
-        episodes, valid_mask = collect_rollouts_ript_vla_style(
-            env_runner, task_name, rloo_batch_size,
-            dynamic_sampling_config=dynamic_sampling_config,
-            recent_success_rates=recent_success_rates,
+        # 1. 收集rollouts（RIPT原版风格：按初始状态分组）
+        # 🔥 关键修改：使用简化的RIPT动态采样，确保RLOO优势计算的正确性
+        enable_ript_dynamic_sampling = dynamic_sampling_config.get('enabled', True) if dynamic_sampling_config else True
+        
+        episodes, valid_mask = collect_rollouts_ript_vla_style_grouped(
+            env_runner=env_runner,
+            task_name=task_name, 
+            demo_batch_size=demo_batch_size,  # 需要多少个不同的初始状态
+            rloo_batch_size=rloo_batch_size,  # 每个初始状态收集多少个样本
+            enable_ript_dynamic_sampling=enable_ript_dynamic_sampling,
             rollout_goal_per_step=rollout_goal_per_step,
             rollout_stats=rollout_stats if enable_rollout_stats_tracking else None,
-            rollout_skip_cnt=rollout_skip_cnt if enable_rollout_stats_tracking else None,
-            rloo_batch_size=rloo_batch_size
+            rollout_skip_cnt=rollout_skip_cnt if enable_rollout_stats_tracking else None
         )
         
         if not episodes:
@@ -951,8 +1376,12 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             except Exception as e:
                 print(f"⚠️ 正确哈希更新失败: {e}")
         
-        # 3. 计算优势（正宗RLOO方法）
-        advantages = compute_advantages_rloo(episodes, rloo_batch_size=rloo_batch_size)
+        # 3. 计算优势（增强版分组RLOO方法，验证初始状态分组）
+        advantages = compute_advantages_rloo_grouped(
+            episodes=episodes, 
+            rloo_batch_size=rloo_batch_size,
+            demo_batch_size=demo_batch_size  # 传递分组信息用于验证
+        )
         
         # 4. 更新策略（直接更新，无复杂组件）
         loss = update_policy_ript_vla_style(
@@ -981,34 +1410,32 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
         
-        # 7. 自适应CFG调整（基于成功率窗口）
-        if adaptive_cfg_enabled and len(recent_success_rates) >= 2:
+        # 7. 自适应CFG调整（简化版本，基于当前步骤成功率）
+        if adaptive_cfg_enabled and len(episodes) > 0:
             try:
-                current_avg = np.mean(recent_success_rates)
-                p_min = dynamic_sampling_config.get('p_min', 0.1)
-                p_max = dynamic_sampling_config.get('p_max', 0.9)
+                # 计算当前步骤的总体成功率
+                current_successes = [ep.get('success', False) for ep in episodes]
+                current_success_rate = np.mean(current_successes)
                 current_cfg = get_config_value(config, 'collection_cfg_scale', 1.5)
                 
-                # 自适应调整逻辑
-                if current_avg < p_min:
-                    # 成功率过低，降低CFG强度（减少过度引导）
+                # 简化的CFG调整逻辑（不依赖复杂窗口）
+                if current_success_rate < 0.2:  # 成功率很低
                     new_cfg = max(1.0, current_cfg - 0.2)
-                    print(f"🔧 自适应CFG: 成功率过低({current_avg:.3f} < {p_min})，降低CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                    print(f"🔧 自适应CFG: 成功率过低({current_success_rate:.3f})，降低CFG {current_cfg:.1f} → {new_cfg:.1f}")
                     # 统一写回配置
                     set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
-                elif current_avg > p_max:
-                    # 成功率过高，增加CFG强度（增强引导）
-                    new_cfg = min(5.0, current_cfg + 0.2)
-                    print(f"🔧 自适应CFG: 成功率过高({current_avg:.3f} > {p_max})，提升CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                elif current_success_rate > 0.9:  # 成功率很高
+                    new_cfg = min(3.0, current_cfg + 0.2)
+                    print(f"🔧 自适应CFG: 成功率过高({current_success_rate:.3f})，提升CFG {current_cfg:.1f} → {new_cfg:.1f}")
                     # 统一写回配置
                     set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
                 else:
-                    print(f"✅ 自适应CFG: 成功率适中({current_avg:.3f})，保持CFG={current_cfg:.1f}")
+                    print(f"✅ 自适应CFG: 成功率适中({current_success_rate:.3f})，保持CFG={current_cfg:.1f}")
                 
                 step_metrics['adaptive_cfg_scale'] = get_config_value(config, 'collection_cfg_scale', 1.5)
-                step_metrics['success_rate_window_avg'] = current_avg
+                step_metrics['current_success_rate'] = current_success_rate
                 
             except Exception as e:
                 print(f"⚠️ 自适应CFG调整失败: {e}")
@@ -1096,7 +1523,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     if enable_rollout_stats_tracking:
         save_rollout_stats(rollout_stats, rollout_stats_path)
         print(f"💾 最终保存 rollout_stats: {rollout_stats_path}")
-    
+
     print(f"\n🎉 RIPT-VLA风格训练完成!")
     print(f"📊 最终结果已保存: {final_results_path}")
     print(f"✨ 使用了简化的直接架构，减少了抽象层复杂度")
