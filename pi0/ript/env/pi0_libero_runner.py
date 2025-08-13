@@ -1266,15 +1266,15 @@ class LIBEROEnvRunner:
         if "image" in template_obs:
             batched_observation["image"] = {}
             for img_key in template_obs["image"]:
-                # 堆叠所有图像张量: (B, C, H, W)
-                img_tensors = [obs["image"][img_key] for obs in batch_obs]
-                batched_observation["image"][img_key] = torch.stack(img_tensors, dim=0)
+                # 🔥 修复：每个obs["image"][img_key]已经是[1, C, H, W]，需要先squeeze再stack
+                img_tensors = [obs["image"][img_key].squeeze(0) for obs in batch_obs]  # 去掉batch维度1
+                batched_observation["image"][img_key] = torch.stack(img_tensors, dim=0)  # -> [B, C, H, W]
         
-        # 处理状态
+        # 处理状态  
         if "state" in template_obs:
-            # 堆叠所有状态张量: (B, state_dim)  
-            state_tensors = [obs["state"] for obs in batch_obs]
-            batched_observation["state"] = torch.stack(state_tensors, dim=0)
+            # 🔥 修复：每个obs["state"]已经是[1, state_dim]，需要先squeeze再stack
+            state_tensors = [obs["state"].squeeze(0) for obs in batch_obs]  # 去掉batch维度1
+            batched_observation["state"] = torch.stack(state_tensors, dim=0)  # -> [B, state_dim]
         
         # 处理提示文本
         if "prompt" in template_obs:
@@ -1284,11 +1284,13 @@ class LIBEROEnvRunner:
         
         # 处理语言tokens（如果存在）
         if "lang_tokens" in template_obs:
-            lang_tokens_list = [obs["lang_tokens"] for obs in batch_obs]
+            # 🔥 修复：每个obs["lang_tokens"]可能已经有batch维度，需要squeeze
+            lang_tokens_list = [obs["lang_tokens"].squeeze(0) if obs["lang_tokens"].dim() > 1 else obs["lang_tokens"] for obs in batch_obs]
             batched_observation["lang_tokens"] = torch.stack(lang_tokens_list, dim=0)
         
         if "lang_masks" in template_obs:
-            lang_masks_list = [obs["lang_masks"] for obs in batch_obs]
+            # 🔥 修复：每个obs["lang_masks"]可能已经有batch维度，需要squeeze
+            lang_masks_list = [obs["lang_masks"].squeeze(0) if obs["lang_masks"].dim() > 1 else obs["lang_masks"] for obs in batch_obs]
             batched_observation["lang_masks"] = torch.stack(lang_masks_list, dim=0)
         
         return batched_observation
