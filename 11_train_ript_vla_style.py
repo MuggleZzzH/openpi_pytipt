@@ -28,6 +28,7 @@ import traceback
 import time
 from tqdm import tqdm
 from collections import deque
+import hashlib
 
 # 修复tokenizers并行化警告和EGL错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -168,6 +169,212 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     
     return policy, optimizer, device
 
+def compute_init_state_hash_from_obs(episode_data: Dict[str, Any]) -> str:
+    """
+    从原始观测计算初始状态哈希（备用方法）
+    
+    Args:
+        episode_data: episode数据，包含observations
+    
+    Returns:
+        初始状态的SHA256哈希字符串
+    """
+    try:
+        # 提取第一个观测作为初始状态
+        if 'observations' in episode_data and len(episode_data['observations']) > 0:
+            first_obs = episode_data['observations'][0]
+            
+            # 提取关键状态信息用于哈希
+            if isinstance(first_obs, dict):
+                # 提取 end-effector 位置和姿态
+                state_components = []
+                if "robot0_eef_pos" in first_obs:
+                    state_components.append(np.array(first_obs["robot0_eef_pos"], dtype=np.float32))
+                if "robot0_eef_quat" in first_obs:
+                    state_components.append(np.array(first_obs["robot0_eef_quat"], dtype=np.float32))
+                if "robot0_gripper_qpos" in first_obs:
+                    state_components.append(np.array(first_obs["robot0_gripper_qpos"], dtype=np.float32))
+                
+                if state_components:
+                    # 合并所有状态组件
+                    combined_state = np.concatenate(state_components).astype(np.float32)
+                    # 计算哈希
+                    return hashlib.sha256(combined_state.tobytes()).hexdigest()
+        
+        # 如果无法提取状态，返回默认哈希
+        return "default_hash"
+        
+    except Exception as e:
+        print(f"⚠️ 从观测计算初始状态哈希失败: {e}")
+        return "error_hash"
+
+def compute_init_state_hash(batch_states: torch.Tensor, batch_pad_mask: torch.Tensor, batch_idx: int) -> str:
+    """
+    计算初始状态的哈希值（完全对标 ript-vla_ori 的 compute_hash_from_state）
+    
+    Args:
+        batch_states: (B, T, state_dim) 批量状态序列
+        batch_pad_mask: (B, T) 批量有效掩码，True表示有效
+        batch_idx: 在批次中的索引
+    
+    Returns:
+        初始状态的SHA256哈希字符串
+    """
+    try:
+        # 🔥 完全对标 RIPT: state_data = state['states'][bidx][0]
+        if batch_idx < batch_states.shape[0] and batch_states.shape[1] > 0:
+            # 取指定batch索引的第一个时间步状态
+            state_data = batch_states[batch_idx, 0]  # (state_dim,)
+            
+            # 取对应的掩码
+            if batch_pad_mask is not None and batch_idx < batch_pad_mask.shape[0]:
+                state_mask = batch_pad_mask[batch_idx, 0]  # 第一个时间步的掩码
+                
+                # 🔥 完全对标 RIPT: state_data[state_mask].cpu().numpy().tobytes()
+                if state_mask.item():  # 如果第一个时间步是有效的
+                    state_bytes = state_data.cpu().numpy().astype(np.float32).tobytes()
+                    return hashlib.sha256(state_bytes).hexdigest()
+            else:
+                # 如果没有掩码，直接使用状态数据
+                state_bytes = state_data.cpu().numpy().astype(np.float32).tobytes()
+                return hashlib.sha256(state_bytes).hexdigest()
+        
+        return "default_hash"
+        
+    except Exception as e:
+        print(f"⚠️ 计算初始状态哈希失败: {e}")
+        return "error_hash"
+
+def load_rollout_stats(stats_path: str) -> Dict[str, List[int]]:
+    """加载 rollout 统计信息"""
+    if Path(stats_path).exists():
+        try:
+            with open(stats_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 加载 rollout_stats 失败: {e}")
+    return {}
+
+def save_rollout_stats(stats: Dict[str, List[int]], stats_path: str):
+    """保存 rollout 统计信息"""
+    try:
+        Path(stats_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(stats_path, 'w') as f:
+            json.dump(stats, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ 保存 rollout_stats 失败: {e}")
+
+def should_skip_init_state(init_hash: str, rollout_stats: Dict[str, List[int]], 
+                          rloo_batch_size: int, rollout_skip_cnt: Dict[str, int],
+                          rollout_skip_threshold: int = 10) -> bool:
+    """
+    判断是否应该跳过某个初始状态（对标 ript-vla_ori 的跳过逻辑）
+    
+    Args:
+        init_hash: 初始状态哈希
+        rollout_stats: {init_hash: [success_list]} 历史记录
+        rloo_batch_size: RLOO批次大小
+        rollout_skip_cnt: 跳过计数器
+        rollout_skip_threshold: 跳过阈值
+    
+    Returns:
+        是否应该跳过
+    """
+    if init_hash in rollout_stats:
+        recent_successes = rollout_stats[init_hash][-rloo_batch_size:]
+        
+        # 检查是否连续全成功或全失败
+        if len(recent_successes) >= rloo_batch_size:
+            if all(s == 1 for s in recent_successes):
+                print(f"🔄 跳过样本: init_hash={init_hash[:8]}... (连续 {rloo_batch_size} 次全成功)")
+                return True
+            elif all(s == 0 for s in recent_successes):
+                print(f"🔄 跳过样本: init_hash={init_hash[:8]}... (连续 {rloo_batch_size} 次全失败)")
+                return True
+    
+    return False
+
+def update_rollout_stats(init_hash: str, success: bool, rollout_stats: Dict[str, List[int]],
+                        rollout_skip_cnt: Dict[str, int], max_history_length: int = 100):
+    """更新 rollout 统计信息"""
+    if init_hash not in rollout_stats:
+        rollout_stats[init_hash] = []
+        rollout_skip_cnt[init_hash] = 0
+    
+    # 添加新结果
+    rollout_stats[init_hash].append(1 if success else 0)
+    
+    # 限制历史长度
+    if len(rollout_stats[init_hash]) > max_history_length:
+        rollout_stats[init_hash] = rollout_stats[init_hash][-max_history_length:]
+
+def update_rollout_stats_with_correct_hash(episodes: List[Dict], batch_states: torch.Tensor, 
+                                         batch_pad_mask: torch.Tensor, owner_indices: List[int],
+                                         rollout_stats: Dict[str, List[int]], 
+                                         rollout_skip_cnt: Dict[str, int]):
+    """
+    使用正确的状态哈希更新 rollout 统计信息（在 CFG adapter 处理后调用）
+    
+    Args:
+        episodes: 原始 episodes
+        batch_states: CFG adapter 处理后的状态 (B, state_dim)，注意这里是单个时间步
+        batch_pad_mask: 对应的掩码，如果可用的话
+        owner_indices: 窗口到 episode 的映射
+        rollout_stats: rollout 统计字典
+        rollout_skip_cnt: 跳过计数字典
+    """
+    if batch_states is None or len(episodes) == 0:
+        return
+    
+    try:
+        # 为每个 episode 计算正确的哈希
+        episode_hash_map = {}  # episode_idx -> correct_hash
+        
+        # 根据 owner_indices 映射，为每个 episode 找到对应的状态
+        for window_idx, episode_idx in enumerate(owner_indices):
+            if window_idx < batch_states.shape[0] and episode_idx < len(episodes):
+                # 使用窗口对应的状态计算哈希
+                state_data = batch_states[window_idx]  # (state_dim,)
+                
+                # 对于单个状态（不是序列），直接计算哈希
+                state_bytes = state_data.cpu().numpy().astype(np.float32).tobytes()
+                correct_hash = hashlib.sha256(state_bytes).hexdigest()
+                
+                episode_hash_map[episode_idx] = correct_hash
+        
+        # 更新统计信息
+        for episode_idx, episode in enumerate(episodes):
+            if episode_idx in episode_hash_map:
+                correct_hash = episode_hash_map[episode_idx]
+                success = episode.get('success', False)
+                
+                # 如果之前有临时哈希，需要迁移统计
+                temp_hash = episode.get('temp_init_hash')
+                if temp_hash and temp_hash != correct_hash and temp_hash in rollout_stats:
+                    # 迁移统计数据到正确的哈希
+                    if correct_hash not in rollout_stats:
+                        rollout_stats[correct_hash] = rollout_stats[temp_hash].copy()
+                        rollout_skip_cnt[correct_hash] = rollout_skip_cnt.get(temp_hash, 0)
+                    else:
+                        # 合并统计数据
+                        rollout_stats[correct_hash].extend(rollout_stats[temp_hash])
+                    
+                    # 清理临时哈希
+                    del rollout_stats[temp_hash]
+                    if temp_hash in rollout_skip_cnt:
+                        del rollout_skip_cnt[temp_hash]
+                
+                # 更新正确哈希的统计
+                update_rollout_stats(correct_hash, success, rollout_stats, rollout_skip_cnt)
+                
+                # 记录正确的哈希到 episode（用于调试）
+                episode['correct_init_hash'] = correct_hash
+                
+    except Exception as e:
+        print(f"⚠️ 更新正确哈希统计时出错: {e}")
+        import traceback
+        traceback.print_exc()
+
 def create_environment_runner(config: Dict[str, Any], policy):
     """创建环境runner（RIPT-VLA风格选择）"""
     use_ript_vla = config.get('features', {}).get('use_ript_vla_runner', False)
@@ -256,9 +463,12 @@ def _dynamic_filter_rollouts(episodes: List[Dict], dynamic_sampling_config: Dict
 def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, 
                                      dynamic_sampling_config: Dict = None, 
                                      recent_success_rates: deque = None,
-                                     rollout_goal_per_step: int = None):
+                                     rollout_goal_per_step: int = None,
+                                     rollout_stats: Dict[str, List[int]] = None,
+                                     rollout_skip_cnt: Dict[str, int] = None,
+                                     rloo_batch_size: int = None):
     """
-    RIPT-VLA风格的rollout收集 + 文件计数器早停
+    RIPT-VLA风格的rollout收集 + 文件计数器早停 + per-init哈希跳过
     直接调用runner，无中间层
     """
     print(f"正在收集 {num_rollouts} 个rollouts...")
@@ -292,6 +502,33 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
                 'total_reward': total_reward,
                 **episode_data
             }
+            
+            # 🔥 新增：per-init 哈希跳过检查
+            enable_init_skip = (rollout_stats is not None and rollout_skip_cnt is not None and 
+                               rloo_batch_size is not None and rloo_batch_size > 0)
+            
+            # 🔥 修改：暂时使用观测哈希，后续在训练循环中用正确的状态哈希
+            if enable_init_skip:
+                # 使用备用方法计算哈希（基于观测）
+                init_hash = compute_init_state_hash_from_obs(episode)
+                
+                # 检查是否应该跳过这个初始状态
+                if should_skip_init_state(init_hash, rollout_stats, rloo_batch_size, 
+                                        rollout_skip_cnt, rollout_skip_threshold=10):
+                    rollout_skip_cnt[init_hash] = rollout_skip_cnt.get(init_hash, 0) + 1
+                    
+                    # 如果跳过次数过多，清理该哈希记录
+                    if rollout_skip_cnt[init_hash] > 10:
+                        if init_hash in rollout_stats:
+                            del rollout_stats[init_hash]
+                        del rollout_skip_cnt[init_hash]
+                        print(f"🧹 清理过度跳过的 init_hash: {init_hash[:8]}...")
+                    
+                    continue  # 跳过这个 episode
+                
+                # 暂时记录哈希，后续会用正确的状态哈希更新
+                episode['temp_init_hash'] = init_hash
+            
             collected_rollouts.append(episode)
             rollout_count += 1
             
@@ -317,15 +554,35 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts,
             
         if not filtered:
             print("⚠️ 本批次被动态采样过滤，返回空集")
-        else:
-            print(f"✓ 成功收集了 {len(filtered)} 个rollouts (过滤后)")
+            return filtered, []
+        
+        # 🔥 新增：padding + valid_mask 机制（对标 ript-vla_ori）
+        target_rollouts = num_rollouts  # 目标数量
+        valid_mask = [True] * len(filtered)
+        
+        if len(filtered) < target_rollouts:
+            num_pad = target_rollouts - len(filtered)
+            print(f"📦 Padding: 需要 {target_rollouts} 个rollouts，实际收集 {len(filtered)} 个，填充 {num_pad} 个")
             
-        return filtered
+            if len(filtered) > 0:
+                # 用最后一个样本进行填充
+                last_episode = filtered[-1].copy()
+                for _ in range(num_pad):
+                    padded_episode = last_episode.copy()
+                    padded_episode['is_padded'] = True  # 标记为填充样本
+                    filtered.append(padded_episode)
+                    valid_mask.append(False)  # 标记为无效
+            else:
+                print("⚠️ 没有有效样本用于填充")
+                return filtered, []
+        
+        print(f"✓ 成功收集了 {len(filtered)} 个rollouts (过滤+填充后，{sum(valid_mask)} 个有效)")
+        return filtered, valid_mask
         
     except Exception as e:
         print(f"❌ Rollout收集失败: {e}")
         traceback.print_exc()
-        return []
+        return [], []
 
 def compute_advantages_rloo(episodes: List[Dict], rloo_batch_size: int = None) -> torch.Tensor:
     """
@@ -491,9 +748,20 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 🔥 新增：读取增强配置
     features_config = config.get('features', {})
     dynamic_sampling_config = features_config.get('dynamic_sampling', {})
-    rollout_goal_per_step = features_config.get('rollout_goal_per_step', None)
     enable_file_counter = features_config.get('enable_file_counter', False)
     adaptive_cfg_enabled = features_config.get('adaptive_cfg', False)
+    
+    # 🔥 修正：按 ript 标准计算全局阈值
+    demo_batch_size = config['algo']['rloo_batch_size']  # 对应 ript 的 demo_batch_size
+    world_size = 1  # 当前单机，后续可从分布式环境读取
+    early_stop_percentage = features_config.get('early_stop_percentage', 0.8)  # 新增配置项
+    
+    if enable_file_counter:
+        total_demo_batch_size = demo_batch_size * world_size
+        rollout_goal_per_step = int(total_demo_batch_size * early_stop_percentage)
+        print(f"🎯 全局阈值计算: {demo_batch_size} × {world_size} × {early_stop_percentage} = {rollout_goal_per_step}")
+    else:
+        rollout_goal_per_step = None
     
     print(f"\n🔧 增强功能配置:")
     print(f"  动态采样: {'✅' if dynamic_sampling_config.get('enabled', False) else '❌'}")
@@ -508,6 +776,19 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 🔥 新增：初始化平滑窗口
     smooth_window_size = dynamic_sampling_config.get('smooth_window', 3)
     recent_success_rates = deque(maxlen=smooth_window_size)
+    
+    # 🔥 新增：per-init 哈希跳过机制初始化
+    enable_rollout_stats_tracking = features_config.get('enable_rollout_stats_tracking', False)
+    rollout_stats_path = features_config.get('rollout_stats_path', str(output_dir / "rollout_stats.json"))
+    
+    rollout_stats = {}
+    rollout_skip_cnt = {}
+    
+    if enable_rollout_stats_tracking:
+        rollout_stats = load_rollout_stats(rollout_stats_path)
+        rollout_skip_cnt = {k: 0 for k in rollout_stats.keys()}
+        print(f"📊 已加载 {len(rollout_stats)} 个初始状态的历史记录")
+        print(f"💾 rollout_stats 路径: {rollout_stats_path}")
     
     # 创建策略和优化器
     policy, optimizer, device = create_policy_and_optimizer(config)
@@ -566,49 +847,78 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
         
         # 1. 收集rollouts（直接调用，无中间层）+ 新功能集成
-        episodes = collect_rollouts_ript_vla_style(
+        episodes, valid_mask = collect_rollouts_ript_vla_style(
             env_runner, task_name, rloo_batch_size,
             dynamic_sampling_config=dynamic_sampling_config,
             recent_success_rates=recent_success_rates,
-            rollout_goal_per_step=rollout_goal_per_step
+            rollout_goal_per_step=rollout_goal_per_step,
+            rollout_stats=rollout_stats if enable_rollout_stats_tracking else None,
+            rollout_skip_cnt=rollout_skip_cnt if enable_rollout_stats_tracking else None,
+            rloo_batch_size=rloo_batch_size
         )
         
         if not episodes:
             print("⚠️ 未收集到有效episodes，跳过此步")
             continue
         
-        # 2. 计算优势（正宗RLOO方法）
+        # 记录有效样本数量
+        valid_count = sum(valid_mask) if valid_mask else len(episodes)
+        step_metrics = {
+            'step': step + 1,
+            'num_episodes': len(episodes),
+            'valid_episodes': valid_count,
+            'padding_episodes': len(episodes) - valid_count
+        }
+        
+        # 2. 🔥 新增：使用正确的状态哈希更新统计（在 CFG adapter 处理后）
+        if enable_rollout_stats_tracking:
+            try:
+                # 通过 CFG adapter 处理 episodes 以获得正确的状态表示
+                batch, owner_indices = cfg_adapter.process_episodes(episodes, device)
+                batch_states = batch.get('state')  # (B, state_dim)
+                
+                # 使用正确的状态哈希更新统计
+                update_rollout_stats_with_correct_hash(
+                    episodes, batch_states, None, owner_indices, 
+                    rollout_stats, rollout_skip_cnt
+                )
+                
+                print(f"🔄 已用正确状态哈希更新 {len(episodes)} 个episodes的统计")
+                
+            except Exception as e:
+                print(f"⚠️ 正确哈希更新失败: {e}")
+        
+        # 3. 计算优势（正宗RLOO方法）
         advantages = compute_advantages_rloo(episodes, rloo_batch_size=rloo_batch_size)
         
-        # 3. 更新策略（直接更新，无复杂组件）
+        # 4. 更新策略（直接更新，无复杂组件）
         loss = update_policy_ript_vla_style(
             policy, optimizer, cfg_adapter, episodes, advantages, device
         )
         
-        # 4. 记录指标
+        # 5. 记录指标
         avg_reward = np.mean([ep['total_reward'] for ep in episodes])
         success_rate = np.mean([ep['success'] for ep in episodes])
         step_time = time.time() - step_start_time
         
-        step_metrics = {
-            'step': step + 1,
-            'num_episodes': len(episodes),
+        # 更新step_metrics
+        step_metrics.update({
             'avg_reward': avg_reward,
             'success_rate': success_rate,
             'loss': loss,
             'step_time': step_time
-        }
+        })
         all_training_metrics.append(step_metrics)
         
-        # 5. 输出结果
+        # 6. 输出结果
         print(f"✓ 步骤 {step + 1} 完成:")
-        print(f"  Episodes: {len(episodes)}")
+        print(f"  Episodes: {len(episodes)} (有效: {valid_count}, 填充: {len(episodes) - valid_count})")
         print(f"  平均奖励: {avg_reward:.4f}")
         print(f"  成功率: {success_rate:.2%}")
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
         
-        # 6. 自适应CFG调整（基于成功率窗口）
+        # 7. 自适应CFG调整（基于成功率窗口）
         if adaptive_cfg_enabled and len(recent_success_rates) >= 2:
             try:
                 current_avg = np.mean(recent_success_rates)
@@ -636,7 +946,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             except Exception as e:
                 print(f"⚠️ 自适应CFG调整失败: {e}")
         
-        # 7. CFG评估（每10步进行一次）
+        # 8. CFG评估（每10步进行一次）
         if (step + 1) % 10 == 0:
             try:
                 best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
@@ -649,7 +959,12 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
         
-        # 8. 保存检查点
+        # 9. 定期保存 rollout_stats
+        if enable_rollout_stats_tracking and (step + 1) % 5 == 0:  # 每5步保存一次
+            save_rollout_stats(rollout_stats, rollout_stats_path)
+            print(f"💾 已保存 rollout_stats ({len(rollout_stats)} 个初始状态)")
+        
+        # 10. 保存检查点
         if (step + 1) % config['training'].get('save_freq', 10) == 0:
             # 轻量权重（仅模型，便于部署与占用小）
             weights_path = output_dir / f"weights_step_{step + 1}.pt"
@@ -710,6 +1025,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         }, final_checkpoint_path)
         print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
 
+    # 最终保存 rollout_stats
+    if enable_rollout_stats_tracking:
+        save_rollout_stats(rollout_stats, rollout_stats_path)
+        print(f"💾 最终保存 rollout_stats: {rollout_stats_path}")
+    
     print(f"\n🎉 RIPT-VLA风格训练完成!")
     print(f"📊 最终结果已保存: {final_results_path}")
     print(f"✨ 使用了简化的直接架构，减少了抽象层复杂度")
