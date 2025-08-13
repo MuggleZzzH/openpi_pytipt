@@ -623,8 +623,8 @@ class PI0_CFG_Adapter(RLModelInterface):
                     print(f"✗ 未知{cam_type}图像格式: {img.shape}")
                     raise ValueError(f"Unexpected {cam_type} image format: {img.shape}")
                 
-                # BGR → RGB转换
-                img_rgb = img[:, :, ::-1].copy()
+                # 水平镜像处理 (保持HWC格式，左右翻转以匹配训练数据)
+                img_rgb = img[:, ::-1, :].copy()
                 
                 # 确保数据类型和范围正确
                 if img_rgb.dtype != np.uint8:

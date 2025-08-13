@@ -362,9 +362,9 @@ class LIBEROEnvRunner:
         # 状态归一化
         state = (unnorm_state - self.state_mean) / (self.state_std + 1e-6)
         
-        # 图像处理
-        base_0_rgb = obs["agentview_image"][:, :, ::-1].copy()
-        left_wrist_0_rgb = obs["robot0_eye_in_hand_image"][:, :, ::-1].copy()
+        # 图像处理 - 水平镜像（保持HWC格式）
+        base_0_rgb = obs["agentview_image"][:, ::-1, :].copy()
+        left_wrist_0_rgb = obs["robot0_eye_in_hand_image"][:, ::-1, :].copy()
         
         # 构造观测格式
         observation = {
@@ -578,7 +578,7 @@ class LIBEROEnvRunner:
             
             # 收集初始观测图像用于视频
             if save_video:
-                initial_img = obs["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                initial_img = obs["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
                 rollout_images.append(initial_img)
             
             # 收集轨迹
@@ -631,6 +631,23 @@ class LIBEROEnvRunner:
                     # 从动作队列中取出当前动作执行
                     current_action = action_buffer[action_index, :7]
                     
+                    # 🔧 动作裁剪：确保动作在合法范围内
+                    if hasattr(env, 'action_space'):
+                        action_space = env.action_space
+                        if is_vector_env and hasattr(action_space, 'spaces') and len(action_space.spaces) > 0:
+                            # VectorEnv使用第一个环境的动作空间
+                            sub_space = action_space.spaces[0]
+                            current_action = np.clip(current_action, sub_space.low, sub_space.high)
+                        elif hasattr(action_space, 'low') and hasattr(action_space, 'high'):
+                            # 单环境动作空间
+                            current_action = np.clip(current_action, action_space.low, action_space.high)
+                        else:
+                            # 使用默认范围[-1, 1]
+                            current_action = np.clip(current_action, -1, 1)
+                    else:
+                        # 没有action_space，使用默认范围[-1, 1]
+                        current_action = np.clip(current_action, -1, 1)
+                    
                     # 执行单步动作
                     if is_vector_env:
                         # VectorEnv期望动作列表
@@ -660,7 +677,7 @@ class LIBEROEnvRunner:
                     
                     # 收集图像用于视频
                     if save_video:
-                        frame_img = next_obs["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                        frame_img = next_obs["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
                         rollout_images.append(frame_img)
                     
                     # 更新状态和计数器
@@ -685,11 +702,8 @@ class LIBEROEnvRunner:
                 traceback.print_exc()
             
             finally:
-                # 关闭环境并释放资源
-                try:
-                    env.close()
-                except:
-                    pass
+                # 注意：环境关闭由run_policy_in_env的finally块统一处理，避免重复关闭
+                pass
             
             # 保存整个轨迹的视频
             if save_video and rollout_images:
@@ -994,7 +1008,7 @@ class LIBEROEnvRunner:
             # 🎬 收集初始观测图像用于视频
             if save_video:
                 try:
-                    initial_img = obs_list[i]["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                    initial_img = obs_list[i]["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
                     episodes_data[i]['rollout_images'].append(initial_img)
                 except Exception as e:
                     if self.rank == 0:
@@ -1072,6 +1086,33 @@ class LIBEROEnvRunner:
                         # 备用：如果还是没有action_buffer，使用dummy动作
                         actions_to_execute.append(dummy_action)
             
+            # 🔧 动作裁剪：确保动作在环境的合法范围内
+            if hasattr(env, 'action_space'):
+                action_space = env.action_space
+                if hasattr(action_space, 'low') and hasattr(action_space, 'high'):
+                    # 单环境动作空间
+                    action_low = action_space.low
+                    action_high = action_space.high
+                    actions_to_execute = [np.clip(action, action_low, action_high) for action in actions_to_execute]
+                elif hasattr(action_space, 'spaces'):
+                    # 向量环境，每个子环境有独立的动作空间
+                    clipped_actions = []
+                    for i, action in enumerate(actions_to_execute):
+                        if i < len(action_space.spaces):
+                            sub_space = action_space.spaces[i]
+                            clipped_action = np.clip(action, sub_space.low, sub_space.high)
+                        else:
+                            # 使用默认范围[-1, 1]
+                            clipped_action = np.clip(action, -1, 1)
+                        clipped_actions.append(clipped_action)
+                    actions_to_execute = clipped_actions
+                else:
+                    # 使用默认范围[-1, 1]进行裁剪
+                    actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
+            else:
+                # 没有action_space信息，使用默认范围[-1, 1]
+                actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
+            
             # 并行执行动作
             step_out = env.step(actions_to_execute)
             if isinstance(step_out, (list, tuple)) and len(step_out) >= 4:
@@ -1104,7 +1145,7 @@ class LIBEROEnvRunner:
                 # 🎬 收集图像用于视频
                 if save_video and episode['rollout_images'] is not None:
                     try:
-                        frame_img = obs_list[i]["agentview_image"][:, :, ::-1].transpose(1, 2, 0).copy()
+                        frame_img = obs_list[i]["agentview_image"][:, ::-1, :].copy()  # HWC + 水平镜像
                         episode['rollout_images'].append(frame_img)
                     except Exception as e:
                         if self.rank == 0:
