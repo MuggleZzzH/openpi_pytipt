@@ -701,7 +701,12 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
     for cfg_scale in cfg_scales:
         print(f"📊 测试CFG={cfg_scale}...")
         # 临时设置CFG强度
-        original_cfg = getattr(env_runner.config, 'collection_cfg_scale', 1.5)
+        original_cfg = getattr(env_runner.config, 'collection_cfg_scale', None)
+        if original_cfg is None and hasattr(env_runner.config, 'algo'):
+            original_cfg = getattr(env_runner.config.algo, 'collection_cfg_scale', None)
+        if original_cfg is None:
+            print("⚠️ CFG扫描：未找到collection_cfg_scale配置，使用1.5")
+            original_cfg = 1.5
         env_runner.config.collection_cfg_scale = cfg_scale
         
         # 运行评估episodes
