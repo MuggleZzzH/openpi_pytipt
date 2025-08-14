@@ -542,6 +542,17 @@ class PI0FlowMatching(nn.Module):
         bsize = state.shape[0]
         device = state.device
         dtype = state.dtype
+        
+        # 🔥 新增：打印CFG推理参数
+        if hasattr(self, '_cfg_debug_counter'):
+            self._cfg_debug_counter += 1
+        else:
+            self._cfg_debug_counter = 1
+        
+        # 每10次推理打印一次，避免过多输出
+        if self._cfg_debug_counter % 10 == 1 or cfg_scale != getattr(self, '_last_cfg_scale', 1.0):
+            print(f"🚀 CFG推理 #{self._cfg_debug_counter}: batch_size={bsize}, cfg_scale={cfg_scale:.2f}, device={device}")
+            self._last_cfg_scale = cfg_scale
 
         if noise is None:
             actions_shape = (
@@ -576,11 +587,16 @@ class PI0FlowMatching(nn.Module):
             # 🔥 旧权重兼容性检查：只有cfg_enabled=True的模型才支持CFG推理
             if not getattr(self, "cfg_enabled", False) or cfg_scale == 1.0:
                 # 单分支推理：旧权重或cfg_scale=1时
+                if self._cfg_debug_counter % 50 == 1:  # 减少频率
+                    print(f"   → 单分支推理: cfg_enabled={getattr(self, 'cfg_enabled', False)}")
                 v_t = self.predict_velocity(
                     state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
                 )
             else:
                 # 双分支CFG推理：只有训练过CFG的新权重才进入此路径
+                if self._cfg_debug_counter % 50 == 1:  # 减少频率
+                    print(f"   → 双分支CFG推理: 条件分支 + 无条件分支, 合成系数={cfg_scale:.2f}")
+                
                 # 构造is_positive标志张量 (CFG需要LongTensor)
                 cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
                 uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)

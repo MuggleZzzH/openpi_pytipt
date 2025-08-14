@@ -719,7 +719,14 @@ class LIBEROEnvRunner:
                         pi0_observation = self.construct_pi0_observation(obs, task_description)
                         
                         # 选择动作 - 使用配置的CFG参数
-                        cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+                        # 优先读取policy.default_cfg_scale，其次读取runner.config.collection_cfg_scale，最后回退1.5
+                        cfg_scale = None
+                        if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
+                            cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
+                        if cfg_scale is None:
+                            cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
+                        if cfg_scale is None:
+                            cfg_scale = 1.5
                         raw_action = self.policy.select_action(pi0_observation, cfg_scale=cfg_scale)
                         action = raw_action[0, :, :7]  # shape: (50, 7)
                         
@@ -1094,10 +1101,27 @@ class LIBEROEnvRunner:
             use_parallel_init = False
         if use_parallel_init and init_states is not None:
             try:
-                obs_any = env.set_init_state(init_states)
+                # 🔥 增强错误处理：检查init_states格式
+                if len(init_states) != env_num:
+                    if self.rank == 0:
+                        print(f"⚠️ init_states数量({len(init_states)})与环境数({env_num})不匹配，跳过set_init_state")
+                else:
+                    # 🔥 新增：详细打印每个环境的初始状态
+                    if self.rank == 0:
+                        print(f"🎯 设置 {len(init_states)} 个并行初始状态:")
+                        for i, state in enumerate(init_states):
+                            state_hash = hash(str(state[:4].round(3)))  # 用前4维生成哈希
+                            print(f"   环境{i}: {state[:4].round(3)}... (哈希:{abs(state_hash) % 10000:04d})")
+                    
+                    obs_any = env.set_init_state(init_states)
+                    if self.rank == 0:
+                        print(f"✅ 初始状态设置完成")
             except Exception as e:
                 if self.rank == 0:
                     print(f"⚠️ set_init_state 调用失败，继续使用默认初始状态: {e}")
+                    print(f"   错误类型: {type(e).__name__}")
+                    if "qpos" in str(e).lower() or "dimension" in str(e).lower():
+                        print(f"   💡 提示: 可能是MuJoCo qpos维度不匹配，建议设置 use_parallel_init_state: false")
         else:
             if self.rank == 0 and init_states is not None:
                 print("ℹ️ 并行模式下已跳过 set_init_state（use_parallel_init_state=false）")
@@ -1377,7 +1401,13 @@ class LIBEROEnvRunner:
             # 🚀 优化：尝试真正的批推理，失败时回退到循环推理
             try:
                 batch_observation = self._stack_pi0_observations(batch_obs)
-                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+                cfg_scale = None
+                if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
+                    cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
+                if cfg_scale is None:
+                    cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
+                if cfg_scale is None:
+                    cfg_scale = 1.5
                 
                 # 一次性批推理 - 这是核心优化点
                 raw_actions = self.policy.select_action(batch_observation, cfg_scale=cfg_scale)
@@ -1479,7 +1509,13 @@ class LIBEROEnvRunner:
             if prompts_for_obs is not None and idx < len(prompts_for_obs):
                 prompt_text = prompts_for_obs[idx]
             pi0_obs = self.construct_pi0_observation(obs, prompt_text or env_name)
-            cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+            cfg_scale = None
+            if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
+                cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
+            if cfg_scale is None:
+                cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
+            if cfg_scale is None:
+                cfg_scale = 1.5
             raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]
             
@@ -1528,6 +1564,15 @@ class LIBEROEnvRunner:
             # 回退到串行执行
             if self.rank == 0:
                 print(f"📋 批量执行回退到串行模式（batch_size={batch_size}）")
+                
+                # 🔥 新增：打印串行模式下的初始状态
+                if init_states is not None:
+                    print(f"🎯 串行模式初始状态分布:")
+                    for i, state in enumerate(init_states):
+                        state_hash = hash(str(state[:4].round(3)))
+                        print(f"   Episode{i}: {state[:4].round(3)}... (哈希:{abs(state_hash) % 10000:04d})")
+                else:
+                    print("⚠️ 串行模式：无初始状态，使用随机初始状态")
             
             # 创建环境
             env = self._create_single_env(env_name)

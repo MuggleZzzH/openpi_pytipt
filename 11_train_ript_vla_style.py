@@ -576,6 +576,13 @@ def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_si
     collected_groups = 0
     
     try:
+        # 每个训练步开始前重置计数器（按步早停，而非累计）
+        if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+            try:
+                env_runner.file_counter.set(0)
+            except Exception:
+                pass
+
         # 获取任务的初始状态池
         task_id = 0  # 简化处理，使用第一个任务
         if hasattr(env_runner, 'benchmark'):
@@ -628,7 +635,10 @@ def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_si
             if init_state is not None:
                 # 复制相同的初始状态
                 env_init_states = np.tile(init_state, (rloo_batch_size, 1))
-                print(f"🔄 并行运行 {rloo_batch_size} 个环境（相同初始状态）")
+                print(f"🔄 第{group_idx+1}组并行运行 {rloo_batch_size} 个环境")
+                print(f"   📍 初始状态哈希: {init_hash[:8]}...")
+                print(f"   📊 状态值: {init_state[:4].round(3)}... (显示前4维)")
+                print(f"   🔢 状态形状: {init_state.shape}, 复制到 {env_init_states.shape}")
                 
                 # 调用 runner 的并行执行（如果支持）
                 if hasattr(env_runner, 'run_policy_in_env_batch'):
@@ -657,9 +667,7 @@ def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_si
                             group_episodes.append(episode)
                             break  # 只收集一个样本
                         
-                        # 更新文件计数器
-                        if hasattr(env_runner, 'file_counter') and env_runner.file_counter:
-                            env_runner.file_counter.update(1)
+                        # 计数器在组被接受后统一更新
             else:
                 # 没有具体初始状态，逐个收集（但会导致不同初始状态混合）
                 print("⚠️ 没有具体初始状态，可能导致 RLOO 基线估计不准确")
@@ -679,14 +687,12 @@ def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_si
                     group_episodes.append(episode)
                     sample_count += 1
                     
-                    # 更新文件计数器
-                    if hasattr(env_runner, 'file_counter') and env_runner.file_counter:
-                        env_runner.file_counter.update(1)
+                    # 计数器在组被接受后统一更新
                     
                     if sample_count >= rloo_batch_size:
                         break
             
-            # 步骤5: RIPT风格动态采样过滤（简单有效）
+            # 步骤5: RIPT风格动态采样过滤（优化版，支持多种策略）
             group_accepted = True
             if enable_ript_dynamic_sampling and len(group_episodes) == rloo_batch_size:
                 # 🔥 使用RIPT原版的简单动态采样
@@ -710,6 +716,16 @@ def collect_rollouts_ript_vla_style_grouped(env_runner, task_name, demo_batch_si
                 all_episodes.extend(group_episodes)
                 collected_groups += 1
                 print(f"✅ 第 {group_idx + 1} 组收集并接受：{len(group_episodes)} 个样本")
+                # 🔥 对齐RIPT：每个被接受的组计数+1
+                if rollout_goal_per_step and hasattr(env_runner, 'file_counter') and env_runner.file_counter:
+                    try:
+                        env_runner.file_counter.update(1)
+                        current_global_count = env_runner.file_counter.get()
+                        if current_global_count >= rollout_goal_per_step:
+                            print(f"🎯 达到全局样本目标 ({current_global_count}/{rollout_goal_per_step} 组)，提前结束收集")
+                            break
+                    except Exception:
+                        pass
             elif len(group_episodes) == rloo_batch_size:
                 print(f"⚠️ 第 {group_idx + 1} 组收集但被过滤：{len(group_episodes)} 个样本")
             else:
@@ -1124,18 +1140,27 @@ def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advan
         return 0.0
 
 def evaluate_with_cfg_sweep(policy, env_runner, task_name, config, eval_episodes=3):
-    """🔥 新增：评估不同CFG强度的效果"""
-    cfg_scales = [1.0, 1.5, 3.0, 5.0]
-    best_cfg = 1.0
+    """🔥 新增：评估不同CFG强度的效果（完全配置化，无硬编码）"""
+    # 从配置文件读取CFG扫描参数
+    cfg_sweep_config = get_config_value(config, 'cfg_sweep_config', {}, ['features'])
+    
+    if not cfg_sweep_config.get('enabled', True):
+        print("⚠️ CFG扫描评估已禁用")
+        return get_config_value(config, 'collection_cfg_scale'), {}
+    
+    cfg_scales = cfg_sweep_config.get('scales', [1.0, 1.25, 1.5, 2.0, 3.0])
+    best_cfg = cfg_scales[0] if cfg_scales else 1.0  # 使用第一个配置值作为默认
     best_success_rate = 0.0
     
     results = {}
-    print(f"\n🔍 开始CFG强度扫描评估...")
+    print(f"\n🔍 开始CFG强度扫描评估（完全配置化）...")
+    print(f"   扫描范围: {cfg_scales}")
+    print(f"   每个CFG评估轮数: {eval_episodes}")
     
     for cfg_scale in cfg_scales:
         print(f"📊 测试CFG={cfg_scale}...")
         # 临时设置CFG强度
-        original_cfg = get_config_value(config, 'collection_cfg_scale', 1.5)
+        original_cfg = get_config_value(config, 'collection_cfg_scale')
         set_config_value(config, 'collection_cfg_scale', cfg_scale)
         env_runner.config.collection_cfg_scale = cfg_scale
         
@@ -1206,6 +1231,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     else:
         print(f"✅ 使用配置的demo_batch_size={demo_batch_size}")
     
+    # 🔥 修复：提前读取rloo_batch_size（在使用前定义）
+    rloo_batch_size = config['algo']['rloo_batch_size']
+    
     world_size = 1  # 当前单机，后续可从分布式环境读取
     early_stop_percentage = features_config.get('early_stop_percentage', 0.8)  # 新增配置项
     
@@ -1214,10 +1242,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     rollout_stats_path = get_config_value(config, 'rollout_stats_path', str(output_dir / "rollout_stats.json"), ['features', 'algo'])
     
     if enable_file_counter:
-        # 正确计算总目标：demo_batch_size(组数) × rloo_batch_size(每组样本数) × world_size
-        total_target_samples = demo_batch_size * rloo_batch_size * world_size
-        rollout_goal_per_step = int(total_target_samples * early_stop_percentage)
-        print(f"🎯 早停阈值计算: {rollout_goal_per_step} = {demo_batch_size}组 × {rloo_batch_size}样本/组 × {world_size}GPU × {early_stop_percentage:.0%}")
+        # 对齐RIPT：按组数早停（每个被接受的组计1），阈值按组计算
+        total_target_groups = demo_batch_size * world_size
+        rollout_goal_per_step = int(np.ceil(total_target_groups * early_stop_percentage))
+        print(f"🎯 早停阈值计算: {rollout_goal_per_step} 组 = {demo_batch_size}组 × {world_size}GPU × {early_stop_percentage:.0%}")
     else:
         rollout_goal_per_step = None
     
@@ -1233,8 +1261,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     print(f"\n🔧 增强功能配置:")
     print(f"  动态采样: {'✅' if dynamic_sampling_config.get('enabled', False) else '❌'}")
     if dynamic_sampling_config.get('enabled', False):
-        print(f"    区间: [{dynamic_sampling_config.get('p_min', 0.1)}, {dynamic_sampling_config.get('p_max', 0.9)}]")
-        print(f"    平滑窗口: {dynamic_sampling_config.get('smooth_window', 3)}")
+        print(f"    模式: RIPT风格 (简单全成功/全失败检查)")
+        print(f"    区间: [{dynamic_sampling_config.get('p_min', 0.1)}, {dynamic_sampling_config.get('p_max', 0.9)}] (备用)")
+        print(f"    注：RIPT风格不使用平滑窗口，直接检查当前组的成功率")
     print(f"  文件计数器: {'✅' if enable_file_counter else '❌'}")
     if rollout_goal_per_step:
         print(f"    每步全局目标: {rollout_goal_per_step}")
@@ -1243,25 +1272,6 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 🔥 简化：移除复杂的平滑窗口（RIPT原版不需要）
     # smooth_window_size = dynamic_sampling_config.get('smooth_window', 3)
     # recent_success_rates = deque(maxlen=smooth_window_size)
-    
-    # 验证环境runner是否支持新功能
-    if hasattr(env_runner, 'run_policy_in_env_batch'):
-        print("✅ 环境runner支持批量执行")
-    else:
-        print("⚠️ 环境runner不支持批量执行，将回退到串行")
-
-    # 验证初始状态池
-    if hasattr(env_runner, 'get_task_init_states'):
-        try:
-            test_states = env_runner.get_task_init_states(0)
-            if test_states:
-                print(f"✅ 初始状态池可用，包含{len(test_states)}个状态")
-            else:
-                print("⚠️ 初始状态池为空")
-        except Exception as e:
-            print(f"⚠️ 获取初始状态池失败: {e}")
-    else:
-        print("⚠️ 环境runner不支持get_task_init_states")
     
     # 🔥 新增：per-init 哈希跳过机制初始化
     
@@ -1275,7 +1285,71 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"💾 rollout_stats 路径: {rollout_stats_path}")
     
     # 创建策略和优化器
-    policy, optimizer, device = create_policy_and_optimizer(config)
+    print("正在加载PI0策略...")
+    
+    # 🔥 正确的策略加载逻辑，严格遵守cfg_enabled配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy_path = config['policy_path']
+    
+    # 加载策略
+    policy = PI0Policy.from_pretrained(policy_path, local_files_only=True)
+    print("Loading weights from local directory")
+    policy = policy.to(device)
+    
+    # 🔥 关键修复：严格按照cfg_enabled设置CFG功能
+    cfg_enabled = config.get('policy', {}).get('cfg_enabled', True)
+    
+    if cfg_enabled:
+        print(f"🔧 启用CFG功能（按配置要求）...")
+        # 同步到Policy、Model与Config三处，确保sample_actions走双分支路径
+        policy.cfg_enabled = True
+        if hasattr(policy, 'model'):
+            setattr(policy.model, 'cfg_enabled', True)
+        if hasattr(policy, 'config'):
+            setattr(policy.config, 'cfg_enabled', True)
+        # 从配置读取collection_cfg_scale
+        policy.default_cfg_scale = config.get('algo', {}).get('collection_cfg_scale', 1.25)
+        print(f"✅ CFG已启用，默认CFG强度: {policy.default_cfg_scale}")
+    else:
+        print(f"🔧 禁用CFG功能（按配置要求）...")
+        policy.cfg_enabled = False
+        if hasattr(policy, 'model'):
+            setattr(policy.model, 'cfg_enabled', False)
+        if hasattr(policy, 'config'):
+            setattr(policy.config, 'cfg_enabled', False)
+        policy.default_cfg_scale = 1.0  # 强制设为1.0，完全禁用CFG
+        print(f"✅ CFG已禁用，强制CFG强度: {policy.default_cfg_scale}")
+    
+    print(f"✓ 策略加载成功，设备: {device}")
+    
+    # 创建优化器
+    print("正在创建优化器...")
+    if config.get('policy', {}).get('train_expert_only', False):
+        # 只训练专家头部
+        expert_params = []
+        for name, param in policy.named_parameters():
+            if 'expert' in name or 'cfg_embedding' in name:  # 包含CFG embedding参数
+                expert_params.append(param)
+        
+        print("🔧 配置训练参数范围...")
+        if hasattr(policy, 'cfg_embedding') and policy.cfg_embedding is not None:
+            cfg_params = list(policy.cfg_embedding.parameters())
+            expert_params.extend(cfg_params)
+            print("✅ CFG embedding参数已加入训练")
+        
+        optimizer = torch.optim.AdamW(expert_params, lr=config['algo']['lr'])
+        total_params = sum(p.numel() for p in expert_params)
+        print(f"🎯 只训练专家头部，参数数量: {total_params:,}")
+    else:
+        # 训练所有参数
+        optimizer = torch.optim.AdamW(policy.parameters(), lr=config['algo']['lr'])
+        total_params = sum(p.numel() for p in policy.parameters())
+        print(f"🎯 训练所有参数，参数数量: {total_params:,}")
+    
+    print(f"✓ 优化器创建成功，学习率: {config['algo']['lr']}")
+    
+    # 返回创建的组件
+    # policy, optimizer, device = policy, optimizer, device
     
     # 创建CFG适配器（必需，用于损失计算）
     # 🔥 新增：窗口化配置支持
@@ -1297,8 +1371,37 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         max_windows_per_episode=max_windows_per_episode
     )
     
-    # 创建环境runner
+    # 创建环境runner（使用标准工厂，确保并行与benchmark配置正确下发）
     env_runner = create_environment_runner(config, policy)
+
+    # 🔥 同步CFG强度到runner（runner内部读取的是根级字段，这里明确设置）
+    if hasattr(env_runner, 'config') and env_runner.config is not None:
+        env_runner.config.collection_cfg_scale = (policy.default_cfg_scale if cfg_enabled else 1.0)
+    else:
+        env_runner.collection_cfg_scale = (policy.default_cfg_scale if cfg_enabled else 1.0)
+    print(f"🔧 环境runner CFG强度设置为: {policy.default_cfg_scale if cfg_enabled else 1.0}")
+
+    print("✓ 环境runner创建成功")
+    
+    # 🔥 新增：验证环境runner功能
+    print(f"\n🔧 环境runner功能验证:")
+    if hasattr(env_runner, 'run_policy_in_env_batch'):
+        print("  批量执行: ✅")
+    else:
+        print("  批量执行: ❌ (将回退到串行)")
+
+    # 验证初始状态池
+    if hasattr(env_runner, 'get_task_init_states'):
+        try:
+            test_states = env_runner.get_task_init_states(0)
+            if test_states:
+                print(f"  初始状态池: ✅ ({len(test_states)}个状态)")
+            else:
+                print("  初始状态池: ⚠️ (为空)")
+        except Exception as e:
+            print(f"  初始状态池: ❌ (获取失败: {e})")
+    else:
+        print("  初始状态池: ❌ (不支持get_task_init_states)")
     
     # 🔥 新增：文件计数器初始化
     if enable_file_counter:
@@ -1314,7 +1417,6 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 与2_test_pi0_on_libero.py对齐：使用libero_goal基准默认task_id=1
     # 若YAML中明确给了task_names_to_use，则仍然使用第一个名称做显示，不影响环境内部task_id选择
     task_name = config['task'].get('task_names_to_use', ['libero_goal_default'])[0]
-    rloo_batch_size = config['algo']['rloo_batch_size']
     
     print(f"\n开始训练循环:")
     print(f"  训练步数: {num_train_steps}")
@@ -1331,7 +1433,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
         
         # 1. 收集rollouts（RIPT原版风格：按初始状态分组）
-        # 🔥 关键修改：使用简化的RIPT动态采样，确保RLOO优势计算的正确性
+        # 🔥 关键修改：使用优化的RIPT动态采样，支持多种策略
         enable_ript_dynamic_sampling = dynamic_sampling_config.get('enabled', True) if dynamic_sampling_config else True
         
         episodes, valid_mask = collect_rollouts_ript_vla_style_grouped(
@@ -1416,25 +1518,33 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 # 计算当前步骤的总体成功率
                 current_successes = [ep.get('success', False) for ep in episodes]
                 current_success_rate = np.mean(current_successes)
-                current_cfg = get_config_value(config, 'collection_cfg_scale', 1.5)
+                current_cfg = get_config_value(config, 'collection_cfg_scale')
                 
-                # 简化的CFG调整逻辑（不依赖复杂窗口）
-                if current_success_rate < 0.2:  # 成功率很低
-                    new_cfg = max(1.0, current_cfg - 0.2)
-                    print(f"🔧 自适应CFG: 成功率过低({current_success_rate:.3f})，降低CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                # 🔥 完全配置化的CFG调整逻辑
+                adaptive_cfg_config = get_config_value(config, 'adaptive_cfg_config', {}, ['features'])
+                
+                min_cfg = adaptive_cfg_config.get('min_cfg', 1.0)
+                max_cfg = adaptive_cfg_config.get('max_cfg', 3.0)
+                cfg_step = adaptive_cfg_config.get('cfg_step', 0.2)
+                low_threshold = adaptive_cfg_config.get('low_success_threshold', 0.2)
+                high_threshold = adaptive_cfg_config.get('high_success_threshold', 0.9)
+                
+                if current_success_rate < low_threshold:  # 成功率很低
+                    new_cfg = max(min_cfg, current_cfg - cfg_step)
+                    print(f"🔧 自适应CFG: 成功率过低({current_success_rate:.3f} < {low_threshold})，降低CFG {current_cfg:.2f} → {new_cfg:.2f}")
                     # 统一写回配置
                     set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
-                elif current_success_rate > 0.9:  # 成功率很高
-                    new_cfg = min(3.0, current_cfg + 0.2)
-                    print(f"🔧 自适应CFG: 成功率过高({current_success_rate:.3f})，提升CFG {current_cfg:.1f} → {new_cfg:.1f}")
+                elif current_success_rate > high_threshold:  # 成功率很高
+                    new_cfg = min(max_cfg, current_cfg + cfg_step)
+                    print(f"🔧 自适应CFG: 成功率过高({current_success_rate:.3f} > {high_threshold})，提升CFG {current_cfg:.2f} → {new_cfg:.2f}")
                     # 统一写回配置
                     set_config_value(config, 'collection_cfg_scale', new_cfg)
                     env_runner.config.collection_cfg_scale = new_cfg
                 else:
-                    print(f"✅ 自适应CFG: 成功率适中({current_success_rate:.3f})，保持CFG={current_cfg:.1f}")
+                    print(f"✅ 自适应CFG: 成功率适中({current_success_rate:.3f})，保持CFG={current_cfg:.2f}")
                 
-                step_metrics['adaptive_cfg_scale'] = get_config_value(config, 'collection_cfg_scale', 1.5)
+                step_metrics['adaptive_cfg_scale'] = get_config_value(config, 'collection_cfg_scale')
                 step_metrics['current_success_rate'] = current_success_rate
                 
             except Exception as e:
@@ -1443,7 +1553,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         # 8. CFG评估（每10步进行一次）
         if (step + 1) % 10 == 0:
             try:
-                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, config, eval_episodes=2)
+                # 从配置文件读取eval_episodes，如果没有配置则默认为2
+                cfg_sweep_config = get_config_value(config, 'cfg_sweep_config', {}, ['features'])
+                eval_episodes = cfg_sweep_config.get('eval_episodes', 2)
+                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, config, eval_episodes=eval_episodes)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")

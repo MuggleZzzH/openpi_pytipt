@@ -1,7 +1,7 @@
-# Stage 11 RIPT-VLA测试配置 - 启用新的并行runner
-# 测试真正的多进程并行环境
+# Stage 11 RIPT-VLA测试配置 - 轻量CFG稳定版
+# 测试轻量CFG增强的性能 (cfg_scale=1.25) + 稳定模拟并行
 
-exp_name: stage11_ript_vla_parallel
+exp_name: stage11_ript_vla_cfg125_fixed
 
 # === 基本路径配置 ===
 policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
@@ -17,14 +17,13 @@ task:
 
 # === 算法配置 ===
 algo:
-  demo_batch_size: 22  # 🔥 新增：每步需要收集的组数（每组rloo_batch_size个样本）
+  demo_batch_size: 1  # 🔥 新增：每步需要收集的组数（每组rloo_batch_size个样本）
   rloo_batch_size: 8   # 每组内样本数（用于RLOO优势计算）
   lr: 1e-5
   gradient_accumulation_steps: 1
-  collection_cfg_scale: 1.5        # 🔥 收集轨迹时的CFG强度
-  cfg_uncond_weight: 0.1           # 🔥 训练时无条件分支权重
+  collection_cfg_scale: 1.25       # 🔥 轻量CFG：设置为1.25（轻微CFG增强）
+  cfg_uncond_weight: 0.1           # 🔥 训练时无条件分支权重（CFG关闭时不使用）
   # RolloutGenerator配置
-  enable_dynamic_sampling: false
   rollout_skip_threshold: 3
   enable_rollout_stats_tracking: true
   rollout_stats_path: "./output/stage11_ript_vla/rollout_stats.json"
@@ -32,12 +31,12 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: true                # 🚨 关键修复：启用CFG功能
+  cfg_enabled: true            # 🚨 启用CFG功能：支持轻量CFG增强
   train_expert_only: true          # 专家头训练模式
 
 # === 数据集配置 ===
 dataset:
-  num_init_states: 22  # 🔥 备用：可用的初始状态数量（与algo.demo_batch_size一致）
+  num_init_states: 1  # 🔥 备用：可用的初始状态数量（与algo.demo_batch_size一致）
   state_dim: 8  # 状态维度
   # 🔥 新增：窗口化采样配置（提高数据利用率）
   windowing_mode: slide      # 窗口模式: last(兼容模式) | random(随机采样) | slide(滑动窗口)
@@ -63,3 +62,29 @@ features:
   enable_smart_sampling: true      # Runner日志用的智能采样开关（与algo.enable_dynamic_sampling对应）
   use_parallel_init_state: false   # 并行时是否调用set_init_state（默认false以避免MuJoCo qpos维度不匹配）
   save_video: true                 # 训练期间保存视频（会写到 pi0/ript/debug_images/videos）
+  
+  # === 🔥 增强功能开关 ===
+  enable_file_counter: true        # 开启文件计数器（分布式训练样本统计）
+  adaptive_cfg: false              # 关闭自适应CFG（CFG已禁用）
+  early_stop_percentage: 0.8       # 文件计数器早停阈值百分比
+  
+  # === 🔥 CFG自适应调整配置 ===
+  adaptive_cfg_config:
+    min_cfg: 1.0                   # CFG最小值
+    max_cfg: 3.0                   # CFG最大值
+    cfg_step: 0.2                  # CFG调整步长
+    low_success_threshold: 0.2     # 低成功率阈值（低于此值降低CFG）
+    high_success_threshold: 0.9    # 高成功率阈值（高于此值提升CFG）
+  
+  # === 🔥 CFG扫描评估配置 ===
+  cfg_sweep_config:
+    enabled: true                  # 是否启用CFG扫描评估
+    scales: [1.0, 1.25, 1.5, 2.0, 3.0]  # 扫描的CFG强度列表
+    eval_episodes: 3               # 每个CFG强度的评估轮数
+  
+  # 动态采样配置（RIPT风格）
+  dynamic_sampling:
+    enabled: true                  # 开启动态采样
+    p_min: 0.1                    # 成功率下限（备用，RIPT风格主要检查全成功/全失败）
+    p_max: 0.9                    # 成功率上限（备用，RIPT风格主要检查全成功/全失败）
+    # 注：RIPT风格使用简单的全成功/全失败检查，不需要平滑窗口
