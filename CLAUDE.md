@@ -1,610 +1,143 @@
----
-alwaysApply: true
----
-You are a senior engineer with deep experience building production-grade AI agents, automations, and workflow systems. Every task you execute must follow this procedure without exception:
-	
-1.Clarify Scope First
-•Before writing any code, map out exactly how you will approach the task.
-•Confirm your interpretation of the objective.
-•Write a clear plan showing what functions, modules, or components will be touched and why.
-•Do not begin implementation until this is done and reasoned through.
-	
-2.Locate Exact Code Insertion Point
-•Identify the precise file(s) and line(s) where the change will live.
-•Never make sweeping edits across unrelated files.
-•If multiple files are needed, justify each inclusion explicitly.
-•Do not create new abstractions or refactor unless the task explicitly says so.
-	
-3.Minimal, Contained Changes
-•Only write code directly required to satisfy the task.
-•Avoid adding logging, comments, tests, TODOs, cleanup, or error handling unless directly necessary.
-•No speculative changes or “while we’re here” edits.
-•All logic should be isolated to not break existing flows.
-	
-4.Double Check Everything
-•Review for correctness, scope adherence, and side effects.
-•Ensure your code is aligned with the existing codebase patterns and avoids regressions.
-•Explicitly verify whether anything downstream will be impacted.
-	
-5.Deliver Clearly
-•Summarize what was changed and why.
-•List every file modified and what was done in each.
-•If there are any assumptions or risks, flag them for review.
-	
-Reminder: You are not a co-pilot, assistant, or brainstorm partner. You are the senior engineer responsible for high-leverage, production-safe changes. Do not improvise. Do not over-engineer. Do not deviate
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Repository Overview
 
-This is a simplified PyTorch implementation of LeRobot's PI0 and PI0-fast Vision-Language-Action (VLA) models, based on Physical Intelligence's OpenPI checkpoints. The repository provides fixes, optimizations, comprehensive usage documentation, and a complete RIPT (Reinforcement Learning with Image-based Trajectory Prediction) framework for distributed RL fine-tuning.
+This is a comprehensive Vision-Language-Action (VLA) research repository containing multiple implementations and frameworks for robotics AI:
 
-**Critical Note**: This repository includes extensive debugging and testing files that help diagnose common issues. Many files starting with `test_` are diagnostic tools for specific problems that arose during development.
+- **OpenPI PyTorch** (`openpi_pytipt/`): Main simplified PyTorch implementation of PI0/PI0-fast models with RIPT RL framework
+- **RIPT-PI0** (`ript-pi0/`): RIPT framework integration with PI0 models  
+- **RIPT-VLA Original** (`ript-vla_ori/`): Original RIPT-VLA implementation for comparison
+- **QueST** (`QueST/`): QueST algorithm implementation for robotics
+- **CFG-RL** (`cfgrl/`): Classifier-Free Guidance for Reinforcement Learning
+- **LeRobot** (`lerobot/`): Extended LeRobot framework
+- **ConRFT** (`conrft/`): Contact-Aware Robot Fine-Tuning framework
 
-## Recent Major Enhancements
+## Main Working Directory
 
-The repository has recently been enhanced with production-ready features including:
+**Primary development focus**: `openpi_pytipt/` - This contains the most active and complete implementation with production-ready features including CFG integration, distributed training, and comprehensive testing infrastructure.
 
-- **CFG (Classifier-Free Guidance) Integration**: PI0 models now support conditional/unconditional generation with CFG-style training for improved quality
-- **Stage 12 Multi-Task Evolution**: Progressive development towards libero-10 multi-task training with enhanced RLOO advantage computation
-- **Advanced Parallel Environment Support**: Intelligent parallel environment management with automatic memory optimization and batch processing fallbacks to prevent GPU memory overflow
-- **Enhanced Testing Infrastructure**: Comprehensive test suites (`test_enhanced_features.py`, `quick_single_gpu_test.py`) that validate all system components
-- **File-based Distributed Coordination**: `FileGlobalCounter` system for robust multi-process coordination using file locks
-- **SubprocVectorEnv Optimization**: Smart detection and mitigation of model serialization issues in parallel environments
-- **Intelligent Memory Management**: Automatic GPU memory analysis and strategy selection for parallel training
+**Important**: The `openpi_pytipt/` directory contains its own detailed CLAUDE.md file with extensive technical documentation. Always reference that file for specific implementation details, debugging guides, and production deployment instructions.
 
-## Staged Development Architecture
+## Quick Start Commands
 
-The codebase follows a **12-stage progressive development approach** from basic inference to production-ready distributed training:
-
-- **Stages 1-6**: `scripts/` directory - Basic inference and environment integration
-- **Stage 7**: `7_train_with_rl_core.py` - Core RL training implementation
-- **Stage 8**: `8_train_with_epochs.py` - Smart sampling and batch processing
-- **Stage 9**: `9_train_with_config.py` - YAML configuration system
-- **Stage 10**: `10_train_with_distributed.py` - Multi-GPU distributed training
-- **Stage 11**: `11_train_ript_vla_style.py` - RIPT-VLA style simplified training with enhanced parallel environment support
-- **Stage 12**: Multi-task evolution towards libero-10 with enhanced RLOO advantage computation and CFG integration
-
-Each stage builds incrementally on the previous ones, maintaining backward compatibility while adding sophisticated features.
-
-## Core Architecture
-
-### Key Components
-
-1. **PI0 Policy Models** (`pi0/` directory):
-   - `modeling_pi0.py`: Main PI0 policy implementation with Flow Matching and critical image format fixes
-   - `modeling_pi0fast.py`: Optimized PI0-fast variant
-   - `paligemma_with_expert.py`: Vision-language model backbone
-
-2. **RIPT RL Training Framework** (`pi0/ript/` directory):
-   - `scripts/train_ript_pi0.py`: Distributed RL training script using CFG-style advantage weighting
-   - `algos/rl_optimizers/`: Core RL optimization algorithms
-     - `pi0_cfg_interface.py`: Critical adapter layer between PI0Policy and RIPT framework
-     - `rl_optimizer_pi0_cfg.py`: CFG-style RL optimizer with Leave-One-Out advantage computation
-     - `rollout_generator.py`: Trajectory generation and data collection
-     - `file_counter.py`: Distributed coordination for multi-process training with atomic file operations
-     - `enhanced_rollout_generator.py`: Advanced rollout generation with smart sampling and early stopping
-   - `env/`: Environment integration with advanced parallel support
-     - `pi0_libero_runner.py`: Enhanced LIBERO environment runner with intelligent parallel environment management
-     - `pi0_libero_runner_ript_vla.py`: RIPT-VLA style runner with action queue management
-     - `parallel_env_factory.py`: Independent environment factory for solving SubprocVectorEnv serialization issues
-   - `utils/`: LIBERO-specific utilities and policy wrappers
-   - `config/`: Training configuration files with feature toggles and parallel environment settings
-
-3. **Model Conversion** (`convert_pi0_to_hf_lerobot.py`):
-   - Converts JAX checkpoints from OpenPI to PyTorch format
-   - Preserves normalization statistics essential for inference
-
-4. **Environment Integration**:
-   - **CleanDiffuser/**: Primary LIBERO environment integration (used by RIPT training)
-   - **LIBERO/**: Official LIBERO benchmark tasks and utilities  
-   - **lerobot/**: Extended LeRobot framework with backward compatibility layers
-
-5. **Testing and Debugging Infrastructure**:
-   - Multiple `test_*.py` files for diagnosing specific issues
-   - `2_test_pi0_on_libero.py`: Reference implementation for LIBERO environment testing (now with debug checkpoints)
-   - `analyze_*.py`: Scripts for performance analysis and debugging
-   - **RIPT_QUALITY_DEBUG_GUIDE.md**: Comprehensive debugging guide for quality issues
-   - `test_enhanced_features.py`: Production-ready test suite for RIPT-VLA level functionality validation
-   - `quick_single_gpu_test.py`: Fast system validation with configurable testing modes
-   - `test_file_counter_integration.py`: Distributed coordination testing and validation
-
-## Essential Development Commands
-
-### Prerequisites and Installation
-Install core dependencies:
+### Working with OpenPI PyTorch (Primary)
 ```bash
+cd openpi_pytipt
 pip install -r requirements.txt
-```
 
-For RIPT training, additional dependencies are required (already included in requirements.txt):
-- hydra-core, robosuite, gym for RL training
-- bddl for LIBERO environment tasks
-- moviepy, imageio for video generation and analysis
-
-### Model Conversion
-Convert OpenPI JAX checkpoints to PyTorch:
-```bash
-python convert_pi0_to_hf_lerobot.py \
-    --checkpoint_dir /path/to/jax/checkpoint/params \
-    --output_path /path/to/pytorch/checkpoint
-```
-
-**Important**: Always preserve the original JAX checkpoint directory as it contains `norm_stats.json` which is critical for proper model inference.
-
-### Running Inference
-Basic inference test:
-```bash
+# Basic model conversion and inference
+python convert_pi0_to_hf_lerobot.py --checkpoint_dir /path/to/jax/params --output_path /path/to/pytorch
 python 1_e2e_inference.py
-```
 
-Libero environment demos:
-```bash
-python libero_demo_lerobot.py
-python 2_test_pi0_on_libero.py
-```
-
-### RIPT RL Training
-Train PI0 with reinforcement learning using RIPT framework:
-
-**Single GPU Training:**
-```bash
-cd /zhaohan/ZJH/openpi_pytorch
-python pi0/ript/scripts/train_ript_pi0.py --config_path pi0/ript/config/train_pi0_cfg_rl.yaml
-```
-
-**Multi-GPU Distributed Training (NEW - Stage 10):**
-```bash
-# Quick 2GPU test
-./scripts/quick_distributed_test.sh
-
-# Standard 4GPU training
-./scripts/launch_distributed_training.sh \
-    --config pi0/ript/config/distributed_train_pi0.yaml --gpus 4
-
-# Large-scale 8GPU training
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
-./scripts/launch_distributed_training.sh \
-    --config pi0/ript/config/distributed_train_pi0.yaml --gpus 8
-```
-
-**Configuration-based Training (Stage 9-11):**
-```bash
-# YAML configuration system
-python 9_train_with_config.py --config_path pi0/ript/config/debug_train_stage9.yaml
-
-# Distributed configuration system  
-python 10_train_with_distributed.py --config_path pi0/ript/config/distributed_train_pi0.yaml
-
-# RIPT-VLA style simplified training with enhanced parallel environment support
-python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_ript_vla.yaml
-
-# Stage 12: Multi-task libero-10 evolution with CFG (in development)
-python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_ript_vla.yaml
-```
-
-Debug training with minimal configuration:
-```bash
-python pi0/ript/scripts/train_ript_pi0.py --config_path pi0/ript/config/debug_train_pi0.yaml
-```
-
-### Testing and Validation Commands
-```bash
-# Environment setup validation
-export DEBUG_SAVE_PROCESSED=1      # Save processed images for debugging
-export PI0_DEBUG_SAVE_VIDEO=true   # Enable rollout video generation
-export TOKENIZERS_PARALLELISM=false # Fix tokenizer warnings
-
-# Comprehensive system validation (RECOMMENDED for new setups)
-python test_enhanced_features.py   # Full RIPT-VLA functionality test
-python quick_single_gpu_test.py --config_path pi0/ript/config/single_gpu_test.yaml
-
-# Core system validation
-python 1_e2e_inference.py          # Basic inference test
-python test_ript_normalization.py   # Test normalization consistency
-python test_ript_training_quick.py  # Test core training components
-python check_libero_format.py       # Verify LIBERO image format
-
-# Component import validation
-python -c "from pi0.modeling_pi0 import PI0Policy; print('✓ PI0 import successful')"
-python -c "from pi0.ript.reward_function import BinarySuccessReward; print('✓ RIPT import successful')"
-
-# Parallel environment and distributed coordination testing
-python test_file_counter_integration.py   # Test distributed coordination
-python test_parallel_envs.py              # Test parallel environment functionality
-
-# Performance analysis (when investigating issues)
-python test_ript_vs_original.py     # Compare RIPT vs reference implementation
-python analyze_inference_differences.py # Detailed inference analysis
-
-# CFG (Classifier-Free Guidance) testing
-python test_cfg_implementation.py   # Test CFG conditional/unconditional generation
-python -c "from pi0.modeling_pi0 import PI0Policy; policy = PI0Policy.from_pretrained('/path/to/checkpoint'); print('✓ CFG-enabled PI0 loaded')"
-```
-
-### Development Environment Setup
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Set up LIBERO environment (for RIPT training)
-# CleanDiffuser and LIBERO should be included in requirements.txt
-
-# Verify GPU setup for distributed training
-nvidia-smi
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-```
-
-### Distributed Training Setup
-```bash
-# Single GPU training
-CUDA_VISIBLE_DEVICES=0 python pi0/ript/scripts/train_ript_pi0.py \
-    --config_path pi0/ript/config/debug_train_pi0.yaml
-
-# Multi-GPU distributed training  
-export NCCL_TIMEOUT=108000  # Extended timeout for distributed operations
-CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 \
-    pi0/ript/scripts/train_ript_pi0.py --config_path pi0/ript/config/train_pi0_cfg_rl.yaml
-```
-
-### Debugging Quality Issues
-For systematic debugging of quality differences between RIPT and reference implementations:
-```bash
-# Run reference with debug checkpoints
-python 2_test_pi0_on_libero.py
-
-# Run RIPT with debug output  
-python pi0/ript/scripts/train_ript_pi0.py --config_path pi0/ript/config/train_pi0_cfg_rl.yaml
-
-# Compare debug outputs
-python -c "
-import json, numpy as np
-ref = json.load(open('debug_2test_raw_obs.json'))
-ript = json.load(open('ript/debug_analysis/session_*/checkpoint2_obs_step0.json'))
-# Detailed comparison logic...
-"
-```
-
-## Critical Architecture Details
-
-### RIPT System Integration
-The RIPT framework implements CFG-style reinforcement learning for PI0 policies with a sophisticated multi-stage architecture:
-
-1. **Flow Matching + CFG-RL**: PI0 uses time-based interpolation for action generation, optimized with classifier-free guidance style advantage weighting
-2. **CFG Dual-Branch Training**: Conditional and unconditional loss computation with configurable weighting (α=0.1 default)
-3. **Distributed Training**: Multi-process coordination through file-based counters and PyTorch DDP
-4. **LIBERO Integration**: 32D policy actions mapped to 7D LIBERO environment actions (6-DOF pose + gripper)
-5. **Advantage Computation**: Leave-One-Out baseline for trajectory-level advantage estimation without value networks
-6. **Smart Sampling**: Enhanced sampling system with state history tracking and intelligent state selection
-
-### Progressive Training Pipeline Evolution
-The training system evolved through multiple stages:
-
-- **Stage 7-8**: Core RL training with smart sampling and batch processing
-- **Stage 9**: Configuration management with YAML support and parameter validation
-- **Stage 10**: Production-ready distributed training with PyTorch DDP
-
-Each stage maintains full backward compatibility while adding sophisticated features.
-
-### Import Path Resolution
-The repository maintains compatibility across different frameworks:
-- `/zhaohan/ZJH/lerobot/lerobot/constants.py` - Re-exports from `common.constants`
-- `/zhaohan/ZJH/lerobot/lerobot/policies/` - Compatibility layer for policy imports
-- `lerobot_constants.py` - Local constants file for standalone operation
-- **RIPT imports**: All internal RIPT imports use `pi0.ript.*` path structure
-
-### Model Loading Requirements
-1. **PyTorch Checkpoint**: Converted from JAX using conversion script
-2. **Normalization Statistics**: Essential `norm_stats.json` from original JAX checkpoint
-3. **Dataset Statistics**: Must include image feature keys for proper model initialization
-4. **RIPT Dependencies**: Additional packages for RL training (hydra-core, robosuite, gym, etc.)
-
-### Key Input/Output Interfaces
-The PI0 model processes multi-modal inputs through standardized interfaces:
-
-**Core Prediction Interface** (`pi0/modeling_pi0.py:55`):
-```python
-# Main inference method with CFG support
-action = policy.select_action(observation, cfg_scale=3.0)  # CFG guidance scale
-
-# Expected observation format:
-observation = {
-    "image": {
-        "base_0_rgb": torch.tensor,      # (B, 3, 224, 224) uint8 [0, 255]
-        "left_wrist_0_rgb": torch.tensor, # Optional additional camera views
-    },
-    "state": torch.tensor,               # (B, state_dim) float32 robot state
-    "prompt": ["task description"],      # List of task instructions
-}
-
-# CFG Training batch format:
-batch = {
-    **observation,
-    "action": torch.tensor,              # (B, T, action_dim) target actions
-    "is_positive": torch.tensor,         # (B,) int32 conditional indicator (1=positive, 0=unconditional)
-}
-```
-
-**Data Processing Pipeline**:
-- `prepare_images()` (line 127): Normalizes images to [-1, 1], handles BCHW format
-- `prepare_state()` (line 216): Pads state vectors to maximum dimensions
-- `prepare_language()` (line 240): Tokenizes prompts with PaliGemma format
-
-**RIPT Integration Points**:
-- `construct_pi0_observation()` in `pi0/ript/env/pi0_libero_runner.py:133`: Converts LIBERO environment outputs to PI0 format
-- Action post-processing includes denormalization and state offset addition
-
-## RIPT Training Architecture
-
-### Core Flow
-1. **Policy Wrapper** (`Pi0PolicyWrapper`): Provides error handling and action formatting
-2. **Environment Runner** (`LIBEROEnvRunner`): Manages LIBERO environment interactions
-3. **Rollout Generator**: Collects trajectories with intelligent sampling
-4. **CFG Adapter** (`PI0_CFG_Adapter`): Converts episodes to PI0-compatible batches
-5. **RL Optimizer** (`RLOptimizerPI0_CFG`): Implements advantage-weighted loss optimization
-
-### Training Data Pipeline
-```
-LIBERO Environment → Trajectory Collection → Episode Processing → Batch Formation → CFG-weighted Loss → Policy Update
-```
-
-### Configuration System
-Training uses YAML configuration files in `pi0/ript/config/`:
-- `train_pi0_cfg_rl.yaml`: Full training configuration
-- `debug_train_pi0.yaml`: Minimal configuration for testing
-- Supports distributed training, mixed precision, gradient accumulation
-
-## Checkpoint Structure
-```
-checkpoints/
-├── pi0_libero_pytorch/          # Converted PyTorch model
-│   ├── config.json              # Model configuration
-│   ├── model.safetensors        # Model weights
-│   └── tokenizer files...
-└── original_jax_checkpoint/     # Keep for norm_stats.json
-    ├── params/                  # JAX parameters
-    └── norm_stats.json          # Critical normalization data
-```
-
-## Common Issues and Solutions
-
-### Import Errors
-If you encounter `ModuleNotFoundError: No module named 'lerobot.constants'`:
-- Ensure `/zhaohan/ZJH/lerobot` is in Python path
-- Check that compatibility layer files exist in `lerobot/lerobot/`
-
-### RIPT Training Issues
-If RIPT training fails:
-- Verify all RIPT dependencies are installed (see RIPT_MIGRATION_PROGRESS.md)
-- Check LIBERO environment setup and EGL/OpenGL configuration
-- Ensure checkpoint paths in config files are correct
-- For distributed training, verify NCCL configuration and GPU visibility
-- **Stage Selection**: Use the appropriate stage script for your needs:
-  - Stage 7-8 for development and debugging
-  - Stage 9 for configuration-based training
-  - Stage 10 for production distributed training
-
-### Parallel Environment Memory Issues
-**Critical Issue**: SubprocVectorEnv causes GPU memory overflow due to model serialization
-- **Root Cause**: Each subprocess loads a complete 3.5GB PI0 model copy
-- **Detection**: GPU memory usage shows ~3.5GB × num_parallel_envs
-- **Solution**: Enhanced system now uses independent environment factory (`parallel_env_factory.py`) to avoid model serialization
-- **Intelligent Fallback**: Automatic GPU memory analysis with fallback to batch processing when memory insufficient
-- **Configuration**: Use feature flags `enable_parallel_envs` and `enable_true_parallel_envs` for fine control
-- **Recommended**: Use Stage 11 training with enhanced parallel environment management
-
-### FileGlobalCounter Issues
-If distributed coordination fails:
-- Ensure sufficient disk space for counter files in `./distributed_counters/`
-- Check file permissions for counter file creation
-- For NFS/shared storage, verify file locking support (`fcntl.flock`)
-- Use `test_file_counter_integration.py` to validate setup
-
-### Dataset Dimension Mismatch Errors
-**Fixed Issue**: `ValueError: all the input array dimensions for the concatenation axis must match exactly`
-- **Root Cause**: Different LIBERO tasks have different numbers of initial states
-- **Solution**: Use `itertools.chain.from_iterable()` to flatten states instead of `np.concatenate()`
-- **Location**: `pi0/ript/scripts/train_ript_pi0.py` LiberoInitStateDataset class
-
-### Quality Differences Between RIPT and Reference
-**Critical Discovery**: Identical environment states produce different action outputs with 5-11cm differences
-- **Root Cause**: Model inference differences despite identical inputs
-- **Status**: Under investigation - see RIPT_QUALITY_DEBUG_GUIDE.md for detailed analysis
-- **Debug Tools**: Both implementations now have debug checkpoints for systematic comparison
-
-### Image Processing Issues
-**Ongoing Investigation**: Image coordinate system handling differences:
-- **CleanDiffuser**: Uses `[::-1].transpose(2,0,1)` (vertical flip + HWC→CHW)
-- **RIPT Current**: May have additional transformations affecting inference
-- **Diagnostic Tools**: `comprehensive_image_analysis.py`, debug image saves in `pi0/ript/debug_images/`
-
-### Image Feature Errors
-If you see "All image features are missing from the batch":
-- Verify `dataset_stats` includes image feature keys matching your observation format
-- Ensure image tensors are properly formatted (3D with correct dimensions)
-
-### Path Configuration
-- JAX checkpoint paths must be preserved for `norm_stats.json` access
-- PyTorch checkpoints require accompanying tokenizer files
-- RIPT training scripts must be run from project root directory (`/zhaohan/ZJH/openpi_pytorch`)
-
-### LIBERO Environment Setup
-**CRITICAL**: RIPT training uses CleanDiffuser's LIBERO integration:
-- **Training Environment**: `gym.make("libero-10-v0", task_id=9, seed=0, ...)` (now standardized)
-- **Environment Warmup**: Use 20-step warmup with dummy actions after `env.reset()` for stability
-- **Reset Method**: `obs = env.reset()` with standard gym interface
-
-## Debug File Structure
-```
-ript/debug_analysis/session_YYYYMMDD_HHMMSS/
-├── checkpoint1_env_info.json           # Environment configuration
-├── checkpoint2_obs_step*.json           # Raw observation statistics  
-├── checkpoint2_raw_*_image_step*.png    # Raw image data
-├── checkpoint3_processed_*_step*.png    # Processed image data
-└── checkpoint5_state_action.json       # Action inference data (when available)
-
-debug_2test_*.json                       # Reference implementation debug data
-debug_2test_images/                      # Reference implementation image debug
-```
-
-## Development Notes
-
-### Current Implementation Status
-The repository has reached production readiness with 11 core development stages completed and Stage 12 in active development:
-
-**Core Features (✅ Complete)**:
-- PI0/PI0-fast model implementations with JAX-to-PyTorch conversion
-- RIPT RL training framework with CFG-style advantage weighting
-- CFG (Classifier-Free Guidance) conditional/unconditional generation support  
-- Enhanced smart sampling with state history tracking
-- YAML-based configuration management system
-- Multi-GPU distributed training with PyTorch DDP
-- Comprehensive debugging and diagnostic tools
-
-**Stage 12 Development (🚧 In Progress)**:
-- Multi-task libero-10 training architecture
-- Enhanced RLOO advantage computation with sample-level filtering
-- Demo-batch × RLOO group dual-layer organization
-- Dynamic sampling optimization and stabilization
-
-**Quality Assurance Findings**:
-- Environment data is identical between implementations
-- Action outputs differ by 5-11cm despite identical inputs
-- Issue isolated to model inference layer, not environment or RL training
-- Systematic debugging infrastructure enables rapid problem diagnosis
-- CFG implementation provides improved training stability and quality
-
-### Production Training Recommendations
-- **Development**: Use Stage 7-8 scripts for rapid iteration
-- **Configuration**: Use Stage 9 for parameterized experiments  
-- **Production**: Use Stage 10 for multi-GPU distributed training
-- **Debugging**: Extensive `test_*.py` suite for systematic issue diagnosis
-- **System Validation**: Always run `test_enhanced_features.py` before production deployments
-- **Parallel Environments**: Use batch processing mode for memory-safe operation
-
-### Configuration Recommendations
-- **Simple Training**: Use `pi0/ript/config/single_gpu_test.yaml`
-- **Feature Testing**: Use `pi0/ript/config/single_gpu_test_with_features.yaml`
-- **Parallel Testing**: Use `pi0/ript/config/multi_env_test.yaml` (with automatic memory optimization)
-- **RIPT-VLA Style**: Use `pi0/ript/config/stage11_ript_vla.yaml` (enhanced parallel environment support)
-- **Production Distributed**: Use `pi0/ript/config/distributed_train_pi0.yaml`
-
-See `DISTRIBUTED_TRAINING_GUIDE.md` for comprehensive distributed training documentation.
-
-## Advanced Features and Testing
-
-### Parallel Environment Management
-The system includes sophisticated parallel environment handling that automatically optimizes for memory constraints:
-
-**Intelligent Strategy Selection**:
-```python
-# Automatic GPU memory analysis and strategy selection
-if required_memory_gb > available_memory_gb * 0.8:
-    # Falls back to batch processing for memory safety
-    return batch_parallel_strategy()
-else:
-    # Attempts lightweight parallel environments
-    return lightweight_parallel_strategy()
-```
-
-**Configuration Controls**:
-```yaml
-features:
-  enable_task_polling: true           # Dynamic task assignment
-  enable_parallel_envs: true          # Parallel environment support
-  enable_true_parallel_envs: true     # True multiprocess parallel environments
-  enable_smart_sampling: true         # Intelligent state sampling
-  use_parallel_init_state: false      # Whether to use set_init_state in parallel mode
-  save_video: true                    # Enable video saving during training
-```
-
-### File-based Distributed Coordination
-The `FileGlobalCounter` system provides robust multi-process coordination:
-- **Atomic Operations**: Uses `fcntl.flock` for exclusive file access
-- **Retry Mechanisms**: Automatic retry with exponential backoff
-- **Cross-Platform**: Works on Unix/Linux systems with shared storage
-- **Fault Tolerant**: Handles process crashes and resource cleanup
-
-### Enhanced Testing Framework
-The repository includes production-ready testing infrastructure:
-
-**Comprehensive Validation** (`test_enhanced_features.py`):
-- File counter functionality testing
-- Environment runner validation
-- Enhanced rollout generator testing
-- Parallel environment feature validation
-- Configuration system testing
-
-**Quick System Check** (`quick_single_gpu_test.py`):
-- Basic setup validation
-- Model loading verification
-- Environment creation testing
-- Simple rollout execution
-- Configurable test modes
-
-**Usage Examples**:
-```bash
-# Full system validation (5 comprehensive tests)
+# System validation (recommended first step)
 python test_enhanced_features.py
+python quick_single_gpu_test.py
 
-# Quick validation with specific config
-python quick_single_gpu_test.py --config_path pi0/ript/config/single_gpu_test_with_features.yaml
-
-# Test parallel environment functionality
-python quick_single_gpu_test.py --config_path pi0/ript/config/multi_env_test.yaml
+# RIPT RL training (staged approach)
+python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_ript_vla.yaml
 ```
 
-### Memory Optimization Techniques
-The system automatically handles common memory issues:
+### Working with RIPT-VLA Original
+```bash
+cd ript-vla_ori
+python train_ript.py config/task/libero_goal.yaml
+```
 
-1. **SubprocVectorEnv Serialization Detection**: Automatically detects when parallel environments would cause memory overflow
-2. **Independent Environment Factory**: Uses `parallel_env_factory.py` to avoid model serialization in subprocesses
-3. **Intelligent Memory Analysis**: Real-time GPU memory monitoring with automatic fallback strategies
-4. **Batch Processing Fallback**: Seamlessly switches to memory-efficient batch processing when needed
-5. **Smart Memory Allocation**: Pre-flight memory checks prevent CUDA OOM errors
-6. **Automatic Cleanup**: Intelligent garbage collection and resource management
+### Working with QueST
+```bash
+cd QueST
+python train.py config/train_base.yaml task=libero_base algo=quest
+```
 
-### Configuration Feature Flags
-Modern configuration system with granular feature control:
+### LIBERO Evaluation
+```bash
+cd openpi_pytipt
+./run_libero10_eval.sh 0 20  # GPU 0, 20 rollouts per task
+```
 
-- `enable_task_polling`: Dynamic task assignment and load balancing
-- `enable_parallel_envs`: Parallel environment processing with automatic optimization
-- `enable_true_parallel_envs`: True multiprocess parallel environments using independent factory
-- `enable_smart_sampling`: Intelligent state sampling based on success history
-- `use_parallel_init_state`: Control whether to use set_init_state in parallel mode (default: false to avoid MuJoCo dimension issues)
-- `save_video`: Enable video recording during training for debugging and analysis
-- Backward compatibility with all existing configurations
+## Repository Architecture
 
-### Stage 12 Multi-Task Evolution (In Progress)
-The latest development stage focuses on evolving from single-task to libero-10 multi-task training:
+### OpenPI PyTorch (`openpi_pytipt/`) - Primary Implementation
+- **12-Stage Progressive Development**: From basic inference to production distributed training
+- **CFG Integration**: Classifier-Free Guidance for improved model quality  
+- **RIPT RL Framework**: Complete reinforcement learning training system
+- **Production Features**: Distributed training, parallel environments, comprehensive testing
+- **Advanced Memory Management**: Intelligent parallel environment handling with automatic fallbacks
 
-**Key Objectives**:
-- Transition from single-task "put_the_bowl_on_the_stove" to libero-10 multi-task scenarios
-- Enhanced RLOO advantage computation with sample-level filtering
-- Integration of demo-batch × RLOO group dual-layer batch organization
-- Task-aware initial state data sources and multi-task environment reuse
+### Other Frameworks
+- **RIPT-PI0** (`ript-pi0/`): Alternative RIPT integration with PI0 models
+- **RIPT-VLA Original** (`ript-vla_ori/`): Reference implementation for comparison studies
+- **QueST** (`QueST/`): QueST algorithm with autoencoder training stages
+- **CFG-RL** (`cfgrl/`): Standalone CFG-RL implementation with PI0 integration
+- **LeRobot** (`lerobot/`): Extended framework with additional robot support
+- **ConRFT** (`conrft/`): Contact-aware robot fine-tuning framework
 
-**Implementation Strategy** (STAGE12_INCREMENTAL_CHECKLIST.md):
-1. **Disable Dynamic Sampling**: Prevent "total_steps=0" issues by disabling aggressive batch-level filtering
-2. **Integrate RolloutGenerator**: Replace batch-level filtering with sample-level collection and statistics
-3. **Enhanced RLOO Computation**: Implement sample-level advantage computation with group-based baselines
-4. **Multi-Task Environment**: Support libero-10 task distribution and task-aware state sampling
-5. **Demo-Batch Organization**: Implement dual-layer batch structure for improved training stability
+## Key Technical Features
 
-**Current Status**: 
-- CFG implementation completed and integrated
-- Dynamic sampling issues identified and solutions planned
-- Progressive rollout of multi-task capabilities in development
+### Model Conversion System
+- **JAX-to-PyTorch**: Converts OpenPI checkpoints while preserving critical normalization statistics
+- **Essential Files**: Always preserve `norm_stats.json` from original JAX checkpoints
+- **HuggingFace Integration**: Compatible with LeRobot policy loading system
 
-**Independent Environment Factory**: Solves the fundamental SubprocVectorEnv serialization problem by creating truly independent environment creation functions that don't reference the main process's policy object.
+### RIPT Training Pipeline
+```
+LIBERO Environment → Trajectory Collection → Episode Processing → 
+CFG Batch Formation → Advantage-Weighted Loss → Policy Update
+```
 
-**Intelligent Memory Management**: Automatic GPU memory analysis that calculates required memory (3.5GB × num_parallel_envs) and compares with available memory, automatically falling back to safe batch processing when needed.
+### Configuration Management
+- **YAML-based**: Comprehensive configuration system with feature toggles
+- **Staged Configs**: Different configurations for development, testing, and production
+- **Parallel Environment Control**: Intelligent memory management with automatic optimization
 
-**Enhanced Observation Processing**: Unified observation handling that supports multiple VectorEnv formats with robust fallback mechanisms for compatibility across different implementations.
+## Critical Development Notes
 
-**Advanced Feature Toggle System**: Granular control over parallel environment features with intelligent defaults and production-ready safety mechanisms.
+### Memory Management
+- **SubprocVectorEnv Issue**: Can cause GPU memory overflow (3.5GB × num_parallel_envs)
+- **Solution**: Enhanced system uses independent environment factory with automatic fallback
+- **Intelligent Detection**: Real-time GPU memory analysis with fallback strategies
 
+### Import Path Compatibility  
+The repository maintains compatibility across multiple frameworks:
+- LeRobot imports: `/zhaohan/ZJH/lerobot/lerobot/constants.py`
+- RIPT imports: Use `pi0.ript.*` path structure  
+- Local constants: `lerobot_constants.py` for standalone operation
 
+### Testing Strategy
+- **System Validation**: `test_enhanced_features.py` for comprehensive testing
+- **Quick Checks**: `quick_single_gpu_test.py` for rapid validation
+- **Component Testing**: Individual test files for specific functionality
+- **Debug Infrastructure**: Extensive debugging tools with image analysis capabilities
 
+## Development Workflow
 
+### For OpenPI PyTorch Development (Primary)
+1. **System Validation**: Run `test_enhanced_features.py` to verify system health
+2. **Model Setup**: Convert JAX checkpoints while preserving `norm_stats.json`
+3. **Configuration Selection**: Choose appropriate YAML config for your use case
+4. **Progressive Training**: Start with single-GPU debug configs, scale to distributed as needed
+5. **Quality Assurance**: Use extensive debug infrastructure when issues arise
+
+### Common Development Tasks
+- **Model Conversion**: `python convert_pi0_to_hf_lerobot.py` with proper paths
+- **Quick Testing**: `python quick_single_gpu_test.py` for rapid validation
+- **Full Training**: Use staged approach (Stage 7 → 8 → 9 → 10 → 11)
+- **Distributed Training**: Set `CUDA_VISIBLE_DEVICES` and use appropriate configs
+- **Debugging**: Leverage comprehensive debug tools and image analysis
+
+## Repository Status and Recommendations
+
+### Production Ready Components
+- **OpenPI PyTorch**: ✅ Complete with CFG integration and distributed training
+- **Model Conversion**: ✅ Reliable JAX-to-PyTorch conversion with statistics preservation
+- **RIPT Framework**: ✅ Production-ready RL training with intelligent memory management
+- **Testing Infrastructure**: ✅ Comprehensive validation and debugging tools
+
+### Development Focus
+- **Primary**: Use `openpi_pytipt/` for all new development work
+- **Reference**: Use `ript-vla_ori/` for comparison studies and validation
+- **Experimentation**: Other frameworks available for specific research needs
+
+**For detailed technical documentation, always reference `openpi_pytipt/CLAUDE.md` which contains comprehensive implementation details, debugging guides, and production deployment instructions.**

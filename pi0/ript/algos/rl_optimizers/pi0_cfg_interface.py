@@ -512,6 +512,225 @@ class PI0_CFG_Adapter(RLModelInterface):
         
         return final_loss
     
+    def compute_weighted_loss_microbatch(
+        self,
+        episodes: List[Dict[str, Any]],
+        advantages: torch.Tensor,
+        device: Optional[torch.device] = None,
+        micro_batch_size: int = 8,
+        grad_accum_steps: int = 1,
+        use_amp: bool = True,
+        optimizer = None,
+        scaler = None
+    ) -> torch.Tensor:
+        """
+        🔥 窗口级微批梯度累积版本 - 解决显存OOM问题
+        
+        核心思路：
+        1. 先process_episodes得到所有窗口的batch (B_windows)
+        2. 沿B_windows维度切分为micro_batch_size的小块
+        3. 每个微批次：共享noise/time，分别计算条件/无条件分支，组合损失
+        4. 损失/grad_accum_steps后backward（累积梯度）
+        5. 满grad_accum_steps时统一step
+        
+        Args:
+            episodes: E个原始轨迹
+            advantages: (E,) episode级优势
+            micro_batch_size: 微批次窗口数（控制显存峰值）
+            grad_accum_steps: 梯度累积步数
+            use_amp: 是否使用混合精度
+            optimizer: 优化器（用于step）
+            scaler: GradScaler（AMP模式下使用）
+        
+        Returns:
+            平均损失值
+        """
+        if device is None:
+            device = self.device
+        
+        print(f"🔧 窗口级微批处理: micro_batch_size={micro_batch_size}, grad_accum_steps={grad_accum_steps}, AMP={use_amp}")
+        
+        # 1. 处理episodes得到窗口batch
+        batch, owner_indices = self.process_episodes(episodes, device)
+        
+        B_windows = batch["state"].shape[0]
+        print(f"   总窗口数: {B_windows}")
+        
+        if B_windows == 0:
+            print("⚠️ 无有效窗口数据")
+            return torch.tensor(0.0, device=device)
+        
+        # 2. 准备优势映射
+        window_advantages = torch.zeros(B_windows, device=device, dtype=advantages.dtype)
+        for window_idx, episode_idx in enumerate(owner_indices):
+            window_advantages[window_idx] = advantages[episode_idx]
+        
+        w_pos = (window_advantages > 0).float()
+        
+        # 3. 准备全局noise和time（所有微批次共享）
+        n, d = self.policy.config.n_action_steps, self.policy.config.max_action_dim
+        dtype = batch["state"].dtype
+        
+        # 🔥 关键：为整个batch生成统一的noise和time
+        global_noise = torch.randn(B_windows, n, d, device=device, dtype=dtype)
+        global_time = self.policy.model.sample_time(B_windows, device).to(dtype)
+        
+        # 4. 微批次处理
+        total_loss = 0.0
+        num_micro_batches = 0
+        
+        for start_idx in range(0, B_windows, micro_batch_size):
+            end_idx = min(start_idx + micro_batch_size, B_windows)
+            micro_B = end_idx - start_idx
+            
+            # 提取微批次数据
+            micro_batch = {}
+            for key, value in batch.items():
+                if key == 'states':
+                    # 处理嵌套的states字典
+                    micro_batch[key] = {}
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, torch.Tensor) and len(sub_value.shape) > 0:
+                            micro_batch[key][sub_key] = sub_value[start_idx:end_idx]
+                        else:
+                            micro_batch[key][sub_key] = sub_value
+                elif isinstance(value, torch.Tensor) and len(value.shape) > 0:
+                    micro_batch[key] = value[start_idx:end_idx]
+                else:
+                    micro_batch[key] = value
+            
+            # 提取微批次的优势和noise/time
+            micro_w_pos = w_pos[start_idx:end_idx]
+            micro_noise = global_noise[start_idx:end_idx]
+            micro_time = global_time[start_idx:end_idx]
+            
+            # 5. 🔥 使用autocast进行微批次的双分支计算
+            try:
+                if use_amp:
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        micro_loss = self._compute_micro_batch_loss(
+                            micro_batch, micro_w_pos, micro_noise, micro_time, device
+                        )
+                else:
+                    micro_loss = self._compute_micro_batch_loss(
+                        micro_batch, micro_w_pos, micro_noise, micro_time, device
+                    )
+                
+                # 损失归一化并累积梯度
+                normalized_loss = micro_loss / grad_accum_steps
+                
+                if optimizer is not None:
+                    if use_amp and scaler is not None:
+                        scaler.scale(normalized_loss).backward()
+                    else:
+                        normalized_loss.backward()
+                
+                total_loss += micro_loss.item()
+                num_micro_batches += 1
+                
+                print(f"   微批次 {num_micro_batches}: B={micro_B}, loss={micro_loss.item():.6f}")
+                
+            except Exception as e:
+                print(f"❌ 微批次 {start_idx}:{end_idx} 处理失败: {e}")
+                continue
+        
+        # 6. 统一进行梯度更新（如果提供了optimizer）
+        if optimizer is not None and num_micro_batches >= grad_accum_steps:
+            try:
+                if use_amp and scaler is not None:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                    optimizer.step()
+                
+                optimizer.zero_grad()
+                print(f"✅ 窗口级微批更新完成: 梯度范数={grad_norm:.6f}")
+            except Exception as e:
+                print(f"❌ 梯度更新失败: {e}")
+                optimizer.zero_grad()
+        
+        avg_loss = total_loss / max(1, num_micro_batches)
+        print(f"🎯 窗口级微批处理完成: 平均损失={avg_loss:.6f}")
+        
+        return torch.tensor(avg_loss, device=device)
+    
+    def _compute_micro_batch_loss(
+        self, 
+        micro_batch: Dict[str, Any], 
+        w_pos: torch.Tensor, 
+        noise: torch.Tensor, 
+        time: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        计算单个微批次的CFG损失
+        
+        Args:
+            micro_batch: 微批次数据
+            w_pos: 微批次正优势掩码
+            noise: 微批次noise
+            time: 微批次time
+            device: 计算设备
+        
+        Returns:
+            微批次损失
+        """
+        B = micro_batch["state"].shape[0]
+        
+        # 1. 条件分支
+        batch_positive = micro_batch.copy()
+        batch_positive["is_positive"] = torch.ones(B, device=device, dtype=torch.long)
+        batch_positive["noise"] = noise
+        batch_positive["time"] = time
+        
+        out_positive = self.policy.forward(batch_positive)
+        if isinstance(out_positive, tuple):
+            loss_dict_pos = out_positive[1]
+        else:
+            loss_dict_pos = out_positive
+        
+        per_step_per_dim_pos = loss_dict_pos["losses"]
+        
+        # 2. 无条件分支（共享noise和time）
+        batch_uncond = micro_batch.copy()
+        batch_uncond["is_positive"] = torch.zeros(B, device=device, dtype=torch.long)
+        batch_uncond["noise"] = noise  # 🔥 共享相同的noise
+        batch_uncond["time"] = time    # 🔥 共享相同的time
+        
+        out_uncond = self.policy.forward(batch_uncond)
+        if isinstance(out_uncond, tuple):
+            loss_dict_uncond = out_uncond[1]
+        else:
+            loss_dict_uncond = out_uncond
+        
+        per_step_per_dim_uncond = loss_dict_uncond["losses"]
+        
+        # 3. CFG组合损失计算
+        per_step_pos = per_step_per_dim_pos.mean(dim=-1)  # (B,T)
+        per_step_uncond = per_step_per_dim_uncond.mean(dim=-1)  # (B,T)
+        
+        # 获取有效步掩码
+        mask = (~micro_batch["action_is_pad"]).float()  # (B,T)
+        
+        # CFG权重计算
+        w_pos_expanded = w_pos.unsqueeze(1).expand_as(mask)  # (B,T)
+        
+        # 标准CFGRL公式
+        cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
+        combined_loss_per_step = w_pos_expanded * per_step_pos + cfg_alpha * per_step_uncond
+        
+        # Padding感知的损失归约
+        window_valid_steps = mask.sum(dim=1)  # (B,)
+        window_losses = (combined_loss_per_step * mask).sum(dim=1) / (window_valid_steps + 1e-8)  # (B,)
+        
+        # 微批次最终损失
+        micro_loss = window_losses.mean()
+        
+        return micro_loss
+    
     def compute_act_logits(self, model, episodes: List[Dict[str, Any]], device: Optional[torch.device] = None):
         """
         This method is required by the RLModelInterface, but for our CFG-style

@@ -17,12 +17,12 @@ task:
 
 # === 算法配置 ===
 algo:
-  demo_batch_size: 1  # 🔥 新增：每步需要收集的组数（每组rloo_batch_size个样本）
-  rloo_batch_size: 8   # 每组内样本数（用于RLOO优势计算）
+  demo_batch_size: 1   # 🔥 解耦：每步收集1组（防OOM第一步）
+  rloo_batch_size: 4   # 每组4个样本（从8降到4，减少显存压力）
   lr: 1e-5
-  gradient_accumulation_steps: 1
-  collection_cfg_scale: 1.25       # 🔥 轻量CFG：设置为1.25（轻微CFG增强）
-  cfg_uncond_weight: 0.1           # 🔥 训练时无条件分支权重（CFG关闭时不使用）
+  gradient_accumulation_steps: 16  # 🔥 提高梯度累积：保持有效batch size
+  collection_cfg_scale: 1.0        # 🔥 收集时关闭CFG（训练时再开启）
+  cfg_uncond_weight: 0.1           # 训练时无条件分支权重
   # RolloutGenerator配置
   rollout_skip_threshold: 3
   enable_rollout_stats_tracking: true
@@ -31,17 +31,18 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: true            # 🚨 启用CFG功能：支持轻量CFG增强
+  cfg_enabled: true                # 🚨 启用CFG功能（训练时使用）
   train_expert_only: true          # 专家头训练模式
+  freeze_vision_encoder: true      # 🔥 新增：冻结视觉编码器（减少显存和计算）
 
 # === 数据集配置 ===
 dataset:
-  num_init_states: 1  # 🔥 备用：可用的初始状态数量（与algo.demo_batch_size一致）
+  num_init_states: 1  # 🔥 与demo_batch_size对齐
   state_dim: 8  # 状态维度
-  # 🔥 新增：窗口化采样配置（提高数据利用率）
-  windowing_mode: slide      # 窗口模式: last(兼容模式) | random(随机采样) | slide(滑动窗口)
-  window_stride: 50          # slide模式下的滑动步长
-  max_windows_per_episode: 2 # 每条轨迹最大窗口数（控制内存和计算）
+  # 🔥 关键修复：关闭滑动窗口（防OOM）
+  windowing_mode: last      # 只用最后窗口，不再滑动
+  window_stride: 999        # 大步长确保不重叠
+  max_windows_per_episode: 1 # 每条轨迹最大窗口数=1
 
 # === 训练配置 ===
 training:
@@ -56,12 +57,12 @@ logging:
 
 # === 特性开关 ===
 features:
-  use_ript_vla_runner: false  # 关闭RIPT-VLA runner，使用LIBEROEnvRunner并行能力
+  use_ript_vla_runner: false  # 关闭RIPT-VLA runner，使用LIBEROEnvRunner
   enable_parallel_envs: true  # 开启并行环境（向量化）
-  enable_true_parallel_envs: true  # 开启真正多进程并行（SubprocVectorEnv）
-  enable_smart_sampling: true      # Runner日志用的智能采样开关（与algo.enable_dynamic_sampling对应）
-  use_parallel_init_state: false   # 并行时是否调用set_init_state（默认false以避免MuJoCo qpos维度不匹配）
-  save_video: true                 # 训练期间保存视频（会写到 pi0/ript/debug_images/videos）
+  enable_true_parallel_envs: false  # 🔥 关闭真正多进程并行（防止内存问题）
+  enable_smart_sampling: true      # Runner日志用的智能采样开关
+  use_parallel_init_state: true    # 🔥 开启：并行时调用set_init_state
+  save_video: false               # 🔥 关闭视频保存（减少显存占用）
   
   # === 🔥 增强功能开关 ===
   enable_file_counter: true        # 开启文件计数器（分布式训练样本统计）

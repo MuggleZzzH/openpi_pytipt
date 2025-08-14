@@ -28,6 +28,8 @@ import traceback
 import time
 from tqdm import tqdm
 
+import hashlib
+
 # 修复tokenizers并行化警告和EGL错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["EGL_LOG_LEVEL"] = "fatal"  # 抑制EGL错误输出
@@ -42,6 +44,164 @@ print(f"=== Stage 11 RIPT-VLA风格简化训练 ===")
 print(f"脚本位置: {current_file}")
 print(f"项目根目录: {project_root}")
 print()
+
+class RolloutStatsTracker:
+    """
+    每个初始状态的rollout统计跟踪器
+    实现per-init跳过机制，与RIPT原版对齐
+    """
+    def __init__(self, rollout_skip_threshold: int = 3, stats_path: Optional[str] = None):
+        self.rollout_stats = {}  # {(task_id, init_hash): [success_history]}
+        self.rollout_skip_cnt = {}  # {(task_id, init_hash): skip_count}
+        self.rollout_skip_threshold = rollout_skip_threshold
+        self.stats_path = stats_path
+        
+        # 加载已有统计
+        if stats_path and Path(stats_path).exists():
+            self._load_stats()
+        
+        print(f"🔧 RolloutStatsTracker初始化:")
+        print(f"  跳过阈值: {rollout_skip_threshold}")
+        print(f"  统计路径: {stats_path}")
+        print(f"  已有统计: {len(self.rollout_stats)} 个init")
+    
+    def _compute_init_hash(self, task_id: int, init_state_data: Any) -> str:
+        """计算初始状态的哈希值"""
+        if isinstance(init_state_data, torch.Tensor):
+            data_bytes = init_state_data.cpu().numpy().tobytes()
+        elif isinstance(init_state_data, np.ndarray):
+            data_bytes = init_state_data.tobytes()
+        else:
+            data_bytes = str(init_state_data).encode()
+        
+        return hashlib.sha256(data_bytes).hexdigest()[:16]  # 短哈希
+    
+    def should_skip_init(self, task_id: int, init_hash: str, rloo_batch_size: int) -> bool:
+        """
+        判断是否应该跳过这个初始状态
+        RIPT原版逻辑：最近K=rloo_batch_size次全成功则跳过
+        """
+        key = (task_id, init_hash)
+        
+        if key not in self.rollout_stats:
+            return False
+        
+        history = self.rollout_stats[key]
+        if len(history) < rloo_batch_size:
+            return False
+        
+        # 检查最近K次是否全成功
+        recent_k = history[-rloo_batch_size:]
+        all_successful = all(s == 1 for s in recent_k)
+        
+        if all_successful:
+            print(f"🚫 跳过init ({task_id}, {init_hash}): 最近{rloo_batch_size}次全成功")
+            return True
+        
+        return False
+    
+    def update_stats(self, task_id: int, init_hash: str, successes: List[bool]):
+        """更新统计信息"""
+        key = (task_id, init_hash)
+        
+        if key not in self.rollout_stats:
+            self.rollout_stats[key] = []
+            self.rollout_skip_cnt[key] = 0
+        
+        # 添加新的成功记录
+        success_ints = [1 if s else 0 for s in successes]
+        self.rollout_stats[key].extend(success_ints)
+        
+        # 保持历史记录长度合理（最多保留100次）
+        if len(self.rollout_stats[key]) > 100:
+            self.rollout_stats[key] = self.rollout_stats[key][-100:]
+        
+        print(f"📊 更新统计 ({task_id}, {init_hash}): +{len(successes)} 次，"
+              f"总计 {len(self.rollout_stats[key])} 次，"
+              f"成功率 {np.mean(self.rollout_stats[key]):.2%}")
+    
+    def increment_skip_count(self, task_id: int, init_hash: str):
+        """增加跳过计数"""
+        key = (task_id, init_hash)
+        if key not in self.rollout_skip_cnt:
+            self.rollout_skip_cnt[key] = 0
+        
+        self.rollout_skip_cnt[key] += 1
+        
+        # 如果跳过次数过多，移除这个init（避免永久跳过）
+        if self.rollout_skip_cnt[key] > self.rollout_skip_threshold:
+            print(f"🗑️ 移除init ({task_id}, {init_hash}): 跳过次数超过阈值")
+            if key in self.rollout_stats:
+                del self.rollout_stats[key]
+            del self.rollout_skip_cnt[key]
+    
+    def _load_stats(self):
+        """加载统计数据"""
+        try:
+            with open(self.stats_path, 'r') as f:
+                data = json.load(f)
+                self.rollout_stats = data.get('rollout_stats', {})
+                self.rollout_skip_cnt = data.get('rollout_skip_cnt', {})
+                
+                # 转换字符串键为元组
+                new_stats = {}
+                new_skip_cnt = {}
+                for key, value in self.rollout_stats.items():
+                    if isinstance(key, str) and ',' in key:
+                        task_id, init_hash = key.strip('()').split(', ')
+                        new_key = (int(task_id), init_hash.strip("'\""))
+                        new_stats[new_key] = value
+                    else:
+                        new_stats[key] = value
+                
+                for key, value in self.rollout_skip_cnt.items():
+                    if isinstance(key, str) and ',' in key:
+                        task_id, init_hash = key.strip('()').split(', ')
+                        new_key = (int(task_id), init_hash.strip("'\""))
+                        new_skip_cnt[new_key] = value
+                    else:
+                        new_skip_cnt[key] = value
+                
+                self.rollout_stats = new_stats
+                self.rollout_skip_cnt = new_skip_cnt
+                
+                print(f"✅ 加载统计数据: {len(self.rollout_stats)} 个init")
+        except Exception as e:
+            print(f"⚠️ 加载统计数据失败: {e}")
+    
+    def save_stats(self):
+        """保存统计数据"""
+        if not self.stats_path:
+            return
+        
+        try:
+            # 确保目录存在
+            Path(self.stats_path).parent.mkdir(parents=True, exist_ok=True)
+            
+            # 转换元组键为字符串以便JSON序列化
+            serializable_stats = {}
+            serializable_skip_cnt = {}
+            
+            for key, value in self.rollout_stats.items():
+                str_key = str(key)
+                serializable_stats[str_key] = value
+            
+            for key, value in self.rollout_skip_cnt.items():
+                str_key = str(key)
+                serializable_skip_cnt[str_key] = value
+            
+            data = {
+                'rollout_stats': serializable_stats,
+                'rollout_skip_cnt': serializable_skip_cnt,
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            with open(self.stats_path, 'w') as f:
+                json.dump(data, f, indent=2)
+                
+            print(f"💾 统计数据已保存: {self.stats_path}")
+        except Exception as e:
+            print(f"❌ 保存统计数据失败: {e}")
 
 # 导入配置管理
 try:
@@ -223,20 +383,31 @@ def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool
     return episodes
 
 
-def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False):
+def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None):
     """
-    RIPT-VLA风格的rollout收集
-    直接调用runner，无中间层
+    RIPT-VLA风格的rollout收集（增强版：支持per-init跳过）
     """
     print(f"正在收集 {num_rollouts} 个rollouts...")
     
     try:
-        # 获取任务的初始状态
+        # 获取任务的初始状态和task_id
         task_id = 0  # 简化处理，使用第一个任务
         if hasattr(env_runner, 'benchmark'):
             all_init_states = env_runner.benchmark.get_task_init_states(task_id)
         else:
             all_init_states = None
+        
+        # 🔥 如果有统计跟踪器，先检查是否应该跳过这个任务
+        if stats_tracker and all_init_states is not None:
+            # 随机选择一个初始状态来检查（简化版，实际可以更精细）
+            sample_init_idx = np.random.randint(0, len(all_init_states))
+            sample_init_state = all_init_states[sample_init_idx]
+            init_hash = stats_tracker._compute_init_hash(task_id, sample_init_state)
+            
+            if stats_tracker.should_skip_init(task_id, init_hash, num_rollouts):
+                stats_tracker.increment_skip_count(task_id, init_hash)
+                print(f"🚫 跳过此次收集：init ({task_id}, {init_hash}) 最近全成功")
+                return []
         
         # 直接调用环境runner的方法
         rollout_generator = env_runner.run_policy_in_env(
@@ -254,11 +425,37 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                 'total_reward': total_reward,
                 **episode_data
             }
+            
+            # 🔥 添加init_hash信息（如果可用）
+            if 'init_hash' not in episode and stats_tracker:
+                # 尝试从episode_data中提取初始状态信息
+                if 'init_state' in episode_data:
+                    init_hash = stats_tracker._compute_init_hash(task_id, episode_data['init_state'])
+                    episode['computed_init_hash'] = init_hash
+            
             collected_rollouts.append(episode)
             rollout_count += 1
             
             if rollout_count >= num_rollouts:
                 break
+        
+        # 🔥 更新统计跟踪器
+        if stats_tracker and collected_rollouts:
+            # 提取成功率信息
+            successes = [ep.get('success', False) for ep in collected_rollouts]
+            
+            # 获取init_hash（使用episode中的或计算得到的）
+            init_hash = None
+            for ep in collected_rollouts:
+                if 'init_hash' in ep:
+                    init_hash = ep['init_hash']
+                    break
+                elif 'computed_init_hash' in ep:
+                    init_hash = ep['computed_init_hash']
+                    break
+            
+            if init_hash:
+                stats_tracker.update_stats(task_id, init_hash, successes)
         
         # 最小动态采样过滤：丢弃全0或全1批次
         filtered = _dynamic_filter_rollouts(collected_rollouts, enable_dynamic_sampling)
@@ -339,15 +536,133 @@ def compute_advantages_rloo(episodes: List[Dict], rloo_batch_size: int = None) -
     
     return advantage
 
-def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advantages, device):
+def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advantages, device, config=None):
     """
-    RIPT-VLA风格的策略更新
-    直接在主循环中处理，无复杂组件
+    RIPT-VLA风格的策略更新（支持梯度累积）
     """
     if not episodes or len(advantages) == 0:
         print("⚠️ 没有有效数据进行策略更新")
         return 0.0
     
+    # 检查是否需要梯度累积
+    gradient_accumulation_steps = 1
+    if config:
+        gradient_accumulation_steps = config.get('algo', {}).get('gradient_accumulation_steps', 1)
+    
+    if gradient_accumulation_steps > 1:
+        return update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps)
+    else:
+        return update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device)
+
+def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps):
+    """
+    梯度累积版本的策略更新（AMP增强 + 窗口级微批处理）
+    """
+    total_episodes = len(episodes)
+    
+    print(f"🔧 窗口级微批梯度累积:")
+    print(f"   总episodes: {total_episodes}")
+    print(f"   累积步数: {gradient_accumulation_steps}")
+    
+    policy.train()
+    
+    # 🔥 关键：使用AMP的GradScaler（新版本API）
+    try:
+        scaler = torch.amp.GradScaler('cuda')  # 新版本API
+    except AttributeError:
+        scaler = torch.cuda.amp.GradScaler()  # 旧版本兼容
+    
+    # 🔥 新版本：直接使用CFG adapter的窗口级微批处理
+    try:
+        avg_loss = cfg_adapter.compute_weighted_loss_microbatch(
+            episodes=episodes,
+            advantages=advantages,
+            device=device,
+            micro_batch_size=8,  # 控制显存峰值的关键参数
+            grad_accum_steps=gradient_accumulation_steps,
+            use_amp=True,
+            optimizer=optimizer,
+            scaler=scaler
+        )
+        
+        print(f"✓ 窗口级微批训练完成，平均损失: {avg_loss:.6f}")
+        return avg_loss.item() if hasattr(avg_loss, 'item') else float(avg_loss)
+        
+    except Exception as e:
+        print(f"❌ 窗口级微批处理失败: {e}")
+        print("🔄 回退到原有梯度累积方法...")
+        traceback.print_exc()
+        
+        # 回退到原有方法
+        return update_policy_with_gradient_accumulation_fallback(
+            policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler
+        )
+
+def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler):
+    """
+    回退版本的梯度累积（保持向后兼容）
+    """
+    total_episodes = len(episodes)
+    mini_batch_size = max(1, total_episodes // gradient_accumulation_steps)
+    
+    print(f"🔧 回退AMP梯度累积训练:")
+    print(f"   总episodes: {total_episodes}")
+    print(f"   累积步数: {gradient_accumulation_steps}")
+    print(f"   mini_batch大小: {mini_batch_size}")
+    
+    total_loss = 0.0
+    gradient_step = 0
+    
+    # 按mini_batch处理
+    for batch_start in range(0, total_episodes, mini_batch_size):
+        batch_end = min(batch_start + mini_batch_size, total_episodes)
+        
+        # 提取mini_batch
+        mini_episodes = episodes[batch_start:batch_end]
+        mini_advantages = advantages[batch_start:batch_end]
+        
+        try:
+            # 🔥 使用autocast包裹forward计算
+            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                mini_advantages = mini_advantages.to(device)
+                loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
+            
+            # 🔥 关键：损失归一化（除以累积步数）
+            normalized_loss = loss / gradient_accumulation_steps
+            
+            # 🔥 使用scaler进行反向传播（梯度累积）
+            scaler.scale(normalized_loss).backward()
+            
+            total_loss += loss.item()
+            gradient_step += 1
+            
+            print(f"  Mini-batch {gradient_step}/{gradient_accumulation_steps}: "
+                  f"loss={loss.item():.6f}, normalized={normalized_loss.item():.6f}")
+            
+            # 🔥 只有达到累积步数才更新参数
+            if gradient_step == gradient_accumulation_steps or batch_end == total_episodes:
+                # 🔥 AMP梯度更新流程
+                scaler.unscale_(optimizer)  # 取消缩放以进行梯度裁剪
+                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                
+                # 参数更新
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+                
+                print(f"  ✓ AMP参数更新完成 (梯度范数: {grad_norm:.6f})")
+                gradient_step = 0
+                
+        except Exception as e:
+            print(f"❌ Mini-batch处理失败: {e}")
+            continue
+    
+    avg_loss = total_loss / max(1, total_episodes // mini_batch_size)
+    print(f"✓ 回退AMP梯度累积训练完成，平均损失: {avg_loss:.6f}")
+    return avg_loss
+
+def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device):
+    """简单版本的策略更新（无梯度累积）"""
     print(f"正在更新策略（{len(episodes)} 个episodes）...")
     
     try:
@@ -426,6 +741,14 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     """
     print("🚀 开始RIPT-VLA风格的训练循环")
     
+    # 🔥 设置数值优化和显存管理
+    print("🔧 设置数值优化...")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+    torch.cuda.empty_cache()
+    print("✅ TF32和显存优化已启用")
+    
     # 设置输出目录
     output_dir = Path(config['output_dir'])
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -460,53 +783,116 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 创建环境runner
     env_runner = create_environment_runner(config, policy)
     
-    # 训练配置
-    num_train_steps = config['training']['num_train_steps']
-    # 与2_test_pi0_on_libero.py对齐：使用libero_goal基准默认task_id=1
-    # 若YAML中明确给了task_names_to_use，则仍然使用第一个名称做显示，不影响环境内部task_id选择
-    task_name = config['task'].get('task_names_to_use', ['libero_goal_default'])[0]
+    # 🔥 创建rollout统计跟踪器
+    stats_path = config['algo'].get('rollout_stats_path', './output/stage11_ript_vla/rollout_stats.json')
+    rollout_skip_threshold = config['algo'].get('rollout_skip_threshold', 3)
+    stats_tracker = RolloutStatsTracker(
+        rollout_skip_threshold=rollout_skip_threshold,
+        stats_path=stats_path
+    )
+    
+    # 🔥 解耦demo_batch_size与rloo_batch_size
+    demo_batch_size = config['algo'].get('demo_batch_size', 1)
     rloo_batch_size = config['algo']['rloo_batch_size']
+    num_train_steps = config['training']['num_train_steps']
+    task_name = config['task'].get('task_names_to_use', ['libero_goal_default'])[0]
+    
+    print(f"\n🔧 批次配置:")
+    print(f"  demo_batch_size: {demo_batch_size} (每步收集的组数)")
+    print(f"  rloo_batch_size: {rloo_batch_size} (每组内样本数)")
+    print(f"  有效批次大小: {demo_batch_size * rloo_batch_size}")
     
     print(f"\n开始训练循环:")
     print(f"  训练步数: {num_train_steps}")
     print(f"  任务: {task_name}")
-    print(f"  批次大小: {rloo_batch_size}")
     print()
     
     all_training_metrics = []
     
-    # 🔥 主训练循环 - RIPT-VLA风格
+    # 🔥 显存监控函数
+    def print_gpu_memory(step_name: str):
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated() / 1024**3
+            print(f"📊 {step_name} - GPU显存: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, 峰值: {max_allocated:.2f}GB")
+    
+    # 🔥 主训练循环 - 按组收集模式
     for step in range(num_train_steps):
         step_start_time = time.time()
+        torch.cuda.reset_peak_memory_stats()  # 重置峰值监控
         
         print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
+        print_gpu_memory("步骤开始")
         
-        # 1. 收集rollouts（直接调用，无中间层）
-        episodes = collect_rollouts_ript_vla_style(
-            env_runner, task_name, rloo_batch_size,
-            enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False)
-        )
+        # 1. 按组收集rollouts（解耦demo_batch_size与rloo_batch_size）
+        all_collected_episodes = []
+        successful_groups = 0
         
-        if not episodes:
+        for group_idx in range(demo_batch_size):
+            print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
+            
+            # 收集一组rollouts（传递统计跟踪器）
+            group_episodes = collect_rollouts_ript_vla_style(
+                env_runner, task_name, rloo_batch_size,
+                enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False),
+                stats_tracker=stats_tracker
+            )
+            
+            if group_episodes:
+                # 检查组级动态采样：全0或全1则丢弃
+                successes = [ep.get('success', False) for ep in group_episodes]
+                if len(successes) > 0 and (all(successes) or not any(successes)):
+                    print(f"⚠️ 组 {group_idx + 1} 被动态采样丢弃 (uniform successes: {all(successes)})")
+                else:
+                    all_collected_episodes.extend(group_episodes)
+                    successful_groups += 1
+                    
+                    # 🔥 提取并显示init_hash信息
+                    init_hashes = []
+                    for ep in group_episodes:
+                        if 'init_hash' in ep:
+                            init_hashes.append(ep['init_hash'][:8])  # 短哈希显示
+                        elif 'computed_init_hash' in ep:
+                            init_hashes.append(ep['computed_init_hash'][:8])
+                    
+                    unique_hashes = list(set(init_hashes))
+                    print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
+                          f"成功率 {np.mean(successes):.2%}，"
+                          f"init_hash: {unique_hashes}")
+            else:
+                print(f"❌ 组 {group_idx + 1} 收集失败")
+        
+        # 🔥 定期保存统计数据
+        if step % 5 == 0:  # 每5步保存一次
+            stats_tracker.save_stats()
+        
+        print(f"📊 组收集完成: {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
+        print_gpu_memory("收集完成")
+        
+        if not all_collected_episodes:
             print("⚠️ 未收集到有效episodes，跳过此步")
             continue
         
         # 2. 计算优势（正宗RLOO方法）
-        advantages = compute_advantages_rloo(episodes, rloo_batch_size=rloo_batch_size)
+        advantages = compute_advantages_rloo(all_collected_episodes, rloo_batch_size=rloo_batch_size)
+        print_gpu_memory("优势计算完成")
         
-        # 3. 更新策略（直接更新，无复杂组件）
+        # 3. 更新策略（带配置传递以支持梯度累积）
         loss = update_policy_ript_vla_style(
-            policy, optimizer, cfg_adapter, episodes, advantages, device
+            policy, optimizer, cfg_adapter, all_collected_episodes, advantages, device, config
         )
+        print_gpu_memory("策略更新完成")
         
         # 4. 记录指标
-        avg_reward = np.mean([ep['total_reward'] for ep in episodes])
-        success_rate = np.mean([ep['success'] for ep in episodes])
+        avg_reward = np.mean([ep['total_reward'] for ep in all_collected_episodes])
+        success_rate = np.mean([ep['success'] for ep in all_collected_episodes])
         step_time = time.time() - step_start_time
         
         step_metrics = {
             'step': step + 1,
-            'num_episodes': len(episodes),
+            'demo_groups': successful_groups,
+            'total_episodes': len(all_collected_episodes),
             'avg_reward': avg_reward,
             'success_rate': success_rate,
             'loss': loss,
@@ -516,11 +902,13 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         
         # 5. 输出结果
         print(f"✓ 步骤 {step + 1} 完成:")
-        print(f"  Episodes: {len(episodes)}")
+        print(f"  成功组数: {successful_groups}/{demo_batch_size}")
+        print(f"  总Episodes: {len(all_collected_episodes)}")
         print(f"  平均奖励: {avg_reward:.4f}")
         print(f"  成功率: {success_rate:.2%}")
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
+        print_gpu_memory("步骤结束")
         
         # 6. CFG评估（每10步进行一次）
         if (step + 1) % 10 == 0:
@@ -558,6 +946,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     'training_metrics': all_training_metrics,
                 }, checkpoint_path)
                 print(f"✓ 完整检查点已保存: {checkpoint_path}")
+    
+    # 🔥 保存最终统计数据
+    stats_tracker.save_stats()
+    print(f"📊 最终统计: {len(stats_tracker.rollout_stats)} 个不同的init状态")
     
     # 保存最终结果
     final_results_path = output_dir / "final_training_results.json"
