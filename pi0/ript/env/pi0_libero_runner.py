@@ -719,14 +719,30 @@ class LIBEROEnvRunner:
                         pi0_observation = self.construct_pi0_observation(obs, task_description)
                         
                         # 选择动作 - 使用配置的CFG参数
-                        # 优先读取policy.default_cfg_scale，其次读取runner.config.collection_cfg_scale，最后回退1.5
+                        # 调试配置传递过程
                         cfg_scale = None
+                        
+                        # 方法1: 从policy读取
                         if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
                             cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
-                        if cfg_scale is None:
-                            cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
+                            if cfg_scale is not None:
+                                print(f"🔍 CFG从policy读取: {cfg_scale}")
+                        
+                        # 方法2: 从config读取
+                        if cfg_scale is None and self.config is not None:
+                            # 尝试多个可能的路径
+                            cfg_scale = getattr(self.config, 'collection_cfg_scale', None)
+                            if cfg_scale is None and hasattr(self.config, 'algo'):
+                                cfg_scale = getattr(self.config.algo, 'collection_cfg_scale', None)
+                            if cfg_scale is not None:
+                                print(f"🔍 CFG从config读取: {cfg_scale}")
+                            else:
+                                print(f"🔍 Config调试: config={type(self.config)}, 属性={dir(self.config) if self.config else 'None'}")
+                        
+                        # 方法3: 最后回退
                         if cfg_scale is None:
                             cfg_scale = 1.5
+                            print(f"⚠️ CFG回退到默认值: {cfg_scale} (请在YAML中设置 algo.collection_cfg_scale)")
                         raw_action = self.policy.select_action(pi0_observation, cfg_scale=cfg_scale)
                         action = raw_action[0, :, :7]  # shape: (50, 7)
                         
@@ -1386,7 +1402,12 @@ class LIBEROEnvRunner:
         # 合并批量观测（如果可能）
         if len(batch_obs) == 1:
             # 单个观测直接推理 - 使用配置的CFG参数
-            cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+            cfg_scale = getattr(self.config, 'collection_cfg_scale', None)
+            if cfg_scale is None and self.config and hasattr(self.config, 'algo'):
+                cfg_scale = getattr(self.config.algo, 'collection_cfg_scale', None)
+            if cfg_scale is None:
+                print(f"⚠️ 未找到collection_cfg_scale配置，请在YAML中设置")
+                cfg_scale = 1.5  # 临时回退
             raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]  # (50, 7)
             
@@ -1407,7 +1428,8 @@ class LIBEROEnvRunner:
                 if cfg_scale is None:
                     cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
                 if cfg_scale is None:
-                    cfg_scale = 1.5
+                    print(f"⚠️ 批量推理未找到collection_cfg_scale配置")
+                    cfg_scale = 1.5  # 临时回退
                 
                 # 一次性批推理 - 这是核心优化点
                 raw_actions = self.policy.select_action(batch_observation, cfg_scale=cfg_scale)
@@ -1438,7 +1460,12 @@ class LIBEROEnvRunner:
             # 🔄 回退路径：循环推理（原有逻辑）
             batch_actions = []
             for pi0_obs in batch_obs:
-                cfg_scale = getattr(self.config, 'collection_cfg_scale', 1.5) if self.config else 1.5
+                cfg_scale = getattr(self.config, 'collection_cfg_scale', None)
+            if cfg_scale is None and self.config and hasattr(self.config, 'algo'):
+                cfg_scale = getattr(self.config.algo, 'collection_cfg_scale', None)
+            if cfg_scale is None:
+                print(f"⚠️ 未找到collection_cfg_scale配置，请在YAML中设置")
+                cfg_scale = 1.5  # 临时回退
                 raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
                 action = raw_action[0, :, :7]
                 
@@ -1515,7 +1542,8 @@ class LIBEROEnvRunner:
             if cfg_scale is None:
                 cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
             if cfg_scale is None:
-                cfg_scale = 1.5
+                print(f"⚠️ 回退推理未找到collection_cfg_scale配置")  
+                cfg_scale = 1.5  # 临时回退
             raw_action = self.policy.select_action(pi0_obs, cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]
             
