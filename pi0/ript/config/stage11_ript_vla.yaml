@@ -40,9 +40,9 @@ dataset:
   num_init_states: 1  # 🔥 与demo_batch_size对齐
   state_dim: 8  # 状态维度
   # 🔥 关键修复：关闭滑动窗口（防OOM）
-  windowing_mode: last      # 只用最后窗口，不再滑动
-  window_stride: 999        # 大步长确保不重叠
-  max_windows_per_episode: 1 # 每条轨迹最大窗口数=1
+  windowing_mode: slide      # 只用最后窗口，不再滑动
+  window_stride: 50        # 大步长确保不重叠
+  max_windows_per_episode: 3 # 每条轨迹最大窗口数=1
 
 # === 训练配置 ===
 training:
@@ -59,9 +59,9 @@ logging:
 features:
   use_ript_vla_runner: false  # 关闭RIPT-VLA runner，使用LIBEROEnvRunner
   enable_parallel_envs: true  # 开启并行环境（向量化）
-  enable_true_parallel_envs: false  # 🔥 关闭真正多进程并行（防止内存问题）
+  enable_true_parallel_envs: true  # 🔥 关闭真正多进程并行（防止内存问题）
   enable_smart_sampling: true      # Runner日志用的智能采样开关
-  use_parallel_init_state: true    # 🔥 开启：并行时调用set_init_state
+  use_parallel_init_state: false    # 🔥 开启：并行时调用set_init_state
   save_video: false               # 🔥 关闭视频保存（减少显存占用）
   
   # === 🔥 增强功能开关 ===
