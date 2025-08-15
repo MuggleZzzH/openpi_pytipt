@@ -64,17 +64,52 @@ class RolloutStatsTracker:
         print(f"  跳过阈值: {rollout_skip_threshold}")
         print(f"  统计路径: {stats_path}")
         print(f"  已有统计: {len(self.rollout_stats)} 个init")
+        print(f"  🎯 哈希计算已对齐RIPT原版（支持mask处理 + 64位哈希）")
     
     def _compute_init_hash(self, task_id: int, init_state_data: Any) -> str:
-        """计算初始状态的哈希值"""
-        if isinstance(init_state_data, torch.Tensor):
+        """
+        计算初始状态的哈希值 - 对齐RIPT原版
+        
+        支持两种格式：
+        1. RIPT原版格式: {'states': tensor, 'pad_mask': tensor}
+        2. PI0简化格式: 直接的tensor或numpy数组
+        """
+        
+        # 🔥 对齐RIPT原版：处理带mask的状态数据
+        if isinstance(init_state_data, dict) and 'states' in init_state_data and 'pad_mask' in init_state_data:
+            # RIPT原版格式处理
+            state_data = init_state_data['states']
+            
+            if isinstance(state_data, torch.Tensor) and state_data.dim() > 1:
+                state_data = state_data[0]  # 取第一个样本（对应bidx=0）
+            
+            # 🎯 关键对齐：应用padding mask
+            if 'pad_mask' in init_state_data:
+                state_mask = init_state_data['pad_mask']
+                if isinstance(state_mask, torch.Tensor) and state_mask.dim() > 1:
+                    state_mask = state_mask[0]  # 取第一个样本
+                
+                if isinstance(state_data, torch.Tensor):
+                    masked_data = state_data[state_mask]  # 只取有效部分
+                    data_bytes = masked_data.cpu().numpy().tobytes()
+                else:
+                    data_bytes = state_data.tobytes()
+            else:
+                if isinstance(state_data, torch.Tensor):
+                    data_bytes = state_data.cpu().numpy().tobytes()
+                else:
+                    data_bytes = state_data.tobytes()
+        
+        # PI0简化格式处理（向后兼容）
+        elif isinstance(init_state_data, torch.Tensor):
             data_bytes = init_state_data.cpu().numpy().tobytes()
         elif isinstance(init_state_data, np.ndarray):
             data_bytes = init_state_data.tobytes()
         else:
             data_bytes = str(init_state_data).encode()
         
-        return hashlib.sha256(data_bytes).hexdigest()[:16]  # 短哈希
+        # 🔧 使用完整哈希对齐RIPT原版（而不是短哈希）
+        return hashlib.sha256(data_bytes).hexdigest()  # 完整64位哈希
     
     def should_skip_init(self, task_id: int, init_hash: str, rloo_batch_size: int) -> bool:
         """
@@ -95,7 +130,7 @@ class RolloutStatsTracker:
         all_successful = all(s == 1 for s in recent_k)
         
         if all_successful:
-            print(f"🚫 跳过init ({task_id}, {init_hash}): 最近{rloo_batch_size}次全成功")
+            print(f"🚫 跳过init ({task_id}, {init_hash[:12]}...): 最近{rloo_batch_size}次全成功")
             return True
         
         return False
@@ -116,7 +151,7 @@ class RolloutStatsTracker:
         if len(self.rollout_stats[key]) > 100:
             self.rollout_stats[key] = self.rollout_stats[key][-100:]
         
-        print(f"📊 更新统计 ({task_id}, {init_hash}): +{len(successes)} 次，"
+        print(f"📊 更新统计 ({task_id}, {init_hash[:12]}...): +{len(successes)} 次，"
               f"总计 {len(self.rollout_stats[key])} 次，"
               f"成功率 {np.mean(self.rollout_stats[key]):.2%}")
     
@@ -130,7 +165,7 @@ class RolloutStatsTracker:
         
         # 如果跳过次数过多，移除这个init（避免永久跳过）
         if self.rollout_skip_cnt[key] > self.rollout_skip_threshold:
-            print(f"🗑️ 移除init ({task_id}, {init_hash}): 跳过次数超过阈值")
+            print(f"🗑️ 移除init ({task_id}, {init_hash[:12]}...): 跳过次数超过阈值")
             if key in self.rollout_stats:
                 del self.rollout_stats[key]
             del self.rollout_skip_cnt[key]
@@ -406,7 +441,7 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             
             if stats_tracker.should_skip_init(task_id, init_hash, num_rollouts):
                 stats_tracker.increment_skip_count(task_id, init_hash)
-                print(f"🚫 跳过此次收集：init ({task_id}, {init_hash}) 最近全成功")
+                print(f"🚫 跳过此次收集：init ({task_id}, {init_hash[:12]}...) 最近全成功")
                 return []
         
         # 直接调用环境runner的方法
@@ -857,9 +892,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     init_hashes = []
                     for ep in group_episodes:
                         if 'init_hash' in ep:
-                            init_hashes.append(ep['init_hash'][:8])  # 短哈希显示
+                            init_hashes.append(ep['init_hash'][:12] + "...")  # 显示前12位
                         elif 'computed_init_hash' in ep:
-                            init_hashes.append(ep['computed_init_hash'][:8])
+                            init_hashes.append(ep['computed_init_hash'][:12] + "...")
                     
                     unique_hashes = list(set(init_hashes))
                     print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
