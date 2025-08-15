@@ -117,6 +117,11 @@ class AdvantageProcessor:
         elif not isinstance(advantages, torch.Tensor):
             advantages = torch.tensor(advantages, dtype=torch.float32)
         
+        # 🔥 关键修复：确保数据类型为浮点型
+        if not advantages.is_floating_point():
+            warnings.warn(f"优势值数据类型为 {advantages.dtype}，自动转换为float32")
+            advantages = advantages.float()
+        
         # 输入验证
         if self.config.enable_validation:
             self._validate_input(advantages)
