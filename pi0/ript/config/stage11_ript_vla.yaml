@@ -21,7 +21,7 @@ algo:
   rloo_batch_size: 4   # 每组4个样本（从8降到4，减少显存压力）
   lr: 1e-5
   gradient_accumulation_steps: 16  # 🔥 提高梯度累积：保持有效batch size
-  collection_cfg_scale: 1.0        # 🔥 收集时关闭CFG（训练时再开启）
+  collection_cfg_scale: 1.25        # 🔥 收集时关闭CFG（训练时再开启）
   cfg_uncond_weight: 0.1           # 训练时无条件分支权重
   # RolloutGenerator配置
   rollout_skip_threshold: 3
@@ -42,7 +42,7 @@ dataset:
   # 🔥 关键修复：关闭滑动窗口（防OOM）
   windowing_mode: slide      # 只用最后窗口，不再滑动
   window_stride: 50        # 大步长确保不重叠
-  max_windows_per_episode: 3 # 每条轨迹最大窗口数=1
+  max_windows_per_episode: 2 # 每条轨迹最大窗口数=1
 
 # === 训练配置 ===
 training:
