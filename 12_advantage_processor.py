@@ -368,8 +368,12 @@ def test_real_world_scenario():
     
     print(f"原始优势值统计:")
     print(f"  数量: {len(raw_advantages)}")
-    print(f"  范围: [{torch.nanmin(advantages_tensor[~torch.isinf(advantages_tensor)]):.2f}, "
-          f"{torch.nanmax(advantages_tensor[~torch.isinf(advantages_tensor)]):.2f}]")
+    # 兼容性修复：替换torch.nanmin/nanmax
+    valid_values = advantages_tensor[~torch.isinf(advantages_tensor) & ~torch.isnan(advantages_tensor)]
+    if len(valid_values) > 0:
+        print(f"  范围: [{valid_values.min():.2f}, {valid_values.max():.2f}]")
+    else:
+        print(f"  范围: [无有效值]")
     print(f"  NaN数: {torch.isnan(advantages_tensor).sum()}")
     print(f"  Inf数: {torch.isinf(advantages_tensor).sum()}")
     
