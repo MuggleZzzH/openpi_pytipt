@@ -11,6 +11,9 @@ from pi0.modeling_pi0 import PI0Policy
 # Assuming the base interface is in a shared location
 from pi0.ript.algos.rl_optimizers.model_interface import RLModelInterface
 
+# 🔥 Phase 2: Import new SO100-style data processing classes
+from pi0.ript.data import SO100StyleProcessor, TrajectoryToSampleGenerator
+
 # 本地实现get_safe_dtype函数
 def get_safe_dtype(tensor):
     """Get safe dtype for tensor operations"""
@@ -29,36 +32,48 @@ class PI0_CFG_Adapter(RLModelInterface):
     for explicit log_prob calculations or a value network.
     """
 
-    def __init__(self, policy: PI0Policy, norm_stats_path: Optional[str] = None, 
-                 windowing_mode: str = 'last', window_stride: int = 10, 
-                 max_windows_per_episode: int = 1, **kwargs):
+    def __init__(self, policy: PI0Policy, norm_stats_path: Optional[str] = None,
+                 windowing_mode: str = 'last', window_stride: int = 10,
+                 max_windows_per_episode: int = 1,
+                 use_so100_processing: bool = False, **kwargs):
         """
         Initialize the adapter with a PI0Policy instance.
         Args:
             policy: An instance of PI0Policy.
-            norm_stats_path: Path to norm_stats.json file for normalization. 
+            norm_stats_path: Path to norm_stats.json file for normalization.
                            If None, will try to find it automatically.
             windowing_mode: Windowing strategy - 'last'|'random'|'slide' (default: 'last' for compatibility)
             window_stride: Stride for sliding window mode (default: 10)
             max_windows_per_episode: Maximum windows per episode (default: 1)
+            use_so100_processing: Whether to use SO100-style sample processing (Phase 2 feature)
         """
         # The base model is the PI0Policy itself.
         super().__init__(model=policy, **kwargs)
         self.policy = policy
-        
-        # 🔥 新增：窗口化采样配置
+
+        # 🔥 Phase 2: Processing method configuration
+        self.use_so100_processing = use_so100_processing
+
+        # 🔥 Legacy: 窗口化采样配置 (kept for backward compatibility)
         self.windowing_mode = windowing_mode
         self.window_stride = window_stride
         self.max_windows_per_episode = max_windows_per_episode
-        
-        print(f"🔧 CFG窗口化配置: mode={windowing_mode}, stride={window_stride}, max_windows={max_windows_per_episode}")
-        
+
+        if use_so100_processing:
+            print(f"🚀 Using SO100-style sample processing (Phase 2)")
+        else:
+            print(f"🔧 Using legacy windowing: mode={windowing_mode}, stride={window_stride}, max_windows={max_windows_per_episode}")
+
         # 视频收集相关
         self.video_frames = {}  # {episode_idx: [frames]}
         self.video_save_enabled = True
-        
+
         # 加载归一化统计信息
         self._load_norm_stats(norm_stats_path)
+
+        # 🔥 Phase 2: Initialize SO100-style processors if enabled
+        if self.use_so100_processing:
+            self._initialize_so100_processors()
         
     def _load_norm_stats(self, norm_stats_path: Optional[str] = None):
         """Load normalization statistics from norm_stats.json"""
@@ -98,6 +113,218 @@ class PI0_CFG_Adapter(RLModelInterface):
             self.state_std = np.ones(8, dtype=np.float32)
             self.action_mean = np.zeros(7, dtype=np.float32)
             self.action_std = np.ones(7, dtype=np.float32)
+
+    def _initialize_so100_processors(self):
+        """
+        Initialize SO100-style data processors with current normalization configuration.
+
+        This method sets up the SO100StyleProcessor and TrajectoryToSampleGenerator
+        using the same normalization statistics as the legacy windowing approach.
+        """
+        print("🔄 Initializing SO100-style data processors...")
+
+        # Create configuration for SO100 processors
+        so100_config = {
+            'action_chunk_size': getattr(self.policy.config, 'n_action_steps', 50),
+            'norm_stats_path': None,  # We'll use the already loaded stats
+            'state_mean': self.state_mean,
+            'state_std': self.state_std,
+            'action_mean': self.action_mean,
+            'action_std': self.action_std
+        }
+
+        # Initialize processors
+        self.so100_processor = SO100StyleProcessor(so100_config)
+        self.sample_generator = TrajectoryToSampleGenerator(self.so100_processor)
+
+        print(f"✅ SO100 processors initialized:")
+        print(f"  - Action chunk size: {so100_config['action_chunk_size']}")
+        print(f"  - State normalization: mean={self.state_mean.shape}, std={self.state_std.shape}")
+        print(f"  - Action normalization: mean={self.action_mean.shape}, std={self.action_std.shape}")
+
+    def process_episodes_to_samples_so100(
+        self,
+        episodes: List[Dict[str, Any]],
+        device: Optional[torch.device] = None,
+    ) -> Tuple[Dict[str, Any], Dict[int, List[int]]]:
+        """
+        🔥 Phase 2: Process episodes using SO100-style sample generation.
+
+        This method replaces the windowing approach with SO100-style processing:
+        - Each trajectory of length L generates L-50+1 training samples
+        - Each sample contains obs[t] → action[t:t+50] (relative actions)
+        - Maintains episode-to-sample mapping for advantage computation
+
+        Args:
+            episodes: List of episode dictionaries
+            device: Target device for tensors
+
+        Returns:
+            Tuple of:
+                - batch: Training batch in OpenPI format
+                - episode_to_samples_map: Mapping from episode indices to sample indices
+        """
+        if not self.use_so100_processing:
+            raise ValueError("SO100 processing not enabled. Set use_so100_processing=True in constructor.")
+
+        if device is None:
+            device = next(self.policy.parameters()).device
+
+        print(f"🚀 Processing {len(episodes)} episodes with SO100-style sampling...")
+
+        # Convert episodes to the format expected by SO100 processors
+        formatted_episodes = []
+        for i, ep in enumerate(episodes):
+            # Convert episode to SO100 format
+            formatted_episode = self._convert_episode_to_so100_format(ep, i)
+            formatted_episodes.append(formatted_episode)
+
+        # Use SO100 processors to generate training batch
+        training_batch, episode_to_samples_map = self.sample_generator.process_episodes_to_training_batch(
+            formatted_episodes, device
+        )
+
+        # Add additional fields expected by CFG training
+        training_batch['owner_indices'] = self._create_owner_indices(episode_to_samples_map)
+
+        print(f"✅ SO100 processing complete:")
+        print(f"  - Episodes: {len(episodes)}")
+        print(f"  - Training samples: {training_batch['batch_size']}")
+        print(f"  - Data utilization: {training_batch['batch_size'] / len(episodes):.1f}x")
+
+        return training_batch, episode_to_samples_map
+
+    def _convert_episode_to_so100_format(self, episode: Dict[str, Any], episode_idx: int) -> Dict[str, Any]:
+        """
+        Convert an episode from the current format to SO100 processor format.
+
+        Args:
+            episode: Episode dictionary from current system
+            episode_idx: Episode index for identification
+
+        Returns:
+            Episode in SO100 processor format
+        """
+        # Extract episode data
+        observations = episode.get('observations', [])
+        actions = episode.get('actions', [])
+
+        # Process observations and extract states
+        processed_observations = []
+        states = []
+
+        for obs in observations:
+            # Process observation to match 2_pi0_on_libero.py format
+            processed_obs, unnorm_state = self._extract_state_from_obs(obs, episode_idx, 0)
+            processed_observations.append(processed_obs)
+            states.append(unnorm_state)
+
+        # Create SO100 format episode
+        so100_episode = {
+            'id': f"episode_{episode_idx}",
+            'processed_observations': processed_observations,
+            'actions': actions,
+            'states': states,
+            'total_reward': episode.get('total_reward', 0.0)
+        }
+
+        return so100_episode
+
+    def _create_owner_indices(self, episode_to_samples_map: Dict[int, List[int]]) -> List[int]:
+        """
+        Create owner indices array for tracking which samples belong to which episodes.
+
+        Args:
+            episode_to_samples_map: Mapping from episode indices to sample indices
+
+        Returns:
+            List where owner_indices[sample_idx] = episode_idx
+        """
+        # Find total number of samples
+        total_samples = 0
+        for sample_indices in episode_to_samples_map.values():
+            total_samples = max(total_samples, max(sample_indices) + 1 if sample_indices else 0)
+
+        # Create owner indices array
+        owner_indices = [-1] * total_samples  # Initialize with -1 (invalid)
+
+        for episode_idx, sample_indices in episode_to_samples_map.items():
+            for sample_idx in sample_indices:
+                owner_indices[sample_idx] = episode_idx
+
+        return owner_indices
+
+    def map_episode_advantages_to_samples_so100(
+        self,
+        episode_advantages: torch.Tensor,
+        episode_to_samples_map: Dict[int, List[int]]
+    ) -> torch.Tensor:
+        """
+        🔥 Phase 2: Map episode-level RLOO advantages to sample-level advantages.
+
+        This is critical for RIPT integration: episode-level RLOO advantages are computed
+        correctly using RIPT mathematics, then propagated to all samples from that episode.
+
+        Args:
+            episode_advantages: Tensor of shape (num_episodes,) with RLOO advantages
+            episode_to_samples_map: Mapping from episode indices to sample indices
+
+        Returns:
+            sample_advantages: Tensor of shape (num_samples,) with advantages for each sample
+        """
+        if not self.use_so100_processing:
+            raise ValueError("SO100 processing not enabled.")
+
+        print(f"🔄 Mapping {len(episode_advantages)} episode advantages to sample level...")
+
+        # Use the sample generator's mapping method
+        sample_advantages = self.sample_generator.map_episode_advantages_to_samples(
+            episode_advantages, episode_to_samples_map
+        )
+
+        # Validate mapping consistency
+        is_valid = self.sample_generator.validate_episode_to_sample_mapping(
+            episode_advantages, episode_to_samples_map, len(sample_advantages)
+        )
+
+        if not is_valid:
+            raise ValueError("Episode-to-sample advantage mapping validation failed")
+
+        print(f"✅ Advantage mapping complete:")
+        print(f"  - Episode advantages: {len(episode_advantages)}")
+        print(f"  - Sample advantages: {len(sample_advantages)}")
+        print(f"  - Positive samples: {(sample_advantages > 0).sum().item()}")
+        print(f"  - Negative samples: {(sample_advantages <= 0).sum().item()}")
+
+        return sample_advantages
+
+    def process_episodes(
+        self,
+        episodes: List[Dict[str, Any]],
+        device: Optional[torch.device] = None,
+    ) -> Tuple[Dict[str, Any], List[int]]:
+        """
+        🔥 Phase 2: Unified episode processing method.
+
+        Routes to either SO100-style processing or legacy windowing based on configuration.
+
+        Args:
+            episodes: List of episode dictionaries
+            device: Target device for tensors
+
+        Returns:
+            Tuple of:
+                - batch: Training batch
+                - owner_indices: List mapping batch indices to episode indices
+        """
+        if self.use_so100_processing:
+            # Use SO100-style processing
+            batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
+            owner_indices = batch['owner_indices']
+            return batch, owner_indices
+        else:
+            # Use legacy windowing processing
+            return self._extract_microbatch_data(episodes, device)
     
     def normalize_state(self, state: np.ndarray) -> np.ndarray:
         """Normalize state using loaded statistics"""
@@ -388,8 +615,30 @@ class PI0_CFG_Adapter(RLModelInterface):
         assert advantages.dim() == 1, f"advantages必须是1维tensor，当前维度: {advantages.dim()}"
         assert isinstance(advantages, torch.Tensor), f"advantages必须是torch.Tensor类型，当前类型: {type(advantages)}"
 
-        # 🔥 窗口化批次处理：现在返回(batch, owner_indices)
-        batch, owner_indices = self.process_episodes(episodes, device)
+        # 🔥 Phase 2: Choose processing method based on configuration
+        if self.use_so100_processing:
+            print("🚀 Using SO100-style sample processing...")
+            batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
+
+            # Map episode advantages to sample advantages
+            sample_advantages = self.map_episode_advantages_to_samples_so100(advantages, episode_to_samples_map)
+
+            # Create owner indices for compatibility
+            owner_indices = batch['owner_indices']
+
+            # Use sample advantages instead of episode advantages
+            window_advantages = sample_advantages
+
+        else:
+            print("🔧 Using legacy windowing processing...")
+            # 🔥 Legacy: 窗口化批次处理
+            batch, owner_indices = self.process_episodes(episodes, device)
+
+            # 🔥 优势映射和归一化处理 (legacy approach)
+            B = batch["state"].shape[0]
+            window_advantages = torch.zeros(B, device=device, dtype=advantages.dtype)
+            for window_idx, episode_idx in enumerate(owner_indices):
+                window_advantages[window_idx] = advantages[episode_idx]
         
         # === 窗口化批次验证 ===
         assert "action_is_pad" in batch, "batch中必须包含action_is_pad字段"
@@ -397,8 +646,13 @@ class PI0_CFG_Adapter(RLModelInterface):
         assert action_is_pad.dtype == torch.bool, f"action_is_pad必须是bool类型，当前类型: {action_is_pad.dtype}"
         assert action_is_pad.dim() == 2, f"action_is_pad必须是2维tensor (B,T)，当前维度: {action_is_pad.dim()}"
         
-        B = batch["state"].shape[0]  # 现在B=窗口数量
-        assert len(owner_indices) == B, f"owner_indices长度({len(owner_indices)})必须与窗口数量({B})匹配"
+        # Get batch size (works for both processing methods)
+        if self.use_so100_processing:
+            B = batch["batch_size"]  # SO100 processing provides batch_size directly
+        else:
+            B = batch["state"].shape[0]  # Legacy windowing uses tensor shape
+
+        assert len(owner_indices) == B, f"owner_indices长度({len(owner_indices)})必须与批次大小({B})匹配"
         
         # 验证至少有一个有效步
         valid_steps = (~action_is_pad).sum()
@@ -412,10 +666,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         noise = torch.randn(B, n, d, device=device, dtype=dtype)
         time = self.policy.model.sample_time(B, device).to(dtype)
         
-        # 🔥 优势映射和归一化处理
-        window_advantages = torch.zeros(B, device=device, dtype=advantages.dtype)
-        for window_idx, episode_idx in enumerate(owner_indices):
-            window_advantages[window_idx] = advantages[episode_idx]
+        # Advantage mapping is now handled above based on processing method
         
         # 🔥 二值优势：简单判断正负（按用户要求保持二值化）
         w_pos = (window_advantages > 0).float()
@@ -423,11 +674,12 @@ class PI0_CFG_Adapter(RLModelInterface):
         # 记录正优势窗口占比
         positive_ratio = w_pos.mean()
         
-        print(f"🔧 优势映射: {len(episodes)} episodes → {B} windows")
+        processing_type = "samples" if self.use_so100_processing else "windows"
+        print(f"🔧 优势映射: {len(episodes)} episodes → {B} {processing_type}")
         print(f"   episode优势: {advantages.shape} = {advantages[:3].tolist()[:3]}...")
-        print(f"   窗口优势: {window_advantages.shape} = {window_advantages[:3].tolist()[:3]}...")
+        print(f"   {processing_type}优势: {window_advantages.shape} = {window_advantages[:3].tolist()[:3]}...")
         print(f"   二值优势: {w_pos[:3].tolist()[:3]}...")
-        print(f"   正优势窗口占比: {positive_ratio:.2%}")
+        print(f"   正优势{processing_type}占比: {positive_ratio:.2%}")
         
         # === CFG风格双分支损失计算 ===
         
