@@ -126,7 +126,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         # Create configuration for SO100 processors
         so100_config = {
             'action_chunk_size': getattr(self.policy.config, 'n_action_steps', 50),
-            'norm_stats_path': None,  # We'll use the already loaded stats
+            'norm_stats_path': "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch/norm_stats.json",  # 给真实路径
             'state_mean': self.state_mean,
             'state_std': self.state_std,
             'action_mean': self.action_mean,
