@@ -120,7 +120,14 @@ class SO100StyleProcessor:
             
             # Key: Compute relative actions (so100_train.py line 65)
             # action = action - state
-            relative_actions = action_chunk - current_state[None, :]  # Broadcasting
+            # 注意：如果状态维度(8) > 动作维度(7)，只使用前7维状态
+            if current_state.shape[0] > action_chunk.shape[1]:
+                # 状态维度 > 动作维度，只使用前action_dim维状态
+                state_for_action = current_state[:action_chunk.shape[1]]
+                relative_actions = action_chunk - state_for_action[None, :]  # Broadcasting
+            else:
+                # 状态维度 <= 动作维度，直接计算
+                relative_actions = action_chunk - current_state[None, :]  # Broadcasting
             
             # Create padding mask (all False for full-length chunks)
             action_is_pad = np.zeros(self.action_chunk_size, dtype=bool)
@@ -159,7 +166,7 @@ class SO100StyleProcessor:
                 "base_0_rgb": obs['image']['base_0_rgb'],
                 "left_wrist_0_rgb": obs['image']['left_wrist_0_rgb']
             },
-            "state": obs['state'],
+            "state": torch.from_numpy(obs['state']).float(),  # 确保state也是tensor
             "action": torch.from_numpy(sample['action']).float(),
             "action_is_pad": torch.from_numpy(sample['action_is_pad']),
             "prompt": obs.get('prompt', [''])

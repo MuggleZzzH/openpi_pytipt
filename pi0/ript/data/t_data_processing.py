@@ -16,9 +16,12 @@ import json
 from pathlib import Path
 from typing import Dict, List, Any
 
-from so100_style_processor import SO100StyleProcessor
-from sample_generator import TrajectoryToSampleGenerator
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))))
 
+from pi0.ript.data.so100_style_processor import SO100StyleProcessor
+from pi0.ript.data.sample_generator import TrajectoryToSampleGenerator
 
 def create_mock_config() -> Dict[str, Any]:
     """Create a mock configuration for testing."""
@@ -102,9 +105,16 @@ def test_so100_style_processor():
             assert processor.validate_sample_format(sample), "Sample format validation failed"
             
             # Check relative action computation
-            original_action = trajectory['actions'][0]
-            current_state = trajectory['states'][0]
-            expected_relative = original_action - current_state
+            original_action = trajectory['actions'][0]  # shape: (7,)
+            current_state = trajectory['states'][0]    # shape: (8,)
+            
+            # 使用和SO100处理器相同的逻辑：只取前7维状态
+            if current_state.shape[0] > original_action.shape[0]:
+                state_for_action = current_state[:original_action.shape[0]]  # 取前7维
+                expected_relative = original_action - state_for_action
+            else:
+                expected_relative = original_action - current_state
+            
             actual_relative = sample['action'][0]  # First action in chunk
             
             np.testing.assert_allclose(expected_relative, actual_relative, rtol=1e-5)
