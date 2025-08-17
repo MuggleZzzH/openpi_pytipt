@@ -20,9 +20,7 @@ from lerobot.configs.policies import PreTrainedConfig
 
 # 我们的组件导入
 from utils.openpi_ript_dataset_wrapper import create_openpi_ript_dataset
-from utils.state_dimension_adapter import create_pi0_state_adapter
 from ript.collectors.openpi_rollout_collector import create_openpi_rollout_collector
-from ript.utils.advantage_processor import create_advantage_processor
 from pi0.ript.algos.rl_optimizers.pi0_cfg_interface import PI0_CFG_Adapter
 
 # 现有RIPT组件导入
@@ -53,7 +51,6 @@ class TrainingConfig:
     dataset_id: str = "ZibinDong/so100_grab_screwdriver"
     action_chunk_size: int = 50
     image_size: Tuple[int, int] = (224, 224)
-    target_state_dim: int = 14
     
     # RIPT配置
     rloo_batch_size: int = 8
@@ -63,11 +60,8 @@ class TrainingConfig:
     rollout_goal_per_step: int = 100
     rollout_skip_threshold: int = 3
     
-    # 优势处理配置
-    advantage_normalization: str = "standard"
-    advantage_clipping: str = "symmetric"
-    advantage_clip_value: float = 3.0
-    advantage_negative_handling: str = "softplus"
+    # 优势处理配置（简化）
+    # 优势值将直接二值化，无需复杂处理
     
     # CFG配置
     cfg_alpha: float = 0.1
@@ -120,7 +114,6 @@ class OpenPIRiptTrainer:
         self.optimizer = None
         self.cfg_adapter = None
         self.rollout_collector = None
-        self.advantage_processor = None
         self.env_runner = None
         self.stats_tracker = None
         self.dataset = None
@@ -154,10 +147,7 @@ class OpenPIRiptTrainer:
         # 5. 初始化环境组件
         self._setup_environment_components()
         
-        # 6. 初始化优势处理器
-        self._setup_advantage_processor()
-        
-        # 7. 初始化统计跟踪器
+        # 6. 初始化统计跟踪器
         self._setup_stats_tracker()
         
         print("✅ 所有组件设置完成")
@@ -234,7 +224,6 @@ class OpenPIRiptTrainer:
                 repo_id=self.config.dataset_id,
                 enable_ript=True,
                 action_chunk_size=self.config.action_chunk_size,
-                target_state_dim=self.config.target_state_dim,
                 image_size=self.config.image_size
             )
             
@@ -266,7 +255,6 @@ class OpenPIRiptTrainer:
                 'enable_dynamic_sampling': self.config.enable_dynamic_sampling,
                 'enable_state_skipping': self.config.enable_state_skipping,
                 'image_size': self.config.image_size,
-                'target_state_dim': self.config.target_state_dim,
                 'action_dim': 7,  # 标准机器人动作维度
                 'rollout_skip_threshold': self.config.rollout_skip_threshold,
                 'rollout_stats_path': str(self.run_dir / 'rollout_stats.json'),
@@ -285,22 +273,7 @@ class OpenPIRiptTrainer:
             print(f"   ❌ 环境组件设置失败: {e}")
             traceback.print_exc()
     
-    def _setup_advantage_processor(self):
-        """初始化优势值处理器"""
-        try:
-            self.advantage_processor = create_advantage_processor(
-                normalization=self.config.advantage_normalization,
-                clipping=self.config.advantage_clipping,
-                clip_value=self.config.advantage_clip_value,
-                negative_handling=self.config.advantage_negative_handling,
-                verbose=self.config.verbose
-            )
-            
-            print(f"   ✅ 优势处理器创建完成")
-            
-        except Exception as e:
-            print(f"   ❌ 优势处理器设置失败: {e}")
-            raise
+
     
     def _setup_stats_tracker(self):
         """初始化统计跟踪器"""
@@ -352,11 +325,8 @@ class OpenPIRiptTrainer:
             rewards = [sample.get("rollout_reward", np.random.random()) for sample in openpi_samples]
             advantages = self._compute_rloo_advantages(rewards)
             
-            # 3. 使用优势处理器处理优势值
-            processed_advantages = self.advantage_processor.process_advantages(
-                advantages,
-                batch_info={"step": self.current_step}
-            )
+            # 3. 简单的优势值处理（最终会二值化，无需复杂处理）
+            processed_advantages = advantages
             
             # 4. 更新样本的优势值
             for i, sample in enumerate(openpi_samples):
@@ -390,7 +360,7 @@ class OpenPIRiptTrainer:
                     "base_0_rgb": torch.randint(0, 255, self.config.image_size + (3,), dtype=torch.uint8),
                     "left_wrist_0_rgb": torch.randint(0, 255, self.config.image_size + (3,), dtype=torch.uint8)
                 },
-                "state": torch.randn(self.config.target_state_dim),
+                "state": torch.randn(14),  # 假设标准14维状态
                 "action": torch.randn(self.config.action_chunk_size, 7),
                 "action_is_pad": torch.zeros(self.config.action_chunk_size, dtype=torch.bool),
                 "prompt": f"mock_task_{i}",
@@ -634,7 +604,7 @@ class OpenPIRiptTrainer:
                 'optimizer_state_dict': self.optimizer.state_dict(),
                 'config': self.config,
                 'training_metrics': self.training_metrics,
-                'advantage_processor_stats': self.advantage_processor.get_processing_stats(),
+
             }
             
             if self.rollout_collector:
@@ -662,7 +632,6 @@ class OpenPIRiptTrainer:
                 },
                 'final_metrics': self.training_metrics[-10:] if self.training_metrics else [],
                 'component_stats': {
-                    'advantage_processor': self.advantage_processor.get_processing_stats(),
                 },
                 'summary': {
                     'total_steps': len(self.training_metrics),
@@ -702,8 +671,6 @@ class OpenPIRiptTrainer:
         
         # 优势值统计
         print(f"\n📈 组件统计:")
-        self.advantage_processor.print_stats()
-        
         if self.rollout_collector:
             self.rollout_collector.print_stats()
 
