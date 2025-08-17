@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 # 导入现有的RIPT组件
 try:
-    from ..env.pi0_libero_runner import LIBEROEnvRunner
+    from env.pi0_libero_runner import LIBEROEnvRunner
     from ..utils.rollout_stats_tracker import RolloutStatsTracker
     from ..reward_function import BinarySuccessReward
     RIPT_COMPONENTS_AVAILABLE = True

@@ -472,8 +472,8 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             rollout_count += 1
             
             if rollout_count >= num_rollouts:
-                break
-        
+                    break
+            
         # 🔥 更新统计跟踪器
         if stats_tracker and collected_rollouts:
             # 提取成功率信息
@@ -487,8 +487,8 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                     break
                 elif 'computed_init_hash' in ep:
                     init_hash = ep['computed_init_hash']
-                    break
-            
+                break
+        
             if init_hash:
                 stats_tracker.update_stats(task_id, init_hash, successes)
         
@@ -610,7 +610,7 @@ def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, epi
     # 🔥 新版本：直接使用CFG adapter的窗口级微批处理
     try:
         avg_loss = cfg_adapter.compute_weighted_loss_microbatch(
-            episodes=episodes,
+        episodes=episodes,
             advantages=advantages,
             device=device,
             micro_batch_size=8,  # 控制显存峰值的关键参数
@@ -958,7 +958,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")
                 # 可选：动态调整收集时使用的CFG强度
-                env_runner.config.collection_cfg_scale = best_cfg
+                    env_runner.config.collection_cfg_scale = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
         
