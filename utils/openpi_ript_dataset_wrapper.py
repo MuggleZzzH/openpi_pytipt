@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional, Union
 from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 from torchvision.transforms.v2 import Resize
 from utils.normalizers import Normalizer
-from utils.state_dimension_adapter import StateDimensionAdapter, StateDimensionConfig, create_pi0_state_adapter
+
 
 
 class OpenPIRiptDatasetWrapper(Dataset):
@@ -22,7 +22,7 @@ class OpenPIRiptDatasetWrapper(Dataset):
     - 保持OpenPI标准数据格式
     - 支持可选RIPT字段（advantages, init_hash）
     - 向后兼容现有数据集
-    - 支持状态维度自动对齐
+
     """
     
     def __init__(
@@ -31,7 +31,6 @@ class OpenPIRiptDatasetWrapper(Dataset):
         image_size: int = 224,
         action_chunk_size: int = 50,
         fps: float = 30.0,
-        target_state_dim: Optional[int] = None,
         enable_ript_fields: bool = False,
         default_advantages: Optional[torch.Tensor] = None,
         **dataset_kwargs
@@ -42,7 +41,6 @@ class OpenPIRiptDatasetWrapper(Dataset):
             image_size: 图像缩放尺寸
             action_chunk_size: 动作chunk长度
             fps: 帧率，用于计算时间戳
-            target_state_dim: 目标状态维度，用于维度对齐
             enable_ript_fields: 是否启用RIPT字段
             default_advantages: 默认优势值
             **dataset_kwargs: 传递给LeRobotDataset的额外参数
@@ -52,17 +50,7 @@ class OpenPIRiptDatasetWrapper(Dataset):
         self.image_size = image_size
         self.action_chunk_size = action_chunk_size
         self.fps = fps
-        self.target_state_dim = target_state_dim
         self.enable_ript_fields = enable_ript_fields
-        
-        # 初始化状态维度适配器
-        self.state_adapter = None
-        if target_state_dim is not None:
-            self.state_adapter = create_pi0_state_adapter(
-                target_state_dim=target_state_dim,
-                padding_mode="zero",
-                truncation_mode="first"
-            )
         
         # 设置图像变换
         self.image_transforms = Resize((image_size, image_size))
@@ -138,10 +126,8 @@ class OpenPIRiptDatasetWrapper(Dataset):
             base_image = (normalized_item["observation.images.base"] * 255).to(torch.uint8)
             wrist_image = (normalized_item["observation.images.wrist"] * 255).to(torch.uint8)
             
-            # 5. 处理状态维度对齐
+            # 5. 获取当前状态
             current_state = normalized_item["observation.state"][0]  # 取当前时刻
-            if self.state_adapter is not None:
-                current_state = self.state_adapter.align_state_dimension(current_state, batch_idx=idx)
             
             # 6. 构造OpenPI标准格式
             sample = {
@@ -170,24 +156,7 @@ class OpenPIRiptDatasetWrapper(Dataset):
             # 返回一个安全的默认样本
             return self._create_fallback_sample()
     
-    def get_state_adapter_stats(self) -> Dict[str, Any]:
-        """
-        获取状态适配器统计信息
-        
-        Returns:
-            状态适配器的转换统计
-        """
-        if self.state_adapter is not None:
-            return self.state_adapter.get_conversion_stats()
-        else:
-            return {"message": "状态适配器未启用"}
-    
-    def print_state_adapter_stats(self):
-        """打印状态适配器统计信息"""
-        if self.state_adapter is not None:
-            self.state_adapter.print_stats()
-        else:
-            print("状态适配器未启用")
+
     
     def _compute_init_hash(self, state: torch.Tensor) -> str:
         """
@@ -215,11 +184,8 @@ class OpenPIRiptDatasetWrapper(Dataset):
         default_image = torch.zeros(3, self.image_size, self.image_size, dtype=torch.uint8)
         
         # 创建默认状态并应用状态适配器
-        fallback_state_dim = self.target_state_dim or 9
+        fallback_state_dim = 14  # 标准维度
         default_state = torch.zeros(fallback_state_dim)
-        if self.state_adapter is not None:
-            # 状态适配器已启用，确保维度正确
-            default_state = self.state_adapter.align_state_dimension(default_state)
         
         default_action = torch.zeros(self.action_chunk_size, 7)  # 假设7维动作
         default_padding = torch.zeros(self.action_chunk_size, dtype=torch.bool)

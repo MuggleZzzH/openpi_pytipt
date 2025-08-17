@@ -8,21 +8,8 @@ from pathlib import Path
 from pi0.modeling_pi0 import PI0Policy
 
 # 导入安全拷贝工具
-try:
-    from ....ript.utils.safe_batch_copy import SafeBatchCopier, create_cfg_safe_copier
-    SAFE_COPY_AVAILABLE = True
-except ImportError:
-    try:
-        # 备用导入路径
-        import sys
-        import os
-        sys.path.append(os.path.join(os.path.dirname(__file__), "../../../.."))
-        from ript.utils.safe_batch_copy import SafeBatchCopier, create_cfg_safe_copier
-        SAFE_COPY_AVAILABLE = True
-    except ImportError:
-        print("⚠️ 安全拷贝模块不可用，将使用深拷贝作为后备")
-        import copy
-        SAFE_COPY_AVAILABLE = False
+# 简化导入，不再需要复杂的安全拷贝
+import copy
 # from lerobot.common.utils.utils import get_safe_dtype  # 暂时注释掉，使用本地实现
 
 # Assuming the base interface is in a shared location
@@ -77,8 +64,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         # 加载归一化统计信息
         self._load_norm_stats(norm_stats_path)
         
-        # 初始化安全拷贝器
-        self._init_safe_copier()
+
         
     def _load_norm_stats(self, norm_stats_path: Optional[str] = None):
         """Load normalization statistics from norm_stats.json"""
@@ -127,26 +113,10 @@ class PI0_CFG_Adapter(RLModelInterface):
         """Denormalize action using loaded statistics"""
         return action * (self.action_std + 1e-6) + self.action_mean
     
-    def _init_safe_copier(self):
-        """初始化安全拷贝器"""
-        if SAFE_COPY_AVAILABLE:
-            self.safe_copier = create_cfg_safe_copier(
-                verify_copies=False,  # 生产环境关闭验证以提高性能
-                track_performance=False,
-                verbose=False
-            )
-            print("✓ CFG安全拷贝器已启用")
-        else:
-            self.safe_copier = None
-            print("⚠️ 使用深拷贝作为后备")
-    
     def _safe_copy_batch(self, batch: Dict[str, Any], copy_suffix: str = "") -> Dict[str, Any]:
-        """安全拷贝批次数据"""
-        if self.safe_copier is not None:
-            return self.safe_copier.safe_copy_batch(batch, copy_suffix=copy_suffix)
-        else:
-            # 后备方案：使用深拷贝
-            return copy.deepcopy(batch)
+        """简单拷贝批次数据"""
+        # 使用简单的浅拷贝（原始方式）
+        return batch.copy()
 
     def process_episodes(
         self,
