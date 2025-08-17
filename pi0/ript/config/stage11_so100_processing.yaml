@@ -14,7 +14,7 @@ task:
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
   num_parallel_envs: 4
-  max_episode_length: null
+  max_episode_length: 100  # 使用RIPT-VLA官方限制：libero_goal=300步
 
 # === 算法配置 ===
 algo:
@@ -32,7 +32,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: true
+  cfg_enabled: false
   train_expert_only: true
   freeze_vision_encoder: true
 
@@ -44,14 +44,18 @@ dataset:
   # 🚀 启用SO100处理 (Phase 3新功能)
   use_so100_processing: true
   
+  # 🔥 内存保护：限制每个轨迹的最大样本数
+  # libero_goal最长270步 → 理论最大220个样本，限制为100个样本保护内存
+  max_samples_per_trajectory: 100  # 防止长轨迹导致内存爆炸
+  
   # Legacy窗口化配置 (SO100模式下忽略，但保留兼容性)
-  windowing_mode: last
-  window_stride: 10
+  windowing_mode: slide
+  window_stride: 50
   max_windows_per_episode: 1
 
 # === 训练配置 ===
 training:
-  num_train_steps: 5  # 测试5步
+  num_train_steps: 3  # 测试5步
   seed: 42
   save_freq: 1
 

@@ -12,8 +12,8 @@ task:
   benchmark_name: "libero_goal"
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
-  num_parallel_envs: 2  # 减少并行环境避免问题
-  max_episode_length: 100  # 限制episode长度
+  num_parallel_envs: 4  # 减少并行环境避免问题
+  max_episode_length: 90  # 使用RIPT-VLA官方限制：libero_goal=300步
 
 # === 算法配置 ===
 algo:
@@ -29,7 +29,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: true  # 启用CFG测试
+  cfg_enabled: false  # 启用CFG测试
   train_expert_only: true
   freeze_vision_encoder: true
 
@@ -60,8 +60,8 @@ logging:
 # === 特性开关 - 简化配置 ===
 features:
   use_ript_vla_runner: false
-  enable_parallel_envs: false      # 禁用并行环境避免卡死
-  enable_true_parallel_envs: false
+  enable_parallel_envs: true      # 禁用并行环境避免卡死
+  enable_true_parallel_envs: true
   enable_smart_sampling: false
   use_parallel_init_state: false
   save_video: false

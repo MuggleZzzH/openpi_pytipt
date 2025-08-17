@@ -100,14 +100,28 @@ class SO100StyleProcessor:
         
         samples = []
         trajectory_length = len(obs_sequence)
+        action_length = len(action_sequence)
+        
+        # 🔧 调试信息：检查序列长度不匹配
+        if trajectory_length != action_length:
+            print(f"⚠ Sequence length mismatch in {trajectory_id}: obs={trajectory_length}, actions={action_length}")
         
         # Skip trajectories that are too short
-        if trajectory_length < self.action_chunk_size:
-            print(f"⚠ Skipping trajectory {trajectory_id}: length {trajectory_length} < {self.action_chunk_size}")
+        if trajectory_length < self.action_chunk_size or action_length < self.action_chunk_size:
+            print(f"⚠ Skipping trajectory {trajectory_id}: obs_len={trajectory_length}, action_len={action_length} < {self.action_chunk_size}")
             return samples
         
-        # Generate L-50+1 samples
-        num_samples = trajectory_length - self.action_chunk_size + 1
+        # 🔥 关键修复：基于动作序列长度计算样本数，确保每个样本都有完整的50步动作
+        # Generate samples only when we can guarantee 50 full action steps
+        max_samples_from_actions = max(0, action_length - self.action_chunk_size + 1)
+        max_samples_from_obs = max(0, trajectory_length - self.action_chunk_size + 1)
+        
+        # 取较小值，确保不会越界
+        theoretical_samples = min(max_samples_from_actions, max_samples_from_obs)
+        
+        print(f"🔧 {trajectory_id}: obs={trajectory_length}, actions={action_length} → max_samples={theoretical_samples}")
+        
+        num_samples = theoretical_samples
         
         for t in range(num_samples):
             # Current observation and state
@@ -117,6 +131,12 @@ class SO100StyleProcessor:
             # Extract action chunk
             action_chunk = action_sequence[t:t + self.action_chunk_size]  # shape: (50, action_dim)
             action_chunk = np.array(action_chunk, dtype=np.float32)
+            
+            # 🔥 关键验证：确保动作块长度为50步
+            if len(action_chunk) != self.action_chunk_size:
+                print(f"❌ Error: Action chunk at t={t} has {len(action_chunk)} steps, expected {self.action_chunk_size}")
+                print(f"   action_sequence length: {len(action_sequence)}, slice: [{t}:{t + self.action_chunk_size}]")
+                continue  # 跳过这个不完整的样本
             
             # Key: Compute relative actions (so100_train.py line 65)
             # action = action - state

@@ -50,12 +50,31 @@ class LIBEROEnvRunner:
         self.max_episode_length = max_episode_length
         self.task_names_to_use = task_names_to_use or []
         self.task_names = task_names_to_use or []  # 兼容性别名，供rollout_generator使用
-        self.max_steps = max_episode_length if max_episode_length is not None else 500
         
-        # ✅ 存储分布式训练参数
+        # ✅ 存储分布式训练参数（需要先赋值rank，后续代码会用到）
         self.config = config
         self.rank = rank
         self.world_size = world_size
+        
+        # 🔥 使用RIPT-VLA官方的任务最大步数设置（基于训练数据统计）
+        TASK_MAX_STEPS = {
+            'libero_spatial': 220,  # longest training demo has 193 steps
+            'libero_object': 280,   # longest training demo has 254 steps
+            'libero_goal': 300,     # longest training demo has 270 steps
+            'libero_10': 520,       # longest training demo has 505 steps
+            'libero_90': 400,       # longest training demo has 373 steps
+        }
+        
+        if max_episode_length is not None:
+            self.max_steps = max_episode_length
+        elif self.benchmark_name and self.benchmark_name.lower() in TASK_MAX_STEPS:
+            self.max_steps = TASK_MAX_STEPS[self.benchmark_name.lower()]
+            if self.rank == 0:
+                print(f"🎯 使用官方任务限制: {self.benchmark_name} → {self.max_steps}步")
+        else:
+            self.max_steps = 300  # 安全默认值（libero_goal的限制）
+            if self.rank == 0:
+                print(f"⚠️ 未知benchmark {self.benchmark_name}，使用默认限制: {self.max_steps}步")
         
         # 🔥 新增：功能开关控制 (安全集成复杂功能)
         # 从配置文件的features部分读取开关设置
