@@ -120,7 +120,15 @@ class SO100StyleProcessor:
             
             # Key: Compute relative actions (so100_train.py line 65)
             # action = action - state
-            relative_actions = action_chunk - current_state[None, :]  # Broadcasting
+            # 🔥 修复：处理状态8维 vs 动作7维的维度不匹配
+            if current_state.shape[0] > action_chunk.shape[1]:
+                # 状态维度 > 动作维度，只使用前action_dim维状态
+                state_for_action = current_state[:action_chunk.shape[1]]
+                relative_actions = action_chunk - state_for_action[None, :]
+                print(f"🔧 维度修复: 状态{current_state.shape} → {state_for_action.shape}, 动作{action_chunk.shape}")
+            else:
+                # 状态维度 <= 动作维度，直接计算
+                relative_actions = action_chunk - current_state[None, :]
             
             # Create padding mask (all False for full-length chunks)
             action_is_pad = np.zeros(self.action_chunk_size, dtype=bool)

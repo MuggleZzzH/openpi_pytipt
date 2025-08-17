@@ -23,11 +23,12 @@ def create_mock_policy():
     """Create a mock PI0Policy for testing."""
     policy = Mock()
     
-    # Mock config
+    # Mock config - 修复：确保所有属性返回正确类型
     policy.config = Mock()
     policy.config.n_action_steps = 50
     policy.config.max_action_dim = 7
     policy.config.num_steps = 10
+    policy.config.cfg_uncond_weight = 0.1  # 修复：添加CFG权重配置
     
     # Mock model
     policy.model = Mock()

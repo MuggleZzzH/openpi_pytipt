@@ -362,13 +362,16 @@ class PI0_CFG_Adapter(RLModelInterface):
                 - batch: Training batch
                 - owner_indices: List mapping batch indices to episode indices
         """
+        print(f"🔍 process_episodes: use_so100_processing={self.use_so100_processing}")
         if self.use_so100_processing:
             # Use SO100-style processing
+            print("🚀 Routing to SO100 processing...")
             batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
             owner_indices = batch['owner_indices']
             return batch, owner_indices
         else:
             # Use legacy windowing processing
+            print("🔧 Routing to legacy windowing processing...")
             return self._extract_microbatch_data(episodes, device)
     
     def normalize_state(self, state: np.ndarray) -> np.ndarray:
