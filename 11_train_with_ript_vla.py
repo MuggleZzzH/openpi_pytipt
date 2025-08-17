@@ -346,9 +346,17 @@ def create_trainer_components(config: Dict[str, Any], policy, env_runner, device
     
     # 🔧 创建CFG适配器（必需的model_adapter）
     print("正在创建CFG适配器...")
+
+    # 🔥 Phase 3: SO100数据处理配置支持
+    dataset_config = config.get('dataset', {})
+    use_so100_processing = dataset_config.get('use_so100_processing', False)
+
+    print(f"数据处理模式: {'SO100样本处理' if use_so100_processing else 'Legacy窗口化'}")
+
     cfg_adapter = PI0_CFG_Adapter(
         policy=policy,
-        norm_stats_path=f"{config['policy_path']}/norm_stats.json"
+        norm_stats_path=f"{config['policy_path']}/norm_stats.json",
+        use_so100_processing=use_so100_processing  # 🔥 Phase 3: 新增SO100支持
     )
     
     # 🔧 为policy添加优化器（RLOptimizerPI0_CFG需要）

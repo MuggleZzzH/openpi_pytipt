@@ -559,10 +559,19 @@ def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, epi
     梯度累积版本的策略更新（AMP增强 + 窗口级微批处理）
     """
     total_episodes = len(episodes)
-    
+
     print(f"🔧 窗口级微批梯度累积:")
     print(f"   总episodes: {total_episodes}")
     print(f"   累积步数: {gradient_accumulation_steps}")
+
+    # 🔥 Phase 3: 数据利用率监控
+    if hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+        # 估算训练样本数量 (基于平均轨迹长度)
+        avg_episode_length = sum(len(ep.get('actions', [])) for ep in episodes) / len(episodes)
+        estimated_samples = max(0, avg_episode_length - 50 + 1) * len(episodes)
+        utilization_ratio = estimated_samples / len(episodes) if len(episodes) > 0 else 0
+        print(f"📊 SO100数据利用率: {len(episodes)} episodes → ~{estimated_samples:.0f} samples ({utilization_ratio:.1f}x)")
+
     
     policy.train()
     
@@ -664,24 +673,32 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
 def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device):
     """简单版本的策略更新（无梯度累积）"""
     print(f"正在更新策略（{len(episodes)} 个episodes）...")
-    
+
+    # 🔥 Phase 3: 数据利用率监控
+    if hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+        # 估算训练样本数量 (基于平均轨迹长度)
+        avg_episode_length = sum(len(ep.get('actions', [])) for ep in episodes) / len(episodes)
+        estimated_samples = max(0, avg_episode_length - 50 + 1) * len(episodes)
+        utilization_ratio = estimated_samples / len(episodes) if len(episodes) > 0 else 0
+        print(f"📊 SO100数据利用率: {len(episodes)} episodes → ~{estimated_samples:.0f} samples ({utilization_ratio:.1f}x)")
+
     try:
         # 计算加权损失
         advantages = advantages.to(device)
         loss = cfg_adapter.compute_weighted_loss(episodes, advantages, device)
-        
+
         # 梯度更新
         optimizer.zero_grad()
         loss.backward()
-        
+
         # 梯度裁剪
         torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-        
+
         optimizer.step()
-        
+
         loss_value = loss.item()
         print(f"✓ 策略更新完成，损失: {loss_value:.6f}")
-        
+
         return loss_value
         
     except Exception as e:
@@ -766,20 +783,31 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     policy, optimizer, device = create_policy_and_optimizer(config)
     
     # 创建CFG适配器（必需，用于损失计算）
-    # 🔥 新增：窗口化配置支持
+    # 🔥 Phase 3: 数据处理配置 (Legacy + SO100)
     dataset_config = config.get('dataset', {})
+
+    # SO100处理配置 (Phase 3新增)
+    use_so100_processing = dataset_config.get('use_so100_processing', False)
+
+    # Legacy窗口化配置 (向后兼容)
     windowing_mode = dataset_config.get('windowing_mode', 'last')
     window_stride = dataset_config.get('window_stride', 10)
     max_windows_per_episode = dataset_config.get('max_windows_per_episode', 1)
-    
-    print(f"\n🔧 CFG窗口化配置:")
-    print(f"  模式: {windowing_mode}")
-    print(f"  步长: {window_stride}")
-    print(f"  每episode最大窗口数: {max_windows_per_episode}")
-    
+
+    print(f"\n🔧 数据处理配置:")
+    print(f"  SO100处理: {'启用' if use_so100_processing else '禁用 (使用Legacy窗口化)'}")
+    if not use_so100_processing:
+        print(f"  窗口化模式: {windowing_mode}")
+        print(f"  窗口步长: {window_stride}")
+        print(f"  每episode最大窗口数: {max_windows_per_episode}")
+    else:
+        print(f"  数据利用率: 预期50-150x提升")
+        print(f"  样本生成: 每个轨迹生成L-50+1个训练样本")
+
     cfg_adapter = PI0_CFG_Adapter(
         policy=policy,
         norm_stats_path=f"{config['policy_path']}/norm_stats.json",
+        use_so100_processing=use_so100_processing,  # 🔥 Phase 3: 新增SO100支持
         windowing_mode=windowing_mode,
         window_stride=window_stride,
         max_windows_per_episode=max_windows_per_episode

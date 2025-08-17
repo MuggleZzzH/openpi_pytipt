@@ -1,0 +1,102 @@
+# Stage 11 SO100 Data Processing Configuration
+# Phase 3: Main Training Script Integration
+# 启用SO100样式数据处理，实现50-150x数据利用率提升
+
+exp_name: stage11_so100_processing_test
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/stage11_so100"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"
+  num_parallel_envs: 4
+  max_episode_length: null
+
+# === 算法配置 ===
+algo:
+  demo_batch_size: 1   # 每步收集1组demo
+  rloo_batch_size: 4   # 每组4个样本
+  lr: 1e-5
+  gradient_accumulation_steps: 8  # 🔥 SO100模式下可以减少累积步数（因为样本更多）
+  collection_cfg_scale: 1.0
+  cfg_uncond_weight: 0.1
+  # RolloutGenerator配置
+  rollout_skip_threshold: 3
+  enable_rollout_stats_tracking: true
+  rollout_stats_path: "./output/stage11_so100/rollout_stats.json"
+  use_val_init: false
+
+# === 策略配置 ===
+policy:
+  cfg_enabled: true
+  train_expert_only: true
+  freeze_vision_encoder: true
+
+# === 🔥 Phase 3: SO100数据处理配置 ===
+dataset:
+  num_init_states: 1
+  state_dim: 8
+  
+  # 🚀 启用SO100处理 (Phase 3新功能)
+  use_so100_processing: true
+  
+  # Legacy窗口化配置 (SO100模式下忽略，但保留兼容性)
+  windowing_mode: last
+  window_stride: 10
+  max_windows_per_episode: 1
+
+# === 训练配置 ===
+training:
+  num_train_steps: 5  # 测试5步
+  seed: 42
+  save_freq: 1
+
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+
+# === 特性开关 ===
+features:
+  use_ript_vla_runner: false
+  enable_parallel_envs: true
+  enable_true_parallel_envs: true
+  enable_smart_sampling: true
+  use_parallel_init_state: false
+  save_video: false
+  
+  # === 增强功能开关 ===
+  enable_file_counter: true
+  adaptive_cfg: false
+  early_stop_percentage: 0.8
+  
+  # === CFG自适应调整配置 ===
+  adaptive_cfg_config:
+    min_cfg: 1.0
+    max_cfg: 3.0
+    cfg_step: 0.2
+    low_success_threshold: 0.2
+    high_success_threshold: 0.9
+  
+  # === CFG扫描评估配置 ===
+  cfg_sweep_config:
+    enabled: true
+    scales: [1.0, 1.25, 1.5, 2.0, 3.0]
+    eval_episodes: 3
+  
+  # 动态采样配置
+  dynamic_sampling:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.9
+
+# === 🔥 Phase 3: SO100性能监控配置 ===
+so100_monitoring:
+  enabled: true
+  log_data_utilization: true
+  log_sample_statistics: true
+  compare_with_legacy: false  # 是否同时运行Legacy方式进行对比
