@@ -343,6 +343,271 @@ class PI0_CFG_Adapter(RLModelInterface):
 
         return sample_advantages
 
+    def create_unified_sample_pool(
+        self,
+        episodes: List[Dict[str, Any]],
+        advantages: torch.Tensor,
+        device: Optional[torch.device] = None,
+        shuffle_samples: bool = True
+    ) -> Tuple[List[Dict[str, Any]], torch.Tensor]:
+        """
+        🚀 统一样本池方法：你想要的理想架构
+
+        将所有episodes一次性转换为统一的样本池，每个样本都有对应的优势值。
+        这是标准深度学习训练范式，避免了复杂的episode-to-sample映射。
+
+        Args:
+            episodes: 原始episode列表
+            advantages: episode级别的优势 (E,)
+            device: 目标设备
+            shuffle_samples: 是否打散样本顺序
+
+        Returns:
+            Tuple of:
+                - unified_samples: 统一的样本列表，每个样本独立
+                - sample_advantages: 对应的样本级优势 (N,)
+        """
+        if device is None:
+            device = self.device
+
+        print(f"🔄 Creating unified sample pool from {len(episodes)} episodes...")
+
+        # 1. 生成所有样本并记录来源episode
+        all_samples = []
+        sample_episode_mapping = []  # 记录每个样本来自哪个episode
+
+        for episode_idx, episode in enumerate(episodes):
+            # 转换episode格式
+            formatted_episode = self._convert_episode_to_so100_format(episode, episode_idx)
+
+            # 生成该episode的所有样本
+            episode_samples = self.so100_processor.process_trajectory_to_samples(formatted_episode)
+
+            # 记录样本和来源episode的映射
+            for sample in episode_samples:
+                all_samples.append(sample)
+                sample_episode_mapping.append(episode_idx)
+
+        print(f"  Generated {len(all_samples)} samples from {len(episodes)} episodes")
+        print(f"  Average samples per episode: {len(all_samples) / len(episodes):.1f}")
+
+        # 2. 创建样本级优势（直接从episode优势复制）
+        sample_advantages = torch.zeros(len(all_samples), device=device, dtype=advantages.dtype)
+        for sample_idx, episode_idx in enumerate(sample_episode_mapping):
+            sample_advantages[sample_idx] = advantages[episode_idx]
+
+        # 3. 可选：打散样本顺序，破除相关性
+        if shuffle_samples:
+            import random
+            # 创建索引列表并打散
+            indices = list(range(len(all_samples)))
+            random.shuffle(indices)
+
+            # 重新排列样本和优势
+            shuffled_samples = [all_samples[i] for i in indices]
+            shuffled_advantages = sample_advantages[indices]
+
+            all_samples = shuffled_samples
+            sample_advantages = shuffled_advantages
+            print(f"  ✅ Samples shuffled to break episode/temporal correlations")
+
+        print(f"✅ Unified sample pool created:")
+        print(f"  - Total samples: {len(all_samples)}")
+        print(f"  - Positive samples: {(sample_advantages > 0).sum().item()}")
+        print(f"  - Negative samples: {(sample_advantages <= 0).sum().item()}")
+        print(f"  - Data utilization: {len(all_samples) / len(episodes):.1f}x")
+
+        return all_samples, sample_advantages
+
+    def compute_loss_from_sample_pool(
+        self,
+        samples: List[Dict[str, Any]],
+        sample_advantages: torch.Tensor,
+        batch_size: int = 32,
+        device: Optional[torch.device] = None
+    ) -> torch.Tensor:
+        """
+        🚀 从统一样本池计算损失：标准深度学习训练范式
+
+        将样本池按固定batch_size切分，逐batch计算损失并累积。
+        这是你想要的理想架构：固定batch大小，标准梯度累积。
+
+        Args:
+            samples: 统一样本池
+            sample_advantages: 对应的样本优势 (N,)
+            batch_size: 固定的batch大小
+            device: 目标设备
+
+        Returns:
+            total_loss: 累积的总损失
+        """
+        if device is None:
+            device = self.device
+
+        total_samples = len(samples)
+        num_batches = (total_samples + batch_size - 1) // batch_size  # 向上取整
+
+        print(f"🔄 Computing loss from sample pool:")
+        print(f"  - Total samples: {total_samples}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Number of batches: {num_batches}")
+
+        total_loss = 0.0
+        processed_samples = 0
+
+        for batch_idx in range(num_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, total_samples)
+
+            # 提取当前batch的样本和优势
+            batch_samples = samples[start_idx:end_idx]
+            batch_advantages = sample_advantages[start_idx:end_idx]
+
+            # 将样本转换为模型输入格式
+            batch_data = self._collate_samples_to_batch(batch_samples, device)
+
+            # 计算CFG损失
+            batch_loss = self._compute_cfg_loss_for_batch(batch_data, batch_advantages, device)
+
+            # 累积损失（按样本数加权）
+            batch_weight = len(batch_samples) / total_samples
+            total_loss += batch_loss * batch_weight
+
+            processed_samples += len(batch_samples)
+
+            if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
+                print(f"  Batch {batch_idx + 1}/{num_batches}: {len(batch_samples)} samples, loss={batch_loss:.6f}")
+
+        print(f"✅ Sample pool processing complete:")
+        print(f"  - Processed samples: {processed_samples}")
+        print(f"  - Total loss: {total_loss:.6f}")
+
+        return total_loss
+
+    def _collate_samples_to_batch(self, samples: List[Dict[str, Any]], device: torch.device) -> Dict[str, Any]:
+        """
+        将样本列表整理成模型输入的batch格式。
+
+        Args:
+            samples: 样本列表
+            device: 目标设备
+
+        Returns:
+            batch: 模型输入格式的batch
+        """
+        if not samples:
+            raise ValueError("Empty samples list")
+
+        # 使用sample_generator的collate方法
+        return self.sample_generator.collate_samples_to_batch(samples, device)
+
+    def _compute_cfg_loss_for_batch(
+        self,
+        batch: Dict[str, Any],
+        advantages: torch.Tensor,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        为单个batch计算CFG损失。
+
+        Args:
+            batch: 模型输入batch
+            advantages: 该batch的优势值
+            device: 目标设备
+
+        Returns:
+            loss: 该batch的平均损失
+        """
+        # 获取CFG参数
+        cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
+
+        # 二值化优势
+        w_pos = (advantages > 0).float()
+
+        # 前向传播
+        outputs = self.policy.forward(batch)
+        losses = outputs['losses']  # (B, T, D)
+
+        # 确保losses是3维
+        assert losses.dim() == 3, f"losses必须是3维tensor (B,T,D)，当前维度: {losses.dim()}"
+
+        B, T, D = losses.shape
+
+        # CFG分支计算
+        if getattr(self.policy.model, 'cfg_enabled', True):
+            # CFG模式：条件分支 + 无条件分支
+            per_step_per_dim_pos = losses  # 条件分支
+
+            # 无条件分支（使用空prompt）
+            uncond_batch = batch.copy()
+            uncond_batch['prompt'] = [''] * B
+            uncond_outputs = self.policy.forward(uncond_batch)
+            per_step_per_dim_uncond = uncond_outputs['losses']
+
+            # CFG组合
+            combined_loss_per_step = w_pos.view(B, 1, 1) * per_step_per_dim_pos + cfg_alpha * per_step_per_dim_uncond
+        else:
+            # 非CFG模式：只使用条件分支
+            combined_loss_per_step = w_pos.view(B, 1, 1) * losses
+
+        # 计算平均损失
+        loss = combined_loss_per_step.mean()
+
+        return loss
+
+    def compute_weighted_loss_unified(
+        self,
+        episodes: List[Dict[str, Any]],
+        advantages: torch.Tensor,
+        device: Optional[torch.device] = None,
+        batch_size: int = 32,
+        shuffle_samples: bool = True
+    ) -> torch.Tensor:
+        """
+        🚀 统一样本池训练接口：你想要的理想架构
+
+        这是完整的统一样本池训练方法，实现了：
+        1. 统一样本生成
+        2. 样本随机化
+        3. 固定batch训练
+        4. 标准梯度累积
+
+        Args:
+            episodes: episode列表
+            advantages: episode级优势
+            device: 目标设备
+            batch_size: 固定batch大小
+            shuffle_samples: 是否打散样本
+
+        Returns:
+            loss: 总损失
+        """
+        if not self.use_so100_processing:
+            # 如果没有启用SO100，回退到原有方法
+            return self.compute_weighted_loss(episodes, advantages, device)
+
+        if device is None:
+            device = next(self.policy.parameters()).device
+
+        print(f"🚀 Unified Sample Pool Training:")
+        print(f"  - Episodes: {len(episodes)}")
+        print(f"  - Batch size: {batch_size}")
+        print(f"  - Shuffle samples: {shuffle_samples}")
+
+        # 1. 创建统一样本池
+        samples, sample_advantages = self.create_unified_sample_pool(
+            episodes, advantages, device, shuffle_samples
+        )
+
+        # 2. 从样本池计算损失
+        loss = self.compute_loss_from_sample_pool(
+            samples, sample_advantages, batch_size, device
+        )
+
+        print(f"✅ Unified training complete, loss: {loss:.6f}")
+
+        return loss
+
     def process_episodes(
         self,
         episodes: List[Dict[str, Any]],

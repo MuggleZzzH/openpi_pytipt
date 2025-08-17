@@ -673,7 +673,20 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
     try:
         # 计算加权损失
         advantages = advantages.to(device)
-        loss = cfg_adapter.compute_weighted_loss(episodes, advantages, device)
+
+        # 🚀 使用统一样本池方法（你想要的理想架构）
+        if hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+            print("🚀 Using unified sample pool training...")
+            loss = cfg_adapter.compute_weighted_loss_unified(
+                episodes=episodes,
+                advantages=advantages,
+                device=device,
+                batch_size=32,  # 固定batch大小
+                shuffle_samples=True  # 打散样本顺序
+            )
+        else:
+            print("🔧 Using legacy episode-by-episode training...")
+            loss = cfg_adapter.compute_weighted_loss(episodes, advantages, device)
 
         # 梯度更新
         optimizer.zero_grad()

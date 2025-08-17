@@ -1,0 +1,89 @@
+# Stage 11 Unified Sample Pool Configuration
+# 测试统一样本池训练方法：你想要的理想架构
+
+exp_name: stage11_unified_pool_test
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/stage11_unified_pool"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"
+  num_parallel_envs: 2  # 减少并行环境避免问题
+  max_episode_length: 100  # 限制episode长度
+
+# === 算法配置 ===
+algo:
+  demo_batch_size: 1
+  rloo_batch_size: 3  # 3个episodes生成统一样本池
+  lr: 1e-5
+  gradient_accumulation_steps: 4
+  collection_cfg_scale: 1.0
+  cfg_uncond_weight: 0.1
+  rollout_skip_threshold: 3
+  enable_rollout_stats_tracking: false
+  use_val_init: false
+
+# === 策略配置 ===
+policy:
+  cfg_enabled: true  # 启用CFG测试
+  train_expert_only: true
+  freeze_vision_encoder: true
+
+# === 🚀 数据处理配置 - 启用统一样本池 ===
+dataset:
+  num_init_states: 1
+  state_dim: 8
+  
+  # 启用SO100处理 + 统一样本池
+  use_so100_processing: true
+  
+  # Legacy配置（SO100模式下忽略）
+  windowing_mode: last
+  window_stride: 10
+  max_windows_per_episode: 1
+
+# === 训练配置 ===
+training:
+  num_train_steps: 3  # 快速测试
+  seed: 42
+  save_freq: 1
+
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+
+# === 特性开关 - 简化配置 ===
+features:
+  use_ript_vla_runner: false
+  enable_parallel_envs: false      # 禁用并行环境避免卡死
+  enable_true_parallel_envs: false
+  enable_smart_sampling: false
+  use_parallel_init_state: false
+  save_video: false
+  enable_file_counter: false
+  adaptive_cfg: false
+  early_stop_percentage: 1.0
+  
+  # 动态采样配置
+  dynamic_sampling:
+    enabled: false
+
+# === 🎯 统一样本池配置说明 ===
+# 
+# 新的训练流程：
+# 1. 收集3个episodes (rloo_batch_size=3)
+# 2. 统一生成所有样本到样本池
+# 3. 打散样本顺序，破除相关性
+# 4. 按固定batch_size=32切分样本
+# 5. 标准梯度累积训练
+#
+# 预期效果：
+# - 固定batch大小，标准深度学习范式
+# - 样本随机化，更好的训练稳定性
+# - 简化的优势传播，无复杂映射
+# - 更高的数据利用率
