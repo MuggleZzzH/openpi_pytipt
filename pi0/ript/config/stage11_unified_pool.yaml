@@ -12,15 +12,15 @@ task:
   benchmark_name: "libero_goal"
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
-  num_parallel_envs: 4  # 减少并行环境避免问题
-  max_episode_length: 90  # 使用RIPT-VLA官方限制：libero_goal=300步
+  num_parallel_envs: 1  # 🔥 单环境避免内存问题
+  max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
 
 # === 算法配置 ===
 algo:
   demo_batch_size: 1
-  rloo_batch_size: 3  # 3个episodes生成统一样本池
+  rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: 8  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.0
   cfg_uncond_weight: 0.1
   rollout_skip_threshold: 3

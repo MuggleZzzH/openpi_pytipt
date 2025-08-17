@@ -681,7 +681,7 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
                 episodes=episodes,
                 advantages=advantages,
                 device=device,
-                batch_size=32,  # 固定batch大小
+                batch_size=4,  # 🔥 减少batch大小避免显存不足
                 shuffle_samples=True  # 打散样本顺序
             )
         else:
@@ -848,13 +848,28 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     
     all_training_metrics = []
     
-    # 🔥 显存监控函数
+    # 🔥 显存监控和清理函数
     def print_gpu_memory(step_name: str):
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
             reserved = torch.cuda.memory_reserved() / 1024**3
             max_allocated = torch.cuda.max_memory_allocated() / 1024**3
             print(f"📊 {step_name} - GPU显存: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, 峰值: {max_allocated:.2f}GB")
+
+    def aggressive_memory_cleanup():
+        """激进的显存清理，解决碎片化问题"""
+        if torch.cuda.is_available():
+            # 清理PyTorch缓存
+            torch.cuda.empty_cache()
+
+            # 强制垃圾回收
+            import gc
+            gc.collect()
+
+            # 再次清理
+            torch.cuda.empty_cache()
+
+            print("🧹 激进显存清理完成")
     
     # 🔥 主训练循环 - 按组收集模式
     for step in range(num_train_steps):
@@ -907,11 +922,17 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         advantages = compute_advantages_rloo(all_collected_episodes, rloo_batch_size=rloo_batch_size)
         print_gpu_memory("优势计算完成")
         
+        # 🔥 训练前激进内存清理
+        aggressive_memory_cleanup()
+
         # 3. 更新策略（带配置传递以支持梯度累积）
         loss = update_policy_ript_vla_style(
             policy, optimizer, cfg_adapter, all_collected_episodes, advantages, device, config
         )
         print_gpu_memory("策略更新完成")
+
+        # 🔥 训练后再次清理
+        aggressive_memory_cleanup()
         
         # 4. 记录指标
         avg_reward = np.mean([ep['total_reward'] for ep in all_collected_episodes])

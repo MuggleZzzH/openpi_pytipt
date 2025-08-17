@@ -423,7 +423,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         self,
         samples: List[Dict[str, Any]],
         sample_advantages: torch.Tensor,
-        batch_size: int = 32,
+        batch_size: int = 8,  # 🔥 减少batch大小避免OOM
         device: Optional[torch.device] = None
     ) -> torch.Tensor:
         """
@@ -463,11 +463,53 @@ class PI0_CFG_Adapter(RLModelInterface):
             batch_samples = samples[start_idx:end_idx]
             batch_advantages = sample_advantages[start_idx:end_idx]
 
-            # 将样本转换为模型输入格式
-            batch_data = self._collate_samples_to_batch(batch_samples, device)
+            # 🔥 动态batch大小调整，避免OOM
+            current_batch_size = len(batch_samples)
 
-            # 计算CFG损失
-            batch_loss = self._compute_cfg_loss_for_batch(batch_data, batch_advantages, device)
+            try:
+                # 将样本转换为模型输入格式
+                batch_data = self._collate_samples_to_batch(batch_samples, device)
+
+                # 计算CFG损失
+                batch_loss = self._compute_cfg_loss_for_batch(batch_data, batch_advantages, device)
+
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    print(f"⚠️ Batch {batch_idx + 1} OOM，尝试减半batch大小...")
+
+                    # 清理显存
+                    torch.cuda.empty_cache()
+
+                    # 分割batch为两个更小的batch
+                    mid_point = len(batch_samples) // 2
+                    if mid_point == 0:
+                        print(f"❌ 单个样本都无法处理，跳过batch {batch_idx + 1}")
+                        continue
+
+                    # 处理前半部分
+                    sub_batch1 = batch_samples[:mid_point]
+                    sub_advantages1 = batch_advantages[:mid_point]
+                    sub_data1 = self._collate_samples_to_batch(sub_batch1, device)
+                    sub_loss1 = self._compute_cfg_loss_for_batch(sub_data1, sub_advantages1, device)
+
+                    # 清理并处理后半部分
+                    del sub_data1
+                    torch.cuda.empty_cache()
+
+                    sub_batch2 = batch_samples[mid_point:]
+                    sub_advantages2 = batch_advantages[mid_point:]
+                    sub_data2 = self._collate_samples_to_batch(sub_batch2, device)
+                    sub_loss2 = self._compute_cfg_loss_for_batch(sub_data2, sub_advantages2, device)
+
+                    # 加权平均
+                    batch_loss = (sub_loss1 * len(sub_batch1) + sub_loss2 * len(sub_batch2)) / current_batch_size
+
+                    del sub_data2
+                    torch.cuda.empty_cache()
+
+                    print(f"✅ 分割处理成功: {len(sub_batch1)} + {len(sub_batch2)} samples")
+                else:
+                    raise e
 
             # 累积损失（按样本数加权）
             batch_weight = len(batch_samples) / total_samples
@@ -508,7 +550,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         device: torch.device
     ) -> torch.Tensor:
         """
-        为单个batch计算CFG损失。
+        为单个batch计算CFG损失（内存优化版本）。
 
         Args:
             batch: 模型输入batch
@@ -518,40 +560,69 @@ class PI0_CFG_Adapter(RLModelInterface):
         Returns:
             loss: 该batch的平均损失
         """
+        # 🔥 内存优化：强制清理显存碎片
+        torch.cuda.empty_cache()
+
         # 获取CFG参数
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
 
         # 二值化优势
         w_pos = (advantages > 0).float()
 
-        # 前向传播
-        outputs = self.policy.forward(batch)
-        losses = outputs['losses']  # (B, T, D)
+        B = batch.get('batch_size', batch['state'].shape[0])
 
-        # 确保losses是3维
-        assert losses.dim() == 3, f"losses必须是3维tensor (B,T,D)，当前维度: {losses.dim()}"
-
-        B, T, D = losses.shape
-
-        # CFG分支计算
+        # CFG分支计算（内存优化）
         if getattr(self.policy.model, 'cfg_enabled', True):
-            # CFG模式：条件分支 + 无条件分支
-            per_step_per_dim_pos = losses  # 条件分支
+            print(f"🔮 CFG双分支计算: batch_size={B}")
 
-            # 无条件分支（使用空prompt）
-            uncond_batch = batch.copy()
-            uncond_batch['prompt'] = [''] * B
-            uncond_outputs = self.policy.forward(uncond_batch)
-            per_step_per_dim_uncond = uncond_outputs['losses']
+            # 🔥 分阶段计算避免内存峰值
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # Step 1: 条件分支
+                outputs = self.policy.forward(batch)
+                per_step_per_dim_pos = outputs['losses']  # (B, T, D)
 
-            # CFG组合
-            combined_loss_per_step = w_pos.view(B, 1, 1) * per_step_per_dim_pos + cfg_alpha * per_step_per_dim_uncond
+                # 立即清理中间结果
+                del outputs
+                torch.cuda.empty_cache()
+
+                # Step 2: 无条件分支
+                uncond_batch = batch.copy()
+                uncond_batch['prompt'] = [''] * B
+                uncond_outputs = self.policy.forward(uncond_batch)
+                per_step_per_dim_uncond = uncond_outputs['losses']
+
+                # 立即清理
+                del uncond_outputs, uncond_batch
+                torch.cuda.empty_cache()
+
+                # Step 3: CFG组合（在autocast内完成）
+                combined_loss_per_step = w_pos.view(B, 1, 1) * per_step_per_dim_pos + cfg_alpha * per_step_per_dim_uncond
+
+                # 立即清理分支结果
+                del per_step_per_dim_pos, per_step_per_dim_uncond
+                torch.cuda.empty_cache()
         else:
-            # 非CFG模式：只使用条件分支
-            combined_loss_per_step = w_pos.view(B, 1, 1) * losses
+            print(f"📝 单分支计算: batch_size={B}")
+
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                # 非CFG模式：只使用条件分支
+                outputs = self.policy.forward(batch)
+                losses = outputs['losses']
+
+                del outputs
+                torch.cuda.empty_cache()
+
+                combined_loss_per_step = w_pos.view(B, 1, 1) * losses
+
+                del losses
+                torch.cuda.empty_cache()
 
         # 计算平均损失
         loss = combined_loss_per_step.mean()
+
+        # 最终清理
+        del combined_loss_per_step
+        torch.cuda.empty_cache()
 
         return loss
 
