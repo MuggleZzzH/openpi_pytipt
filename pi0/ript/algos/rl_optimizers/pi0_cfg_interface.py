@@ -214,10 +214,13 @@ class PI0_CFG_Adapter(RLModelInterface):
         states = []
 
         for obs in observations:
-            # Process observation to match 2_pi0_on_libero.py format
-            processed_obs, unnorm_state = self._extract_state_from_obs(obs, episode_idx, 0)
-            processed_observations.append(processed_obs)
+            # Extract state (8-dimensional)
+            unnorm_state = self._extract_state_from_obs(obs, episode_idx, 0)
             states.append(unnorm_state)
+
+            # Create processed observation in OpenPI format
+            processed_obs = self._create_processed_observation(obs, unnorm_state)
+            processed_observations.append(processed_obs)
 
         # Create SO100 format episode
         so100_episode = {
@@ -253,6 +256,48 @@ class PI0_CFG_Adapter(RLModelInterface):
                 owner_indices[sample_idx] = episode_idx
 
         return owner_indices
+
+    def _create_processed_observation(self, obs: Dict[str, Any], unnorm_state: np.ndarray) -> Dict[str, Any]:
+        """
+        Create processed observation in OpenPI format.
+
+        Args:
+            obs: Raw observation dictionary
+            unnorm_state: Unnormalized state (8-dimensional)
+
+        Returns:
+            Processed observation in OpenPI format
+        """
+        # Extract and process images
+        base_image, wrist_image = self._extract_dual_images_from_obs(obs, 0, 0)
+
+        # Apply image transformations (following 2_pi0_on_libero.py)
+        def to_hwc_hmirror(arr: np.ndarray) -> np.ndarray:
+            if isinstance(arr, np.ndarray) and arr.ndim == 3:
+                # CHW -> HWC if needed
+                if arr.shape[0] == 3 and arr.shape[-1] != 3:
+                    arr = arr.transpose(1, 2, 0)
+                # Horizontal mirror
+                return arr[:, ::-1, :].copy()
+            return arr
+
+        base_image = to_hwc_hmirror(base_image)
+        wrist_image = to_hwc_hmirror(wrist_image)
+
+        # Normalize state
+        normalized_state = self.normalize_state(unnorm_state)
+
+        # Create processed observation
+        processed_obs = {
+            'image': {
+                'base_0_rgb': torch.from_numpy(base_image).float(),
+                'left_wrist_0_rgb': torch.from_numpy(wrist_image).float()
+            },
+            'state': torch.from_numpy(normalized_state).float(),
+            'prompt': [obs.get('task_description', '')]
+        }
+
+        return processed_obs
 
     def map_episode_advantages_to_samples_so100(
         self,

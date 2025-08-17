@@ -36,11 +36,12 @@ def create_mock_policy():
     policy.model = Mock()
     policy.model.sample_time = lambda batch_size, device: torch.rand(batch_size, device=device)
     
-    # Mock forward method
+    # Mock forward method - 修复：返回3维losses tensor (B,T,D)
     def mock_forward(batch):
         B = batch.get('batch_size', batch['state'].shape[0])
         T = batch['action'].shape[1]
-        losses = torch.randn(B, T, requires_grad=True)
+        D = batch['action'].shape[2]  # 动作维度，通常是7
+        losses = torch.randn(B, T, D, requires_grad=True)  # 3维tensor (B,T,D)
         return {'losses': losses}
     
     policy.forward = mock_forward
@@ -185,13 +186,13 @@ def test_data_utilization_comparison():
     device = torch.device('cpu')
     
     # Test legacy processing
-    policy = create_mock_policy()
+    legacy_policy = create_mock_policy()
     legacy_adapter = PI0_CFG_Adapter(
-        policy=policy,
+        policy=legacy_policy,
         use_so100_processing=False,
         windowing_mode='last'
     )
-    
+
     try:
         legacy_batch, legacy_owner_indices = legacy_adapter.process_episodes(episodes, device)
         legacy_samples = legacy_batch['state'].shape[0]
@@ -199,10 +200,11 @@ def test_data_utilization_comparison():
     except Exception as e:
         print(f"Legacy processing failed: {e}")
         return False
-    
+
     # Test SO100 processing
+    so100_policy = create_mock_policy()
     so100_adapter = PI0_CFG_Adapter(
-        policy=policy,
+        policy=so100_policy,
         use_so100_processing=True
     )
     
