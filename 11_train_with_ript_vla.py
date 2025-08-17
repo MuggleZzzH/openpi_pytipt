@@ -18,6 +18,7 @@
     
     # 使用RIPT-VLA runner (新功能)
     python 11_train_with_ript_vla.py --config_path pi0/ript/config/debug_train_ript_vla.yaml
+    
 """
 
 import os
