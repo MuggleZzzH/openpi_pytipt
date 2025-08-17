@@ -26,11 +26,12 @@ def create_mock_policy():
     """Create a mock PI0Policy for testing."""
     policy = Mock()
     
-    # Mock config
+    # Mock config - 修复：确保所有属性返回正确类型
     policy.config = Mock()
     policy.config.n_action_steps = 50
     policy.config.max_action_dim = 7
     policy.config.num_steps = 10
+    policy.config.cfg_uncond_weight = 0.1  # 修复：添加CFG权重配置
     
     # Mock model
     policy.model = Mock()
@@ -209,7 +210,8 @@ def test_data_utilization_comparison():
     )
     
     try:
-        so100_batch, so100_owner_indices = so100_adapter.process_episodes(episodes, device)
+        # 🔥 直接调用SO100处理方法，避免路由问题
+        so100_batch, episode_to_samples_map = so100_adapter.process_episodes_to_samples_so100(episodes, device)
         so100_samples = so100_batch['batch_size']
         print(f"SO100 processing: {len(episodes)} episodes → {so100_samples} samples")
         
