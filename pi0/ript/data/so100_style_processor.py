@@ -125,7 +125,6 @@ class SO100StyleProcessor:
                 # 状态维度 > 动作维度，只使用前action_dim维状态
                 state_for_action = current_state[:action_chunk.shape[1]]
                 relative_actions = action_chunk - state_for_action[None, :]
-                print(f"🔧 维度修复: 状态{current_state.shape} → {state_for_action.shape}, 动作{action_chunk.shape}")
             else:
                 # 状态维度 <= 动作维度，直接计算
                 relative_actions = action_chunk - current_state[None, :]

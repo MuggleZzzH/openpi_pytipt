@@ -164,7 +164,10 @@ def test_data_utilization():
     )
     
     try:
-        so100_batch, _ = so100_adapter.process_episodes(episodes, device)
+        print(f"🔍 SO100 adapter config: use_so100_processing={so100_adapter.use_so100_processing}")
+
+        # 🔥 直接调用SO100处理方法，避免路由问题
+        so100_batch, episode_to_samples_map = so100_adapter.process_episodes_to_samples_so100(episodes, device)
         so100_samples = so100_batch['batch_size']
         print(f"SO100: {len(episodes)} episodes → {so100_samples} samples")
         
