@@ -1,0 +1,92 @@
+# Stage 11 Non-CFG Configuration
+# 禁用CFG功能的配置文件，用于测试标准训练模式
+
+exp_name: stage11_no_cfg_test
+
+# === 基本路径配置 ===
+policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
+output_dir: "./output/stage11_no_cfg"
+
+# === 任务配置 ===
+task:
+  benchmark_name: "libero_goal"
+  task_names_to_use:
+    - "put_the_bowl_on_the_stove"
+  num_parallel_envs: 4
+  max_episode_length: null
+
+# === 算法配置 ===
+algo:
+  demo_batch_size: 1
+  rloo_batch_size: 4
+  lr: 1e-5
+  gradient_accumulation_steps: 8
+  collection_cfg_scale: 1.0  # CFG禁用时此参数无效，但保留兼容性
+  cfg_uncond_weight: 0.1     # CFG禁用时此参数无效，但保留兼容性
+  rollout_skip_threshold: 3
+  enable_rollout_stats_tracking: true
+  rollout_stats_path: "./output/stage11_no_cfg/rollout_stats.json"
+  use_val_init: false
+
+# === 🔥 策略配置 - CFG禁用 ===
+policy:
+  cfg_enabled: false  # 🚨 禁用CFG功能
+  train_expert_only: true
+  freeze_vision_encoder: true
+
+# === 数据处理配置 ===
+dataset:
+  num_init_states: 1
+  state_dim: 8
+  
+  # 数据处理方式选择
+  use_so100_processing: false  # 可以选择启用SO100处理
+  
+  # Legacy窗口化配置
+  windowing_mode: last
+  window_stride: 10
+  max_windows_per_episode: 1
+
+# === 训练配置 ===
+training:
+  num_train_steps: 10
+  seed: 42
+  save_freq: 5
+
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+
+# === 特性开关 ===
+features:
+  use_ript_vla_runner: false
+  enable_parallel_envs: true
+  enable_true_parallel_envs: true
+  enable_smart_sampling: true
+  use_parallel_init_state: false
+  save_video: false
+  enable_file_counter: true
+  adaptive_cfg: false  # CFG禁用时此功能自动禁用
+  early_stop_percentage: 0.8
+  
+  # 动态采样配置
+  dynamic_sampling:
+    enabled: true
+    p_min: 0.1
+    p_max: 0.9
+
+# === 注意事项 ===
+# 1. CFG禁用时，以下功能将自动跳过：
+#    - CFG embedding参数训练
+#    - CFG强度评估
+#    - CFG相关的损失计算分支
+# 
+# 2. 训练将使用标准的策略梯度方法
+# 
+# 3. 可以与SO100数据处理结合使用，获得数据利用率提升
+# 
+# 4. 适用场景：
+#    - 对比CFG和非CFG模式的性能
+#    - 调试训练问题
+#    - 资源受限的环境

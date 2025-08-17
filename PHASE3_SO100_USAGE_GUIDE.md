@@ -64,10 +64,17 @@ python 11_train_with_ript_vla.py --config pi0/ript/config/stage11_so100_processi
 ### **基本配置**
 
 ```yaml
+# === 策略配置 ===
+policy:
+  cfg_enabled: true  # 🔥 CFG功能控制 (true=启用, false=禁用)
+  train_expert_only: true
+  freeze_vision_encoder: true
+
+# === 数据处理配置 ===
 dataset:
   # 🚀 SO100处理开关
   use_so100_processing: true
-  
+
   # 数据维度配置
   state_dim: 8
   num_init_states: 1
@@ -97,6 +104,53 @@ so100_monitoring:
   enabled: true
   log_data_utilization: true
   log_sample_statistics: true
+```
+
+---
+
+## 🎛️ CFG功能控制
+
+### **CFG启用/禁用**
+
+通过配置文件完全控制CFG功能：
+
+```yaml
+policy:
+  cfg_enabled: true   # 启用CFG (默认)
+  # cfg_enabled: false  # 禁用CFG
+```
+
+### **CFG模式对比**
+
+| 功能 | CFG启用 | CFG禁用 |
+|------|---------|---------|
+| **训练方式** | CFG分支训练 | 标准策略梯度 |
+| **CFG embedding** | 参与训练 | 跳过训练 |
+| **CFG强度评估** | 定期执行 | 自动跳过 |
+| **内存使用** | 稍高 | 较低 |
+| **训练速度** | 标准 | 稍快 |
+
+### **使用场景**
+
+#### **启用CFG (推荐)**
+- 正常的RIPT-VLA训练
+- 需要条件生成能力
+- 追求最佳模型性能
+
+#### **禁用CFG**
+- 调试训练问题
+- 资源受限环境
+- 对比实验研究
+- 简化训练流程
+
+### **配置文件模板**
+
+```bash
+# CFG启用配置
+cp pi0/ript/config/stage11_so100_processing.yaml my_cfg_enabled.yaml
+
+# CFG禁用配置
+cp pi0/ript/config/stage11_no_cfg.yaml my_cfg_disabled.yaml
 ```
 
 ---
@@ -170,7 +224,17 @@ dataset:
 
 ### **常见问题**
 
-#### **1. 内存不足错误**
+#### **1. CFG配置不生效**
+```
+CFG功能仍然启用，即使设置了cfg_enabled: false
+```
+
+**解决方案**:
+- 检查配置文件YAML语法
+- 确保配置文件被正确加载
+- 运行CFG控制测试：`python test_cfg_control.py --test_both`
+
+#### **2. 内存不足错误**
 ```
 RuntimeError: CUDA out of memory
 ```

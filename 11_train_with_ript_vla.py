@@ -330,10 +330,23 @@ def load_policy(config: Dict[str, Any], device):
         raise FileNotFoundError(f"策略路径不存在: {policy_path}")
     
     policy = PI0Policy.from_pretrained(policy_path)
+
+    # 🔧 根据配置控制CFG功能
+    policy_config = config.get('policy', {})
+    cfg_enabled = policy_config.get('cfg_enabled', True)  # 默认启用以保持兼容性
+
+    print(f"🔧 配置CFG功能: {'启用' if cfg_enabled else '禁用'}")
+    policy.model.cfg_enabled = cfg_enabled
+    if hasattr(policy, 'config'):
+        policy.config.cfg_enabled = cfg_enabled
+
     policy = policy.to(device)
     policy.eval()
-    
-    print("✓ 策略加载成功")
+
+    if cfg_enabled:
+        print("✅ 策略加载成功，CFG已启用")
+    else:
+        print("✅ 策略加载成功，CFG已禁用")
     return policy
 
 def create_trainer_components(config: Dict[str, Any], policy, env_runner, device):

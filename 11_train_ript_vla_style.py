@@ -285,12 +285,19 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     policy_path = config['policy_path']
     policy = PI0Policy.from_pretrained(policy_path)
     
-    # 🔥 关键修复：强制启用CFG（解决原始checkpoint兼容性问题）
-    print("🔧 强制启用CFG功能...")
-    policy.model.cfg_enabled = True
+    # 🔧 根据配置控制CFG功能
+    policy_config = config.get('policy', {})
+    cfg_enabled = policy_config.get('cfg_enabled', True)  # 默认启用以保持兼容性
+
+    print(f"🔧 配置CFG功能: {'启用' if cfg_enabled else '禁用'}")
+    policy.model.cfg_enabled = cfg_enabled
     if hasattr(policy, 'config'):
-        policy.config.cfg_enabled = True
-    print("✅ CFG已启用，训练和推理都将使用CFG分支")
+        policy.config.cfg_enabled = cfg_enabled
+
+    if cfg_enabled:
+        print("✅ CFG已启用，训练和推理将使用CFG分支")
+    else:
+        print("⚠️ CFG已禁用，将使用标准训练模式")
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     policy = policy.to(device)
@@ -311,10 +318,12 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     trainable_params += list(policy.model.action_out_proj.parameters())
     trainable_params += list(policy.model.state_proj.parameters())
     
-    # 3. CFG embedding参数
-    if hasattr(policy.model, "cfg_emb"):
+    # 3. CFG embedding参数 (仅在CFG启用时训练)
+    if hasattr(policy.model, "cfg_emb") and getattr(policy.model, 'cfg_enabled', True):
         trainable_params += list(policy.model.cfg_emb.parameters())
         print("✅ CFG embedding参数已加入训练")
+    elif hasattr(policy.model, "cfg_emb"):
+        print("⚠️ CFG已禁用，跳过CFG embedding参数训练")
     
     # 4. 创建优化器
     print("正在创建优化器...")
@@ -581,31 +590,10 @@ def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, epi
     except AttributeError:
         scaler = torch.cuda.amp.GradScaler()  # 旧版本兼容
     
-    # 🔥 新版本：直接使用CFG adapter的窗口级微批处理
-    try:
-        avg_loss = cfg_adapter.compute_weighted_loss_microbatch(
-            episodes=episodes,
-            advantages=advantages,
-            device=device,
-            micro_batch_size=8,  # 控制显存峰值的关键参数
-            grad_accum_steps=gradient_accumulation_steps,
-            use_amp=True,
-            optimizer=optimizer,
-            scaler=scaler
-        )
-        
-        print(f"✓ 窗口级微批训练完成，平均损失: {avg_loss:.6f}")
-        return avg_loss.item() if hasattr(avg_loss, 'item') else float(avg_loss)
-        
-    except Exception as e:
-        print(f"❌ 窗口级微批处理失败: {e}")
-        print("🔄 回退到原有梯度累积方法...")
-        traceback.print_exc()
-        
-        # 回退到原有方法
-        return update_policy_with_gradient_accumulation_fallback(
-            policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler
-        )
+    # 使用标准梯度累积方法
+    return update_policy_with_gradient_accumulation_fallback(
+        policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler
+    )
 
 def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler):
     """
@@ -785,6 +773,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 创建CFG适配器（必需，用于损失计算）
     # 🔥 Phase 3: 数据处理配置 (Legacy + SO100)
     dataset_config = config.get('dataset', {})
+    policy_config = config.get('policy', {})
+
+    # CFG状态检查
+    cfg_enabled = getattr(policy.model, 'cfg_enabled', True)
 
     # SO100处理配置 (Phase 3新增)
     use_so100_processing = dataset_config.get('use_so100_processing', False)
@@ -794,7 +786,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     window_stride = dataset_config.get('window_stride', 10)
     max_windows_per_episode = dataset_config.get('max_windows_per_episode', 1)
 
-    print(f"\n🔧 数据处理配置:")
+    print(f"\n🔧 训练配置:")
+    print(f"  CFG模式: {'启用' if cfg_enabled else '禁用'}")
     print(f"  SO100处理: {'启用' if use_so100_processing else '禁用 (使用Legacy窗口化)'}")
     if not use_so100_processing:
         print(f"  窗口化模式: {windowing_mode}")
@@ -881,18 +874,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     all_collected_episodes.extend(group_episodes)
                     successful_groups += 1
                     
-                    # 🔥 提取并显示init_hash信息
-                    init_hashes = []
-                    for ep in group_episodes:
-                        if 'init_hash' in ep:
-                            init_hashes.append(ep['init_hash'][:8])  # 短哈希显示
-                        elif 'computed_init_hash' in ep:
-                            init_hashes.append(ep['computed_init_hash'][:8])
-                    
-                    unique_hashes = list(set(init_hashes))
                     print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
-                          f"成功率 {np.mean(successes):.2%}，"
-                          f"init_hash: {unique_hashes}")
+                          f"成功率 {np.mean(successes):.2%}")
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
         
@@ -943,8 +926,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"  耗时: {step_time:.2f}秒")
         print_gpu_memory("步骤结束")
         
-        # 6. CFG评估（每10步进行一次）
-        if (step + 1) % 10 == 0:
+        # 6. CFG评估（每10步进行一次，仅在CFG启用时）
+        if (step + 1) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
             try:
                 best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
@@ -954,6 +937,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 env_runner.config.collection_cfg_scale = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
+        elif (step + 1) % 10 == 0:
+            print("⚠️ CFG已禁用，跳过CFG强度评估")
         
         # 7. 保存检查点
         if (step + 1) % config['training'].get('save_freq', 10) == 0:
