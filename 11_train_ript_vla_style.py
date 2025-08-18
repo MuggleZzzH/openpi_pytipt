@@ -617,98 +617,91 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
     total_episodes = len(episodes)
     mini_batch_size = max(1, total_episodes // gradient_accumulation_steps)
     
-    print(f"🔧 回退AMP梯度累积训练:")
+    # 🚀 统一样本池训练（无mini-batch分割）
+    print(f"🔧 统一样本池训练:")
     print(f"   总episodes: {total_episodes}")
     print(f"   累积步数: {gradient_accumulation_steps}")
-    print(f"   mini_batch大小: {mini_batch_size}")
     
     total_loss = 0.0
-    gradient_step = 0
     
-    # 按mini_batch处理
-    for batch_start in range(0, total_episodes, mini_batch_size):
-        batch_end = min(batch_start + mini_batch_size, total_episodes)
-        
-        # 提取mini_batch
-        mini_episodes = episodes[batch_start:batch_end]
-        mini_advantages = advantages[batch_start:batch_end]
-        
-        try:
-            # 🔥 使用autocast包裹forward计算
-            with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                mini_advantages = mini_advantages.to(device)
-                
-                # 🚀 检查是否使用统一样本池方法
-                use_unified_pool = config is not None and config.get('unified_pool_batch_size') is not None
-                
-                # 🔥 调试信息
-                print(f"🔍 梯度累积中的调试信息:")
-                print(f"  use_unified_pool: {use_unified_pool}")
-                print(f"  hasattr(cfg_adapter, 'use_so100_processing'): {hasattr(cfg_adapter, 'use_so100_processing')}")
-                if hasattr(cfg_adapter, 'use_so100_processing'):
-                    print(f"  cfg_adapter.use_so100_processing: {cfg_adapter.use_so100_processing}")
-                
-                if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
-                    print("🚀 Using unified sample pool training in gradient accumulation...")
-                    # 从config读取参数
-                    batch_size_cfg = config.get('unified_pool_batch_size', 8)
-                    shuffle_cfg = config.get('unified_pool_shuffle', True)
-                    print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
-                    
-                    loss = cfg_adapter.compute_weighted_loss_unified(
-                        episodes=mini_episodes,
-                        advantages=mini_advantages,
-                        device=device,
-                        batch_size=batch_size_cfg,
-                        shuffle_samples=shuffle_cfg,
-                        scaler=scaler,
-                        optimizer=optimizer,
-                        gradient_accumulation_steps=gradient_accumulation_steps
-                    )
-                else:
-                    print("🔧 Using legacy episode-by-episode training in gradient accumulation...")
-                    loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
+    # 🔥 直接使用所有episodes，不再分割mini-batch
+    try:
+        # 🚀 使用autocast包裹forward计算
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            advantages = advantages.to(device)
             
-            # 🔥 统一样本池训练中梯度已累积和参数已更新，无需外层处理
+            # 🚀 检查是否使用统一样本池方法
+            use_unified_pool = config is not None and config.get('unified_pool_batch_size') is not None
+            
             if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
-                print("  ✅ 梯度累积和参数更新已在统一样本池中完成")
-                # 直接累积loss用于统计
-                total_loss += loss.item()
-                gradient_step += 1
+                print("🚀 使用统一样本池训练（所有轨迹）...")
+                # 从config读取参数
+                batch_size_cfg = config.get('unified_pool_batch_size', 8)
+                shuffle_cfg = config.get('unified_pool_shuffle', True)
+                print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
+                
+                loss = cfg_adapter.compute_weighted_loss_unified(
+                    episodes=episodes,  # 🔥 使用所有episodes
+                    advantages=advantages,  # 🔥 使用所有advantages
+                    device=device,
+                    batch_size=batch_size_cfg,
+                    shuffle_samples=shuffle_cfg,
+                    scaler=scaler,
+                    optimizer=optimizer,
+                    gradient_accumulation_steps=gradient_accumulation_steps
+                )
+                
+                total_loss = loss.item()
+                print(f"✅ 统一样本池训练完成，总损失: {total_loss}")
+                
             else:
-                # 🔥 传统方式：损失归一化（除以累积步数）
-                normalized_loss = loss / gradient_accumulation_steps
+                print("🔧 回退到原始梯度累积训练...")
+                gradient_step = 0
                 
-                # 🔥 使用scaler进行反向传播（梯度累积）
-                scaler.scale(normalized_loss).backward()
-                
-                total_loss += loss.item()
-                gradient_step += 1
-                
-                print(f"  Mini-batch {gradient_step}/{gradient_accumulation_steps}: "
-                      f"loss={loss.item():.6f}, normalized={normalized_loss.item():.6f}")
-                
-                # 🔥 只有达到累积步数才更新参数
-                if gradient_step == gradient_accumulation_steps or batch_end == total_episodes:
-                    # 🔥 AMP梯度更新流程
-                    scaler.unscale_(optimizer)  # 取消缩放以进行梯度裁剪
-                    grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                # 🔥 原始mini-batch梯度累积逻辑（fallback）
+                for batch_start in range(0, total_episodes, mini_batch_size):
+                    batch_end = min(batch_start + mini_batch_size, total_episodes)
                     
-                    # 参数更新
+                    # 提取mini_batch
+                    mini_episodes = episodes[batch_start:batch_end]
+                    mini_advantages = advantages[batch_start:batch_end]
+                    
+                    # mini-batch训练逻辑
+                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                        mini_advantages = mini_advantages.to(device)
+                        
+                        # 传统episode-by-episode训练
+                        loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
+                        
+                        # 梯度累积
+                        normalized_loss = loss / gradient_accumulation_steps
+                        if scaler is not None:
+                            scaler.scale(normalized_loss).backward()
+                        else:
+                            normalized_loss.backward()
+                        
+                        total_loss += loss.item()
+                        gradient_step += 1
+                
+                # 参数更新
+                if scaler is not None:
+                    scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
-                    optimizer.zero_grad()
-                    
-                    print(f"  ✓ AMP参数更新完成 (梯度范数: {grad_norm:.6f})")
-                    gradient_step = 0
+                else:
+                    optimizer.step()
+                optimizer.zero_grad()
                 
-        except Exception as e:
-            print(f"❌ Mini-batch处理失败: {e}")
-            continue
+                print(f"✅ 传统梯度累积训练完成，总损失: {total_loss}")
     
-    avg_loss = total_loss / max(1, total_episodes // mini_batch_size)
-    print(f"✓ 回退AMP梯度累积训练完成，平均损失: {avg_loss:.6f}")
-    return avg_loss
+    except Exception as e:
+        print(f"❌ 训练失败: {e}")
+        total_loss = 0.0
+    
+    print(f"✓ 统一样本池训练完成，总损失: {total_loss:.6f}")
+    return total_loss
 
 def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device, config=None):
     """简单版本的策略更新（无梯度累积）"""

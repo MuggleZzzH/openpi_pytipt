@@ -101,5 +101,5 @@ features:
 # - 更高的数据利用率
 
 # === 可调超参数（避免硬编码） ===
-unified_pool_batch_size: 8   # 统一样本池每个batch大小 - 修复显存累积后适当提升
+unified_pool_batch_size: 12   # 统一样本池每个batch大小 - 修复显存累积后适当提升
 unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序

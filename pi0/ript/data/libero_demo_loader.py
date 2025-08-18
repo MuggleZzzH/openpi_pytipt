@@ -28,17 +28,20 @@ class LIBERODemoDataset(Dataset):
                  data_prefix: str,
                  benchmark_name: str = "LIBERO_SPATIAL",
                  task_names_to_use: Optional[List[str]] = None,
-                 load_full_trajectory: bool = False):
+                 load_full_trajectory: bool = False,
+                 n_demos: int = 10):
         """
         Args:
             data_prefix: LIBERO数据集根目录路径
             benchmark_name: 基准名称 (LIBERO_SPATIAL, LIBERO_GOAL等)
             task_names_to_use: 要使用的任务名称列表
             load_full_trajectory: 是否加载完整轨迹（否则只加载初始状态）
+            n_demos: 每个任务要加载的演示数量（默认10个）
         """
         self.data_prefix = data_prefix
         self.benchmark_name = benchmark_name
         self.load_full_trajectory = load_full_trajectory
+        self.n_demos = n_demos
         
         # 获取LIBERO基准
         try:
@@ -81,85 +84,109 @@ class LIBERODemoDataset(Dataset):
                 logger.warning(f"任务数据路径不存在: {demo_path}")
                 continue
             
-            # 🔥 直接加载单个演示文件，而不是查找多个demo_i.hdf5文件
+            # 🔥 从HDF5文件中加载多个演示（每个文件包含50个demo）
             try:
-                demo_data = self._load_single_demo(demo_path, task_idx, task_name, task_description)
-                if demo_data is not None:
-                    self.demos.append(demo_data)
-                    self.task_descriptions.append(task_description)
-                    self.task_names.append(task_name)
-                    logger.info(f"✓ 成功加载demo: {demo_path}")
+                demos_data = self._load_multiple_demos(demo_path, task_idx, task_name, task_description, self.n_demos)
+                if demos_data:
+                    for demo_data in demos_data:
+                        self.demos.append(demo_data)
+                        self.task_descriptions.append(task_description)
+                        self.task_names.append(task_name)
+                    logger.info(f"✓ 成功加载 {len(demos_data)} 个demos从: {demo_path}")
             except Exception as e:
                 logger.warning(f"加载demo失败 {demo_path}: {e}")
                 continue
     
-    def _load_single_demo(self, demo_path: str, task_idx: int, task_name: str, task_description: str) -> Optional[Dict]:
+    def _load_multiple_demos(self, demo_path: str, task_idx: int, task_name: str, task_description: str, n_demos: int) -> List[Dict]:
         """
-        加载单个demo文件
+        从HDF5文件中加载多个演示
         
         Args:
             demo_path: demo文件路径
             task_idx: 任务索引
             task_name: 任务名称
             task_description: 任务描述
+            n_demos: 要加载的演示数量
             
         Returns:
-            demo数据字典或None
+            演示数据列表
         """
+        demos_data = []
+        
         try:
             with h5py.File(demo_path, 'r') as f:
-                # 获取基本信息
-                demo_data = {
-                    'task_id': task_idx,
-                    'task_name': task_name,
-                    'task_description': task_description,
-                    'demo_path': demo_path
-                }
+                # 检查文件结构
+                if 'data' not in f:
+                    logger.warning(f"HDF5文件缺少'data'组: {demo_path}")
+                    return demos_data
                 
-                # 获取轨迹长度
-                if 'data' in f:
-                    data_group = f['data']
+                data_group = f['data']
+                
+                # 获取所有可用的demo keys
+                demo_keys = [k for k in data_group.keys() if k.startswith('demo_')]
+                demo_keys.sort(key=lambda x: int(x.split('_')[1]))  # 按数字排序
+                
+                if not demo_keys:
+                    logger.warning(f"HDF5文件中没有找到demo数据: {demo_path}")
+                    return demos_data
+                
+                # 限制加载数量
+                n_demos_to_load = min(n_demos, len(demo_keys))
+                selected_demo_keys = demo_keys[:n_demos_to_load]
+                
+                logger.info(f"从文件 {demo_path} 中发现 {len(demo_keys)} 个demo，将加载前 {n_demos_to_load} 个")
+                
+                # 加载每个演示
+                for demo_key in selected_demo_keys:
+                    episode_data = data_group[demo_key]
                     
-                    # 获取第一个episode的数据
-                    episode_keys = [k for k in data_group.keys() if k.startswith('demo_')]
-                    if not episode_keys:
-                        return None
-                    
-                    episode_key = episode_keys[0]
-                    episode_data = data_group[episode_key]
-                    
-                    # 提取初始状态
-                    if 'obs' in episode_data:
-                        obs_data = episode_data['obs']
-                        
-                        # 获取初始观测
-                        initial_obs = {}
-                        for obs_key in obs_data.keys():
-                            obs_values = obs_data[obs_key][:]
-                            if len(obs_values) > 0:
-                                initial_obs[obs_key] = obs_values[0]  # 第一个时间步
-                        
-                        demo_data['initial_obs'] = initial_obs
-                    
-                    # 提取初始动作（如果需要）
-                    if 'actions' in episode_data:
-                        actions = episode_data['actions'][:]
-                        if len(actions) > 0:
-                            demo_data['initial_action'] = actions[0]
-                    
-                    # 如果需要完整轨迹
-                    if self.load_full_trajectory:
-                        demo_data['full_trajectory'] = {
-                            'obs': {k: v[:] for k, v in episode_data['obs'].items()},
-                            'actions': episode_data['actions'][:] if 'actions' in episode_data else None,
-                            'rewards': episode_data.get('rewards', [])[:] if 'rewards' in episode_data else None
+                    try:
+                        # 获取基本信息
+                        demo_data = {
+                            'task_id': task_idx,
+                            'task_name': task_name,
+                            'task_description': task_description,
+                            'demo_path': demo_path,
+                            'demo_id': demo_key
                         }
-                
-                return demo_data
+                        
+                        # 提取初始状态
+                        if 'obs' in episode_data:
+                            obs_data = episode_data['obs']
+                            
+                            # 获取初始观测
+                            initial_obs = {}
+                            for obs_key in obs_data.keys():
+                                obs_values = obs_data[obs_key][:]
+                                if len(obs_values) > 0:
+                                    initial_obs[obs_key] = obs_values[0]  # 第一个时间步
+                            
+                            demo_data['initial_obs'] = initial_obs
+                        
+                        # 提取初始动作（如果需要）
+                        if 'actions' in episode_data:
+                            actions = episode_data['actions'][:]
+                            if len(actions) > 0:
+                                demo_data['initial_action'] = actions[0]
+                        
+                        # 如果需要完整轨迹
+                        if self.load_full_trajectory:
+                            demo_data['full_trajectory'] = {
+                                'obs': {k: v[:] for k, v in episode_data['obs'].items()},
+                                'actions': episode_data['actions'][:] if 'actions' in episode_data else None,
+                                'rewards': episode_data.get('rewards', [])[:] if 'rewards' in episode_data else None
+                            }
+                        
+                        demos_data.append(demo_data)
+                        
+                    except Exception as e:
+                        logger.warning(f"加载demo {demo_key} 失败: {e}")
+                        continue
                 
         except Exception as e:
             logger.error(f"读取demo文件失败 {demo_path}: {e}")
-            return None
+            
+        return demos_data
     
     def __len__(self) -> int:
         return len(self.demos)

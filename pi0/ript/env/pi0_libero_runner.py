@@ -1121,7 +1121,12 @@ class LIBEROEnvRunner:
             start_idx = count * env_num
             end_idx = min(start_idx + env_num, len(all_init_states))
             indices = np.arange(start_idx, end_idx) % len(all_init_states)
-            current_init_states = all_init_states[indices]
+            
+            # 🔥 修复：兼容列表和numpy数组索引
+            if isinstance(all_init_states, list):
+                current_init_states = [all_init_states[i] for i in indices]
+            else:
+                current_init_states = all_init_states[indices]
             
             if self.rank == 0:
                 print(f"并行轮次 {count+1}/{eval_loop_num}, 状态索引: {indices}")
