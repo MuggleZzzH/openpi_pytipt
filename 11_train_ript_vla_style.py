@@ -224,6 +224,10 @@ try:
     from pi0.ript.reward_function import BinarySuccessReward
     from pi0.ript.algos.rl_optimizers.pi0_cfg_interface import PI0_CFG_Adapter
     print("✓ RIPT核心组件")
+
+    # 🔥 新增：LIBERO demo数据加载器
+    from pi0.ript.data.libero_demo_loader import create_libero_demo_dataloader
+    print("✓ LIBERO demo加载器")
     
     # # 导入简化的环境runner
     # try:
@@ -392,19 +396,30 @@ def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool
     return episodes
 
 
-def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None):
+def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None, demo_initial_state=None):
     """
-    RIPT-VLA风格的rollout收集（增强版：支持per-init跳过）
+    RIPT-VLA风格的rollout收集（增强版：支持per-init跳过和demo初始状态）
+
+    Args:
+        demo_initial_state: 来自LIBERO数据集的demo初始状态（可选）
     """
     print(f"正在收集 {num_rollouts} 个rollouts...")
-    
+
     try:
-        # 获取任务的初始状态和task_id
-        task_id = 0  # 简化处理，使用第一个任务
-        if hasattr(env_runner, 'benchmark'):
-            all_init_states = env_runner.benchmark.get_task_init_states(task_id)
+        # 🔥 新增：处理demo初始状态
+        if demo_initial_state is not None:
+            print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
+            # 从demo中提取初始状态信息
+            task_id = demo_initial_state['task_id'][0].item()
+            # 将demo的初始观测转换为环境可用的初始状态
+            all_init_states = [demo_initial_state['initial_obs']]
         else:
-            all_init_states = None
+            # 获取任务的初始状态和task_id
+            task_id = 0  # 简化处理，使用第一个任务
+            if hasattr(env_runner, 'benchmark'):
+                all_init_states = env_runner.benchmark.get_task_init_states(task_id)
+            else:
+                all_init_states = None
         
         # 🔥 如果有统计跟踪器，先检查是否应该跳过这个任务
         if stats_tracker and all_init_states is not None:
@@ -836,10 +851,41 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     )
     
     # 🔥 解耦demo_batch_size与rloo_batch_size
-    demo_batch_size = config['algo'].get('demo_batch_size', 1)
+    demo_batch_size = config['algo'].get('demo_batch_size', 6)  # 改为默认6，与原版RIPT一致
     rloo_batch_size = config['algo']['rloo_batch_size']
     num_train_steps = config['training']['num_train_steps']
-    task_name = config['task'].get('task_names_to_use', ['libero_goal_default'])[0]
+    task_names = config['task'].get('task_names_to_use', ['LIBERO_SPATIAL_0'])
+
+    # 🔥 新增：创建LIBERO demo数据加载器
+    use_libero_demos = config.get('use_libero_demos', True)
+    if use_libero_demos:
+        try:
+            # 从环境变量或配置中获取数据路径
+            libero_data_prefix = config.get('libero_data_prefix', '/path/to/libero/datasets')
+            benchmark_name = config.get('benchmark_name', 'LIBERO_SPATIAL')
+
+            demo_dataloader = create_libero_demo_dataloader(
+                data_prefix=libero_data_prefix,
+                benchmark_name=benchmark_name,
+                batch_size=demo_batch_size,
+                n_demos=50,  # 每个任务50个demo
+                task_names_to_use=task_names if task_names != ['LIBERO_SPATIAL_0'] else None,
+                shuffle=True,
+                num_workers=0  # 避免多进程问题
+            )
+            demo_data_iter = iter(demo_dataloader)
+            print(f"✅ LIBERO demo数据加载器创建成功")
+            print(f"  数据路径: {libero_data_prefix}")
+            print(f"  基准: {benchmark_name}")
+            print(f"  数据集大小: {len(demo_dataloader.dataset)}")
+        except Exception as e:
+            print(f"⚠️ LIBERO demo加载器创建失败: {e}")
+            print("  将使用传统的环境重置方式")
+            demo_dataloader = None
+            demo_data_iter = None
+    else:
+        demo_dataloader = None
+        demo_data_iter = None
     
     print(f"\n🔧 批次配置:")
     print(f"  demo_batch_size: {demo_batch_size} (每步收集的组数)")
@@ -848,7 +894,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     
     print(f"\n开始训练循环:")
     print(f"  训练步数: {num_train_steps}")
-    print(f"  任务: {task_name}")
+    print(f"  任务: {task_names}")
+    print(f"  使用LIBERO demos: {'是' if demo_dataloader else '否'}")
     print()
     
     all_training_metrics = []
@@ -875,12 +922,29 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         
         for group_idx in range(demo_batch_size):
             print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
-            
-            # 收集一组rollouts（传递统计跟踪器）
+
+            # 🔥 新增：获取demo初始状态（如果可用）
+            demo_batch = None
+            if demo_data_iter is not None:
+                try:
+                    demo_batch = next(demo_data_iter)
+                    print(f"  📋 使用LIBERO demo: 任务{demo_batch['task_id'][0].item()}")
+                except StopIteration:
+                    # 重新开始数据迭代器
+                    demo_data_iter = iter(demo_dataloader)
+                    demo_batch = next(demo_data_iter)
+                    print(f"  📋 重新开始demo迭代: 任务{demo_batch['task_id'][0].item()}")
+                except Exception as e:
+                    print(f"  ⚠️ Demo获取失败: {e}")
+                    demo_batch = None
+
+            # 收集一组rollouts（传递demo初始状态和统计跟踪器）
             group_episodes = collect_rollouts_ript_vla_style(
-                env_runner, task_name, rloo_batch_size,
+                env_runner, task_names[0] if not demo_batch else demo_batch['task_name'][0],
+                rloo_batch_size,
                 enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False),
-                stats_tracker=stats_tracker
+                stats_tracker=stats_tracker,
+                demo_initial_state=demo_batch  # 🔥 新增：传递demo初始状态
             )
             
             if group_episodes:

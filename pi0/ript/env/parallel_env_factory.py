@@ -7,6 +7,48 @@
 
 import os
 import gym
+import numpy as np
+from typing import Optional
+
+
+class SyncedInitStateWrapper:
+    """
+    同步初始状态包装器
+
+    确保并行环境都使用相同的初始状态ID，解决随机初始状态导致的不同步问题。
+    """
+
+    def __init__(self, env, fixed_init_state_id: int):
+        """
+        Args:
+            env: 被包装的环境
+            fixed_init_state_id: 固定的初始状态ID
+        """
+        self.env = env
+        self.fixed_init_state_id = fixed_init_state_id
+
+        # 代理所有属性到原始环境
+        for attr in ['action_space', 'observation_space', 'task_description',
+                     'num_init_states', 'step', 'close', 'seed']:
+            if hasattr(env, attr):
+                setattr(self, attr, getattr(env, attr))
+
+    def reset(self, init_state_id: Optional[int] = None):
+        """
+        重置环境，强制使用固定的初始状态ID
+
+        Args:
+            init_state_id: 忽略此参数，始终使用固定的ID
+
+        Returns:
+            observation: 环境观测
+        """
+        # 🔥 关键修复：忽略传入的init_state_id，使用固定值
+        return self.env.reset(init_state_id=self.fixed_init_state_id)
+
+    def __getattr__(self, name):
+        """代理其他属性到原始环境"""
+        return getattr(self.env, name)
 
 
 def create_libero_env_independent(benchmark_name: str, env_name: str = None, task_id: int = None):
@@ -69,18 +111,20 @@ def create_libero_env_independent(benchmark_name: str, env_name: str = None, tas
     return env, task_description
 
 
-def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int = None):
+def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int = None,
+                      fixed_init_state_id: int = None):
     """
     创建环境工厂函数 - 供SubprocVectorEnv使用
-    
+
     这个函数返回一个lambda，该lambda调用独立的环境创建函数。
     关键在于返回的lambda不捕获任何外部变量引用。
-    
+
     Args:
         benchmark_name: LIBERO基准名称
         env_name: 环境名称 (可选)
         task_id: 任务ID (可选)
-    
+        fixed_init_state_id: 固定的初始状态ID，用于确保并行环境同步 (可选)
+
     Returns:
         callable: 无参数的环境工厂函数
     """
@@ -92,8 +136,13 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
             env_name=env_name,
             task_id=task_id
         )
+
+        # 🔥 关键修复：如果指定了固定初始状态ID，创建同步包装器
+        if fixed_init_state_id is not None:
+            env = SyncedInitStateWrapper(env, fixed_init_state_id)
+
         return env  # SubprocVectorEnv只需要环境对象
-    
+
     return env_factory
 
 

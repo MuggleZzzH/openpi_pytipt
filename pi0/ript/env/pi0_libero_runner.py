@@ -986,31 +986,56 @@ class LIBEROEnvRunner:
         
         try:
             # 🔑 关键：使用独立环境工厂，避免序列化self对象
+            # 🔥 关键修复：使用固定初始状态ID确保并行环境同步
+
+            # 从配置中读取同步设置
+            sync_config = getattr(self.config, 'features', {}).get('parallel_env_sync', {})
+            sync_enabled = sync_config.get('enabled', True)
+            fixed_init_state_id = sync_config.get('fixed_init_state_id', 0) if sync_enabled else None
+
             env_factory = create_env_factory(
                 benchmark_name=self.benchmark_name,
                 env_name=env_name,
-                task_id=None  # 自动推断
+                task_id=None,  # 自动推断
+                fixed_init_state_id=fixed_init_state_id  # 🔥 新增：固定初始状态ID
             )
-            
+
             # 创建多个环境工厂实例
             env_factories = [env_factory for _ in range(self.num_parallel_envs)]
             
             if self.rank == 0:
                 print(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")
-            
+                if sync_enabled and fixed_init_state_id is not None:
+                    print(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
+                else:
+                    print("🎲 使用随机初始状态模式")
+
             # 设置multiprocessing启动方法
             if multiprocessing.get_start_method(allow_none=True) != 'spawn':
                 multiprocessing.set_start_method('spawn', force=True)
-            
+
             # 创建SubprocVectorEnv
             parallel_env = SubprocVectorEnv(env_factories)
             
-            # 🔍 仅记录reset返回信息，不做强校验以适配不同实现
+            # 🔍 验证并行环境初始状态同步性
             try:
                 test_obs = parallel_env.reset()
                 if self.rank == 0:
                     if isinstance(test_obs, list):
                         print(f"✅ SubprocVectorEnv已创建，reset返回list，长度: {len(test_obs)}")
+
+                        # 🔥 新增：验证初始状态同步性
+                        verify_sync = sync_config.get('verify_sync', True)
+                        if verify_sync:
+                            sync_verified = self._verify_parallel_env_sync(test_obs)
+                            if sync_verified:
+                                print("✅ 并行环境初始状态同步验证通过")
+                            else:
+                                print("⚠️ 并行环境初始状态可能不同步")
+                                if sync_enabled:
+                                    print("   建议检查SyncedInitStateWrapper是否正常工作")
+                        else:
+                            print("ℹ️ 跳过同步验证（verify_sync=false）")
                     else:
                         print(f"✅ SubprocVectorEnv已创建，reset返回类型: {type(test_obs)}")
             except Exception as e:
@@ -1633,13 +1658,57 @@ class LIBEROEnvRunner:
                 pass
             
             return episodes
-    
+
+    def _verify_parallel_env_sync(self, obs_list):
+        """
+        验证并行环境的初始状态同步性
+
+        Args:
+            obs_list: 并行环境reset返回的观测列表
+
+        Returns:
+            bool: True表示同步，False表示不同步
+        """
+        if not isinstance(obs_list, list) or len(obs_list) < 2:
+            return True  # 单环境或无效输入，认为同步
+
+        try:
+            # 提取每个环境的状态
+            states = []
+            hashes = []
+
+            for i, obs in enumerate(obs_list):
+                state = self._extract_state_from_obs(obs)
+                state_hash = self._compute_state_hash(state)
+                states.append(state)
+                hashes.append(state_hash)
+                print(f"   环境 {i}: 状态哈希 = {state_hash}")
+
+            # 检查同步性
+            unique_hashes = set(hashes)
+            is_synced = len(unique_hashes) == 1
+
+            if is_synced:
+                print(f"   🔒 所有 {len(obs_list)} 个环境状态完全同步")
+            else:
+                print(f"   ⚠️ 发现 {len(unique_hashes)} 个不同状态，环境未完全同步")
+                # 详细报告不同状态的分布
+                for j, unique_hash in enumerate(unique_hashes):
+                    indices = [i for i, h in enumerate(hashes) if h == unique_hash]
+                    print(f"     状态 {j+1}: {unique_hash} (环境 {indices})")
+
+            return is_synced
+
+        except Exception as e:
+            print(f"   ❌ 同步验证失败: {e}")
+            return False
+
     def _can_use_parallel_envs(self, batch_size):
         """检查是否可以使用并行环境"""
         # 简化判断逻辑
         features_config = getattr(self.config, 'features', {})
         enable_parallel = features_config.get('enable_parallel_envs', False)
         enable_true_parallel = features_config.get('enable_true_parallel_envs', False)
-        
+
         return enable_parallel and enable_true_parallel and batch_size > 1
     
