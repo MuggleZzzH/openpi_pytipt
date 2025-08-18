@@ -660,37 +660,47 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
                         advantages=mini_advantages,
                         device=device,
                         batch_size=batch_size_cfg,
-                        shuffle_samples=shuffle_cfg
+                        shuffle_samples=shuffle_cfg,
+                        scaler=scaler,
+                        optimizer=optimizer,
+                        gradient_accumulation_steps=gradient_accumulation_steps
                     )
                 else:
                     print("🔧 Using legacy episode-by-episode training in gradient accumulation...")
                     loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
             
-            # 🔥 关键：损失归一化（除以累积步数）
-            normalized_loss = loss / gradient_accumulation_steps
-            
-            # 🔥 使用scaler进行反向传播（梯度累积）
-            scaler.scale(normalized_loss).backward()
-            
-            total_loss += loss.item()
-            gradient_step += 1
-            
-            print(f"  Mini-batch {gradient_step}/{gradient_accumulation_steps}: "
-                  f"loss={loss.item():.6f}, normalized={normalized_loss.item():.6f}")
-            
-            # 🔥 只有达到累积步数才更新参数
-            if gradient_step == gradient_accumulation_steps or batch_end == total_episodes:
-                # 🔥 AMP梯度更新流程
-                scaler.unscale_(optimizer)  # 取消缩放以进行梯度裁剪
-                grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+            # 🔥 统一样本池训练中梯度已累积和参数已更新，无需外层处理
+            if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+                print("  ✅ 梯度累积和参数更新已在统一样本池中完成")
+                # 直接累积loss用于统计
+                total_loss += loss.item()
+                gradient_step += 1
+            else:
+                # 🔥 传统方式：损失归一化（除以累积步数）
+                normalized_loss = loss / gradient_accumulation_steps
                 
-                # 参数更新
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+                # 🔥 使用scaler进行反向传播（梯度累积）
+                scaler.scale(normalized_loss).backward()
                 
-                print(f"  ✓ AMP参数更新完成 (梯度范数: {grad_norm:.6f})")
-                gradient_step = 0
+                total_loss += loss.item()
+                gradient_step += 1
+                
+                print(f"  Mini-batch {gradient_step}/{gradient_accumulation_steps}: "
+                      f"loss={loss.item():.6f}, normalized={normalized_loss.item():.6f}")
+                
+                # 🔥 只有达到累积步数才更新参数
+                if gradient_step == gradient_accumulation_steps or batch_end == total_episodes:
+                    # 🔥 AMP梯度更新流程
+                    scaler.unscale_(optimizer)  # 取消缩放以进行梯度裁剪
+                    grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
+                    
+                    # 参数更新
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    
+                    print(f"  ✓ AMP参数更新完成 (梯度范数: {grad_norm:.6f})")
+                    gradient_step = 0
                 
         except Exception as e:
             print(f"❌ Mini-batch处理失败: {e}")

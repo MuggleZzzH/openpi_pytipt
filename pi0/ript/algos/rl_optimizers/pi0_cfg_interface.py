@@ -428,8 +428,11 @@ class PI0_CFG_Adapter(RLModelInterface):
         samples: List[Dict[str, Any]],
         sample_advantages: torch.Tensor,
         batch_size: int = 8,  # 🔥 减少batch大小避免OOM
-        device: Optional[torch.device] = None
-    ) -> torch.Tensor:
+        device: Optional[torch.device] = None,
+        scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        gradient_accumulation_steps: int = 1
+    ) -> float:
         """
         🚀 从统一样本池计算损失：标准深度学习训练范式
 
@@ -458,6 +461,7 @@ class PI0_CFG_Adapter(RLModelInterface):
 
         total_loss = 0.0
         processed_samples = 0
+        gradient_step = 0  # 梯度累积计数器
 
         for batch_idx in range(num_batches):
             start_idx = batch_idx * batch_size
@@ -495,34 +499,120 @@ class PI0_CFG_Adapter(RLModelInterface):
                     sub_advantages1 = batch_advantages[:mid_point]
                     sub_data1 = self._collate_samples_to_batch(sub_batch1, device)
                     sub_loss1 = self._compute_cfg_loss_for_batch(sub_data1, sub_advantages1, device)
+                    
+                    # 立即处理第一个子batch的梯度
+                    sub_weight1 = len(sub_batch1) / total_samples
+                    sub_normalized_loss1 = sub_loss1 * sub_weight1 / gradient_accumulation_steps
+                    sub_loss1_value = sub_loss1.detach().item()
+                    
+                    if scaler is not None:
+                        scaler.scale(sub_normalized_loss1).backward()
+                    else:
+                        sub_normalized_loss1.backward()
+                    
+                    gradient_step += 1
 
                     # 清理并处理后半部分
-                    del sub_data1
+                    del sub_data1, sub_loss1, sub_normalized_loss1
                     torch.cuda.empty_cache()
 
                     sub_batch2 = batch_samples[mid_point:]
                     sub_advantages2 = batch_advantages[mid_point:]
                     sub_data2 = self._collate_samples_to_batch(sub_batch2, device)
                     sub_loss2 = self._compute_cfg_loss_for_batch(sub_data2, sub_advantages2, device)
+                    
+                    # 立即处理第二个子batch的梯度
+                    sub_weight2 = len(sub_batch2) / total_samples
+                    sub_normalized_loss2 = sub_loss2 * sub_weight2 / gradient_accumulation_steps
+                    sub_loss2_value = sub_loss2.detach().item()
+                    
+                    if scaler is not None:
+                        scaler.scale(sub_normalized_loss2).backward()
+                    else:
+                        sub_normalized_loss2.backward()
+                    
+                    gradient_step += 1
 
-                    # 加权平均
-                    batch_loss = (sub_loss1 * len(sub_batch1) + sub_loss2 * len(sub_batch2)) / current_batch_size
+                    # 计算加权平均loss值（仅用于日志）
+                    batch_loss_value = (sub_loss1_value * len(sub_batch1) + sub_loss2_value * len(sub_batch2)) / current_batch_size
 
-                    del sub_data2
+                    del sub_data2, sub_loss2, sub_normalized_loss2
                     torch.cuda.empty_cache()
-
-                    print(f"✅ 分割处理成功: {len(sub_batch1)} + {len(sub_batch2)} samples")
+                    
+                    # 🔥 检查是否需要参数更新（OOM分割情况）
+                    if gradient_step == gradient_accumulation_steps or batch_idx == num_batches - 1:
+                        if optimizer is not None:
+                            # 梯度裁剪
+                            if scaler is not None:
+                                scaler.unscale_(optimizer)
+                            grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                            
+                            # 参数更新
+                            if scaler is not None:
+                                scaler.step(optimizer)
+                                scaler.update()
+                            else:
+                                optimizer.step()
+                            
+                            optimizer.zero_grad()
+                            print(f"  ✓ 参数更新完成 (OOM分割, 步骤 {gradient_step}/{gradient_accumulation_steps}, 梯度范数: {grad_norm:.6f})")
+                            gradient_step = 0
+                    
+                    # 跳过正常的梯度累积，因为已经处理过了
+                    total_loss += batch_loss_value * batch_weight
+                    processed_samples += len(batch_samples)
+                    
+                    print(f"  Batch {batch_idx + 1}/{num_batches}: {len(batch_samples)} samples, loss={batch_loss_value:.6f}")
+                    continue  # 跳过正常处理流程
                 else:
                     raise e
 
-            # 累积损失（按样本数加权）
+            # 🔥 梯度累积策略：类似ript-vla的做法
             batch_weight = len(batch_samples) / total_samples
-            total_loss += batch_loss * batch_weight
+            # 考虑梯度累积步数的归一化
+            normalized_batch_loss = batch_loss * batch_weight / gradient_accumulation_steps
+            
+            # 保存loss数值用于日志
+            batch_loss_value = batch_loss.detach().item()
+            
+            # 立即反向传播，累积梯度
+            if scaler is not None:
+                scaler.scale(normalized_batch_loss).backward()
+            else:
+                normalized_batch_loss.backward()
+            
+            gradient_step += 1
+            
+            # 累积数值（不保留梯度）
+            total_loss += batch_loss_value * batch_weight
+            
+            # 🔥 参数更新逻辑：达到累积步数或最后一个batch时更新
+            if gradient_step == gradient_accumulation_steps or batch_idx == num_batches - 1:
+                if optimizer is not None:
+                    # 梯度裁剪
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 1.0)
+                    
+                    # 参数更新
+                    if scaler is not None:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    
+                    optimizer.zero_grad()
+                    print(f"  ✓ 参数更新完成 (步骤 {gradient_step}/{gradient_accumulation_steps}, 梯度范数: {grad_norm:.6f})")
+                    gradient_step = 0
+            
+            # 清理batch计算图
+            del batch_loss, normalized_batch_loss
+            torch.cuda.empty_cache()
 
             processed_samples += len(batch_samples)
 
             if batch_idx % 10 == 0 or batch_idx == num_batches - 1:
-                print(f"  Batch {batch_idx + 1}/{num_batches}: {len(batch_samples)} samples, loss={batch_loss:.6f}")
+                print(f"  Batch {batch_idx + 1}/{num_batches}: {len(batch_samples)} samples, loss={batch_loss_value:.6f}")
 
         print(f"✅ Sample pool processing complete:")
         print(f"  - Processed samples: {processed_samples}")
@@ -652,7 +742,10 @@ class PI0_CFG_Adapter(RLModelInterface):
         advantages: torch.Tensor,
         device: Optional[torch.device] = None,
         batch_size: Optional[int] = None,
-        shuffle_samples: Optional[bool] = None
+        shuffle_samples: Optional[bool] = None,
+        scaler: Optional[torch.cuda.amp.GradScaler] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        gradient_accumulation_steps: int = 1
     ) -> torch.Tensor:
         """
         🚀 统一样本池训练接口：你想要的理想架构
@@ -696,14 +789,15 @@ class PI0_CFG_Adapter(RLModelInterface):
             episodes, advantages, device, shuffle_samples
         )
 
-        # 2. 从样本池计算损失
-        loss = self.compute_loss_from_sample_pool(
-            samples, sample_advantages, batch_size, device
+        # 2. 从样本池计算损失（内部已进行梯度累积）
+        loss_value = self.compute_loss_from_sample_pool(
+            samples, sample_advantages, batch_size, device, scaler, optimizer, gradient_accumulation_steps
         )
 
-        print(f"✅ Unified training complete, loss: {loss:.6f}")
+        print(f"✅ Unified training complete, loss: {loss_value:.6f}")
 
-        return loss
+        # 返回零梯度tensor，因为梯度已在内部累积
+        return torch.tensor(loss_value, device=device, requires_grad=False)
 
     def process_episodes(
         self,

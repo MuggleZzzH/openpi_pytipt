@@ -12,18 +12,18 @@ task:
   benchmark_name: "libero_spatial"         # 🔥 修复：使用小写格式
   task_names_to_use:
     - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"    # 🔥 修复：从LIBERO官方任务映射获取
-  num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
+  num_parallel_envs: 4  # 🔥 单环境避免内存问题
+  max_episode_length: 100  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 新增：LIBERO数据集配置
 use_libero_demos: true                     # 启用LIBERO demo加载
-libero_data_prefix: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset"  # LIBERO数据集路径（需要修改为实际路径）
+libero_data_prefix: "/zhaohan/ZJH/ript-vla_copy/datasets"  # LIBERO数据集根路径
 benchmark_name: "libero_spatial"          # 与task.benchmark_name保持一致
 
 # === 算法配置 ===
 algo:
-  demo_batch_size: 1
-  rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
+  demo_batch_size: 2
+  rloo_batch_size: 4  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
   gradient_accumulation_steps: 4  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.01
@@ -101,5 +101,5 @@ features:
 # - 更高的数据利用率
 
 # === 可调超参数（避免硬编码） ===
-unified_pool_batch_size: 2   # 统一样本池每个batch大小 - 降低避免OOM
+unified_pool_batch_size: 8   # 统一样本池每个batch大小 - 修复显存累积后适当提升
 unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序

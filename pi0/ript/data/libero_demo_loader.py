@@ -27,20 +27,17 @@ class LIBERODemoDataset(Dataset):
     def __init__(self, 
                  data_prefix: str,
                  benchmark_name: str = "LIBERO_SPATIAL",
-                 n_demos: int = 50,
                  task_names_to_use: Optional[List[str]] = None,
                  load_full_trajectory: bool = False):
         """
         Args:
             data_prefix: LIBERO数据集根目录路径
             benchmark_name: 基准名称 (LIBERO_SPATIAL, LIBERO_GOAL等)
-            n_demos: 每个任务使用的demo数量
             task_names_to_use: 要使用的任务名称列表
             load_full_trajectory: 是否加载完整轨迹（否则只加载初始状态）
         """
         self.data_prefix = data_prefix
         self.benchmark_name = benchmark_name
-        self.n_demos = n_demos
         self.load_full_trajectory = load_full_trajectory
         
         # 获取LIBERO基准
@@ -76,36 +73,25 @@ class LIBERODemoDataset(Dataset):
             task_name = task.name
             task_description = task.language
             
-            # 构建数据路径
-            task_data_path = os.path.join(
-                self.data_prefix, 
-                "libero", 
-                self.benchmark.get_task_demonstration(task_idx)
-            )
+            # 🔥 修复：get_task_demonstration返回的是文件路径，不是目录路径
+            demo_relative_path = self.benchmark.get_task_demonstration(task_idx)
+            demo_path = os.path.join(self.data_prefix, "libero", demo_relative_path)
             
-            if not os.path.exists(task_data_path):
-                logger.warning(f"任务数据路径不存在: {task_data_path}")
+            if not os.path.exists(demo_path):
+                logger.warning(f"任务数据路径不存在: {demo_path}")
                 continue
             
-            # 加载该任务的demo
-            demo_files = [f"demo_{i}.hdf5" for i in range(self.n_demos)]
-            
-            for demo_file in demo_files:
-                demo_path = os.path.join(task_data_path, demo_file)
-                
-                if not os.path.exists(demo_path):
-                    logger.warning(f"Demo文件不存在: {demo_path}")
-                    continue
-                
-                try:
-                    demo_data = self._load_single_demo(demo_path, task_idx, task_name, task_description)
-                    if demo_data is not None:
-                        self.demos.append(demo_data)
-                        self.task_descriptions.append(task_description)
-                        self.task_names.append(task_name)
-                except Exception as e:
-                    logger.warning(f"加载demo失败 {demo_path}: {e}")
-                    continue
+            # 🔥 直接加载单个演示文件，而不是查找多个demo_i.hdf5文件
+            try:
+                demo_data = self._load_single_demo(demo_path, task_idx, task_name, task_description)
+                if demo_data is not None:
+                    self.demos.append(demo_data)
+                    self.task_descriptions.append(task_description)
+                    self.task_names.append(task_name)
+                    logger.info(f"✓ 成功加载demo: {demo_path}")
+            except Exception as e:
+                logger.warning(f"加载demo失败 {demo_path}: {e}")
+                continue
     
     def _load_single_demo(self, demo_path: str, task_idx: int, task_name: str, task_description: str) -> Optional[Dict]:
         """
