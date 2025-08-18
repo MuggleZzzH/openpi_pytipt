@@ -12,8 +12,8 @@ task:
   benchmark_name: "libero_goal"
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
-  num_parallel_envs: 1  # 🔥 单环境避免内存问题
-  max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
+  num_parallel_envs: 2  # 🔥 单环境避免内存问题
+  max_episode_length: 51  # 🔥 进一步限制episode长度减少样本数
 
 # === 算法配置 ===
 algo:
@@ -21,7 +21,7 @@ algo:
   rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
   gradient_accumulation_steps: 8  # 🔥 增加累积步数补偿小batch
-  collection_cfg_scale: 1.0
+  collection_cfg_scale: 1.01
   cfg_uncond_weight: 0.1
   rollout_skip_threshold: 3
   enable_rollout_stats_tracking: false
@@ -29,7 +29,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: false  # 启用CFG测试
+  cfg_enabled: true  # 启用CFG测试
   train_expert_only: true
   freeze_vision_encoder: true
 

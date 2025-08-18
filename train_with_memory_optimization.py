@@ -71,7 +71,15 @@ def run_training_with_memory_optimization(config_path: str):
     
     try:
         # 导入并运行训练
-        from main_train_ript_vla_style import main
+        # 动态导入训练脚本
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("train_module", "11_train_ript_vla_style.py")
+        train_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(train_module)
+        main = train_module.main if hasattr(train_module, 'main') else None
+        
+        if main is None:
+            raise ImportError("无法找到main函数在11_train_ript_vla_style.py中")
         
         print(f"🎯 开始训练，配置文件: {config_path}")
         

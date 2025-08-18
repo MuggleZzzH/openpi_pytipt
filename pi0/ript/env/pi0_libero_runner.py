@@ -737,15 +737,36 @@ class LIBEROEnvRunner:
                         # 使用正确的PI0观测格式
                         pi0_observation = self.construct_pi0_observation(obs, task_description)
                         
-                        # 选择动作 - 使用配置的CFG参数
-                        # 优先读取policy.default_cfg_scale，其次读取runner.config.collection_cfg_scale，最后回退1.5
+                        # 选择动作 - 强制要求YAML中配置CFG参数
                         cfg_scale = None
+                        
+                        # 🔥 读取YAML配置（支持对象模式和dict模式）
+                        if self.config:
+                            # 对象模式
+                            if hasattr(self.config, 'algo') and hasattr(self.config.algo, 'collection_cfg_scale'):
+                                cfg_scale = self.config.algo.collection_cfg_scale
+                            # dict模式
+                            elif isinstance(self.config, dict):
+                                cfg_scale = self.config.get('algo', {}).get('collection_cfg_scale', None)
+                        
+                        # 🔥 如果YAML没写，直接抛错，不再回退默认值
+                        if cfg_scale is None:
+                            raise ValueError(
+                                "❌ 未在YAML的algo.collection_cfg_scale中找到CFG scale配置！\n"
+                                "请在配置文件中添加：\n"
+                                "algo:\n"
+                                "  collection_cfg_scale: 1.1  # 或其他值"
+                            )
+                        
+                        # 🔧 （可选）警告policy内置值被忽略
                         if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
-                            cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
-                        if cfg_scale is None:
-                            cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
-                        if cfg_scale is None:
-                            cfg_scale = 1.5
+                            policy_cfg = getattr(self.policy, 'default_cfg_scale', None)
+                            if policy_cfg is not None:
+                                print(f"⚠️ policy.default_cfg_scale={policy_cfg} 被忽略，使用YAML中的 {cfg_scale}")
+                        
+                        # 确认使用的CFG scale
+                        print(f"✅ 使用CFG Scale: {cfg_scale}")
+                        
                         raw_action = self.policy.select_action(pi0_observation, cfg_scale=cfg_scale)
                         action = raw_action[0, :, :7]  # shape: (50, 7)
                         
@@ -1387,13 +1408,20 @@ class LIBEROEnvRunner:
         
         # 合并批量观测（如果可能）
         if len(batch_obs) == 1:
-            # 单个观测直接推理 - 使用配置的CFG参数
-            cfg_scale = getattr(self.config, 'collection_cfg_scale', None)
-            if cfg_scale is None and self.config and hasattr(self.config, 'algo'):
-                cfg_scale = getattr(self.config.algo, 'collection_cfg_scale', None)
+            # 单个观测直接推理 - 强制要求YAML中配置CFG参数
+            cfg_scale = None
+            if self.config:
+                # 对象模式
+                if hasattr(self.config, 'algo') and hasattr(self.config.algo, 'collection_cfg_scale'):
+                    cfg_scale = self.config.algo.collection_cfg_scale
+                # dict模式
+                elif isinstance(self.config, dict):
+                    cfg_scale = self.config.get('algo', {}).get('collection_cfg_scale', None)
+            
             if cfg_scale is None:
-                print(f"⚠️ 未找到collection_cfg_scale配置，请在YAML中设置")
-                cfg_scale = 1.5  # 临时回退
+                raise ValueError("❌ 未在YAML的algo.collection_cfg_scale中找到CFG scale配置！")
+            
+            print(f"✅ 使用CFG Scale (单观测): {cfg_scale}")
             raw_action = self.policy.select_action(batch_obs[0], cfg_scale=cfg_scale)
             action = raw_action[0, :, :7]  # (50, 7)
             
@@ -1408,13 +1436,21 @@ class LIBEROEnvRunner:
             # 🚀 优化：尝试真正的批推理，失败时回退到循环推理
             try:
                 batch_observation = self._stack_pi0_observations(batch_obs)
+                
+                # 🔥 强制要求YAML中配置CFG参数（批推理）
                 cfg_scale = None
-                if hasattr(self, 'policy') and hasattr(self.policy, 'default_cfg_scale'):
-                    cfg_scale = getattr(self.policy, 'default_cfg_scale', None)
+                if self.config:
+                    # 对象模式
+                    if hasattr(self.config, 'algo') and hasattr(self.config.algo, 'collection_cfg_scale'):
+                        cfg_scale = self.config.algo.collection_cfg_scale
+                    # dict模式
+                    elif isinstance(self.config, dict):
+                        cfg_scale = self.config.get('algo', {}).get('collection_cfg_scale', None)
+                
                 if cfg_scale is None:
-                    cfg_scale = getattr(self.config, 'collection_cfg_scale', None) if self.config else None
-                if cfg_scale is None:
-                    cfg_scale = 1.5
+                    raise ValueError("❌ 未在YAML的algo.collection_cfg_scale中找到CFG scale配置！")
+                
+                print(f"✅ 使用CFG Scale (批推理): {cfg_scale}")
                 
                 # 一次性批推理 - 这是核心优化点
                 raw_actions = self.policy.select_action(batch_observation, cfg_scale=cfg_scale)
