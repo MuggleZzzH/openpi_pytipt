@@ -20,7 +20,7 @@ algo:
   demo_batch_size: 1
   rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
-  gradient_accumulation_steps: 8  # 🔥 增加累积步数补偿小batch
+  gradient_accumulation_steps: 4  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.01
   cfg_uncond_weight: 0.1
   rollout_skip_threshold: 3
@@ -87,3 +87,7 @@ features:
 # - 样本随机化，更好的训练稳定性
 # - 简化的优势传播，无复杂映射
 # - 更高的数据利用率
+
+# === 可调超参数（避免硬编码） ===
+unified_pool_batch_size: 16   # 统一样本池每个batch大小
+unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序

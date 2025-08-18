@@ -677,12 +677,17 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
         # 🚀 使用统一样本池方法（你想要的理想架构）
         if hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
             print("🚀 Using unified sample pool training...")
+            # 从配置读取可调参数
+            cfg_conf = cfg_adapter.policy.config
+            batch_size_cfg = getattr(cfg_conf, 'unified_pool_batch_size', None)
+            shuffle_cfg   = getattr(cfg_conf, 'unified_pool_shuffle', None)
+
             loss = cfg_adapter.compute_weighted_loss_unified(
                 episodes=episodes,
                 advantages=advantages,
                 device=device,
-                batch_size=32,  # 固定batch大小
-                shuffle_samples=True  # 打散样本顺序
+                batch_size=batch_size_cfg,
+                shuffle_samples=shuffle_cfg
             )
         else:
             print("🔧 Using legacy episode-by-episode training...")

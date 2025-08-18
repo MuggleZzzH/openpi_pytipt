@@ -386,9 +386,10 @@ class PI0_CFG_Adapter(RLModelInterface):
             # 生成该episode的所有样本
             episode_samples = self.so100_processor.process_trajectory_to_samples(formatted_episode)
 
-            # 记录样本和来源episode的映射
+            # 🔧 转换为OpenPI格式，确保包含'image'等字段
             for sample in episode_samples:
-                all_samples.append(sample)
+                openpi_sample = self.so100_processor.convert_to_openpi_format(sample)
+                all_samples.append(openpi_sample)
                 sample_episode_mapping.append(episode_idx)
 
         print(f"  Generated {len(all_samples)} samples from {len(episodes)} episodes")
@@ -585,20 +586,29 @@ class PI0_CFG_Adapter(RLModelInterface):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 # Step 1: 条件分支
                 outputs = self.policy.forward(batch)
-                per_step_per_dim_pos = outputs['losses']  # (B, T, D)
+                # 兼容 (pred, dict) 或 dict 两种返回
+                if isinstance(outputs, tuple):
+                    loss_dict_pos = outputs[1]
+                else:
+                    loss_dict_pos = outputs
+                per_step_per_dim_pos = loss_dict_pos['losses']  # (B, T, D)
 
                 # 立即清理中间结果
-                del outputs
+                del outputs, loss_dict_pos
                 torch.cuda.empty_cache()
 
                 # Step 2: 无条件分支
                 uncond_batch = batch.copy()
                 uncond_batch['prompt'] = [''] * B
                 uncond_outputs = self.policy.forward(uncond_batch)
-                per_step_per_dim_uncond = uncond_outputs['losses']
+                if isinstance(uncond_outputs, tuple):
+                    loss_dict_uncond = uncond_outputs[1]
+                else:
+                    loss_dict_uncond = uncond_outputs
+                per_step_per_dim_uncond = loss_dict_uncond['losses']
 
                 # 立即清理
-                del uncond_outputs, uncond_batch
+                del uncond_outputs, loss_dict_uncond, uncond_batch
                 torch.cuda.empty_cache()
 
                 # Step 3: CFG组合（在autocast内完成）
@@ -613,9 +623,13 @@ class PI0_CFG_Adapter(RLModelInterface):
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
                 # 非CFG模式：只使用条件分支
                 outputs = self.policy.forward(batch)
-                losses = outputs['losses']
+                if isinstance(outputs, tuple):
+                    loss_dict = outputs[1]
+                else:
+                    loss_dict = outputs
+                losses = loss_dict['losses']
 
-                del outputs
+                del outputs, loss_dict
                 torch.cuda.empty_cache()
 
                 combined_loss_per_step = w_pos.view(B, 1, 1) * losses
@@ -637,8 +651,8 @@ class PI0_CFG_Adapter(RLModelInterface):
         episodes: List[Dict[str, Any]],
         advantages: torch.Tensor,
         device: Optional[torch.device] = None,
-        batch_size: int = 32,
-        shuffle_samples: bool = True
+        batch_size: Optional[int] = None,
+        shuffle_samples: Optional[bool] = None
     ) -> torch.Tensor:
         """
         🚀 统一样本池训练接口：你想要的理想架构
@@ -665,6 +679,12 @@ class PI0_CFG_Adapter(RLModelInterface):
 
         if device is None:
             device = next(self.policy.parameters()).device
+
+        # 从配置读取可调参数，避免硬编码
+        if batch_size is None:
+            batch_size = getattr(self.policy.config, 'unified_pool_batch_size', 32)
+        if shuffle_samples is None:
+            shuffle_samples = getattr(self.policy.config, 'unified_pool_shuffle', True)
 
         print(f"🚀 Unified Sample Pool Training:")
         print(f"  - Episodes: {len(episodes)}")
