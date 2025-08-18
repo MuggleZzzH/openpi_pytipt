@@ -327,6 +327,9 @@ class PI0_CFG_Adapter(RLModelInterface):
             episode_advantages, episode_to_samples_map
         )
 
+        # 🔧 确保优势 tensor 与 batch 位于同一设备，避免 "different devices" 错误
+        sample_advantages = sample_advantages.to(self.device)
+
         # Validate mapping consistency
         is_valid = self.sample_generator.validate_episode_to_sample_mapping(
             episode_advantages, episode_to_samples_map, len(sample_advantages)

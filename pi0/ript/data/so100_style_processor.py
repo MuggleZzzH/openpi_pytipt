@@ -140,14 +140,21 @@ class SO100StyleProcessor:
             
             # Key: Compute relative actions (so100_train.py line 65)
             # action = action - state
-            # 🔥 修复：处理状态8维 vs 动作7维的维度不匹配
-            if current_state.shape[0] > action_chunk.shape[1]:
+            # 🔥 修复：处理状态8维 vs 动作7维的维度不匹配 + 数据类型不匹配
+            
+            # 确保current_state是numpy数组
+            if isinstance(current_state, torch.Tensor):
+                current_state_np = current_state.cpu().numpy()
+            else:
+                current_state_np = current_state
+            
+            if current_state_np.shape[0] > action_chunk.shape[1]:
                 # 状态维度 > 动作维度，只使用前action_dim维状态
-                state_for_action = current_state[:action_chunk.shape[1]]
+                state_for_action = current_state_np[:action_chunk.shape[1]]
                 relative_actions = action_chunk - state_for_action[None, :]
             else:
                 # 状态维度 <= 动作维度，直接计算
-                relative_actions = action_chunk - current_state[None, :]
+                relative_actions = action_chunk - current_state_np[None, :]
             
             # Create padding mask (all False for full-length chunks)
             action_is_pad = np.zeros(self.action_chunk_size, dtype=bool)

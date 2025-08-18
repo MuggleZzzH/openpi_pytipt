@@ -13,7 +13,7 @@ task:
   task_names_to_use:
     - "put_the_bowl_on_the_stove"
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: 51  # 🔥 进一步限制episode长度减少样本数
+  max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
 
 # === 算法配置 ===
 algo:

@@ -45,11 +45,13 @@ def create_test_episode(episode_length: int = 60) -> Dict[str, Any]:
         actions.append(action)
     
     episode = {
-        'observations': observations,
+        'processed_observations': observations,
         'actions': actions,
+        'states': [obs['state'] for obs in observations],  # 添加states序列
         'total_reward': 0.5,
         'success': True,
-        'task_description': 'test task'
+        'task_description': 'test task',
+        'id': 'test_episode_0'
     }
     
     return episode
@@ -63,14 +65,14 @@ def test_device_consistency():
     print(f"Target device: {device}")
     
     try:
+        # 创建处理器配置
+        config = {
+            'action_chunk_size': 50,
+            'norm_stats_path': '/zhaohan/ZJH/openpi/physical-intelligence/libero/norm_stats.json'
+        }
+        
         # 创建处理器
-        processor = SO100StyleProcessor(
-            action_chunk_size=50,
-            state_mean=np.zeros(8),
-            state_std=np.ones(8),
-            action_mean=np.zeros(7),
-            action_std=np.ones(7)
-        )
+        processor = SO100StyleProcessor(config)
         
         sample_generator = TrajectoryToSampleGenerator(processor)
         
@@ -78,22 +80,29 @@ def test_device_consistency():
         episode = create_test_episode(episode_length=60)
         
         print(f"📊 Test episode created:")
-        print(f"  - Episode length: {len(episode['observations'])}")
+        print(f"  - Episode length: {len(episode['processed_observations'])}")
         print(f"  - Action length: {len(episode['actions'])}")
         
         # 处理episode为样本
         print("🔄 Processing episode to samples...")
-        samples, episode_to_samples_map = sample_generator.process_episodes_to_samples(
-            [episode], device
+        samples, episode_to_samples_map = sample_generator.generate_samples_from_episodes(
+            [episode]
         )
+        
+        # 转换为OpenPI格式
+        openpi_samples = []
+        for sample in samples:
+            openpi_sample = sample_generator.processor.convert_to_openpi_format(sample)
+            openpi_samples.append(openpi_sample)
         
         print(f"✅ Sample generation successful:")
         print(f"  - Generated samples: {len(samples)}")
+        print(f"  - OpenPI samples: {len(openpi_samples)}")
         print(f"  - Episode mapping: {episode_to_samples_map}")
         
         # 检查样本设备
         print("🔍 Checking sample devices...")
-        for i, sample in enumerate(samples[:3]):  # 检查前3个样本
+        for i, sample in enumerate(openpi_samples[:3]):  # 检查前3个样本
             print(f"  Sample {i}:")
             print(f"    base_image device: {sample['image']['base_0_rgb'].device}")
             print(f"    wrist_image device: {sample['image']['left_wrist_0_rgb'].device}")
@@ -103,7 +112,7 @@ def test_device_consistency():
         
         # 测试collate
         print("🔄 Testing batch collation...")
-        batch = sample_generator.collate_samples_to_batch(samples[:4], device)
+        batch = sample_generator.collate_samples_to_batch(openpi_samples[:4], device)
         
         print(f"✅ Batch collation successful:")
         print(f"  - Batch size: {batch['batch_size']}")
@@ -122,9 +131,26 @@ def test_device_consistency():
             ('action_is_pad', batch['action_is_pad'])
         ]
         
+        # 使用相同的设备匹配函数
+        def devices_match(device1, device2):
+            """检查两个设备是否匹配，考虑cuda:0和cuda的等价性"""
+            device1_str = str(device1)
+            device2_str = str(device2)
+            
+            # 直接相等
+            if device1_str == device2_str:
+                return True
+            
+            # cuda和cuda:0等价
+            if (device1_str == 'cuda' and device2_str.startswith('cuda:')) or \
+               (device2_str == 'cuda' and device1_str.startswith('cuda:')):
+                return True
+                
+            return False
+        
         all_on_correct_device = True
         for name, tensor in tensors_to_check:
-            if tensor.device != expected_device:
+            if not devices_match(tensor.device, expected_device):
                 print(f"❌ {name} on wrong device: {tensor.device}, expected: {expected_device}")
                 all_on_correct_device = False
         
@@ -161,7 +187,30 @@ def test_advantages_device():
         print(f"w_pos device: {w_pos.device}")
         print(f"w_pos values: {w_pos}")
         
-        if advantages.device == device and w_pos.device == device:
+        # 检查设备是否正确（考虑cuda:0和cuda的等价性）
+        def devices_match(device1, device2):
+            """检查两个设备是否匹配，考虑cuda:0和cuda的等价性"""
+            device1_str = str(device1)
+            device2_str = str(device2)
+            
+            # 直接相等
+            if device1_str == device2_str:
+                return True
+            
+            # cuda和cuda:0等价
+            if (device1_str == 'cuda' and device2_str.startswith('cuda:')) or \
+               (device2_str == 'cuda' and device1_str.startswith('cuda:')):
+                return True
+                
+            return False
+        
+        advantages_correct = devices_match(advantages.device, device)
+        w_pos_correct = devices_match(w_pos.device, device)
+        
+        print(f"Advantages device check: {advantages.device} matches {device} -> {advantages_correct}")
+        print(f"w_pos device check: {w_pos.device} matches {device} -> {w_pos_correct}")
+        
+        if advantages_correct and w_pos_correct:
             print("✅ Advantages device handling correct!")
             return True
         else:
