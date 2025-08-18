@@ -44,7 +44,7 @@ ENV/
 # 日志、图像、数据集、检查点等（全部屏蔽）
 output/
 checkpoints/
-dataset/
+datasets/
 logs/
 images/
 libero_task_videos/
