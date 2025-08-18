@@ -45,7 +45,7 @@ class LIBERODemoDataset(Dataset):
         
         # 获取LIBERO基准
         try:
-            from libero.libero import get_benchmark
+            from libero.libero.benchmark import get_benchmark
             self.benchmark = get_benchmark(benchmark_name)()
             self.n_tasks = self.benchmark.n_tasks
         except ImportError:

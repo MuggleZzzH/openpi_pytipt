@@ -9,16 +9,16 @@ output_dir: "./output/stage11_unified_pool"
 
 # === 任务配置 ===
 task:
-  benchmark_name: "LIBERO_SPATIAL"         # 🔥 改为LIBERO标准基准名
+  benchmark_name: "libero_spatial"         # 🔥 修复：使用小写格式
   task_names_to_use:
-    - "LIBERO_SPATIAL_0"                   # 🔥 改为LIBERO标准任务名
+    - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"    # 🔥 修复：从LIBERO官方任务映射获取
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
   max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 新增：LIBERO数据集配置
 use_libero_demos: true                     # 启用LIBERO demo加载
-libero_data_prefix: "/path/to/libero/datasets"  # LIBERO数据集路径（需要修改为实际路径）
-benchmark_name: "LIBERO_SPATIAL"          # 与task.benchmark_name保持一致
+libero_data_prefix: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset"  # LIBERO数据集路径（需要修改为实际路径）
+benchmark_name: "libero_spatial"          # 与task.benchmark_name保持一致
 
 # === 算法配置 ===
 algo:
@@ -101,5 +101,5 @@ features:
 # - 更高的数据利用率
 
 # === 可调超参数（避免硬编码） ===
-unified_pool_batch_size: 16   # 统一样本池每个batch大小
+unified_pool_batch_size: 2   # 统一样本池每个batch大小 - 降低避免OOM
 unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序

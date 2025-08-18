@@ -574,11 +574,11 @@ def update_policy_ript_vla_style(policy, optimizer, cfg_adapter, episodes, advan
         gradient_accumulation_steps = config.get('algo', {}).get('gradient_accumulation_steps', 1)
     
     if gradient_accumulation_steps > 1:
-        return update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps)
+        return update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, config)
     else:
-        return update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device)
+        return update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device, config)
 
-def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps):
+def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, config=None):
     """
     梯度累积版本的策略更新（AMP增强 + 窗口级微批处理）
     """
@@ -607,10 +607,10 @@ def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, epi
     
     # 使用标准梯度累积方法
     return update_policy_with_gradient_accumulation_fallback(
-        policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler
+        policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler, config=config
     )
 
-def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler):
+def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_adapter, episodes, advantages, device, gradient_accumulation_steps, scaler, config=None):
     """
     回退版本的梯度累积（保持向后兼容）
     """
@@ -637,7 +637,34 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
             # 🔥 使用autocast包裹forward计算
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 mini_advantages = mini_advantages.to(device)
-                loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
+                
+                # 🚀 检查是否使用统一样本池方法
+                use_unified_pool = config is not None and config.get('unified_pool_batch_size') is not None
+                
+                # 🔥 调试信息
+                print(f"🔍 梯度累积中的调试信息:")
+                print(f"  use_unified_pool: {use_unified_pool}")
+                print(f"  hasattr(cfg_adapter, 'use_so100_processing'): {hasattr(cfg_adapter, 'use_so100_processing')}")
+                if hasattr(cfg_adapter, 'use_so100_processing'):
+                    print(f"  cfg_adapter.use_so100_processing: {cfg_adapter.use_so100_processing}")
+                
+                if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+                    print("🚀 Using unified sample pool training in gradient accumulation...")
+                    # 从config读取参数
+                    batch_size_cfg = config.get('unified_pool_batch_size', 8)
+                    shuffle_cfg = config.get('unified_pool_shuffle', True)
+                    print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
+                    
+                    loss = cfg_adapter.compute_weighted_loss_unified(
+                        episodes=mini_episodes,
+                        advantages=mini_advantages,
+                        device=device,
+                        batch_size=batch_size_cfg,
+                        shuffle_samples=shuffle_cfg
+                    )
+                else:
+                    print("🔧 Using legacy episode-by-episode training in gradient accumulation...")
+                    loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
             
             # 🔥 关键：损失归一化（除以累积步数）
             normalized_loss = loss / gradient_accumulation_steps
@@ -673,7 +700,7 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
     print(f"✓ 回退AMP梯度累积训练完成，平均损失: {avg_loss:.6f}")
     return avg_loss
 
-def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device):
+def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, device, config=None):
     """简单版本的策略更新（无梯度累积）"""
     print(f"正在更新策略（{len(episodes)} 个episodes）...")
 
@@ -690,12 +717,23 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
         advantages = advantages.to(device)
 
         # 🚀 使用统一样本池方法（你想要的理想架构）
-        if hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
+        use_unified_pool = config.get('unified_pool_batch_size') is not None  # 🔥 修复：检查是否配置了统一样本池
+        
+        # 🔥 调试信息
+        print(f"🔍 调试信息:")
+        print(f"  unified_pool_batch_size: {config.get('unified_pool_batch_size')}")
+        print(f"  use_unified_pool: {use_unified_pool}")
+        print(f"  hasattr(cfg_adapter, 'use_so100_processing'): {hasattr(cfg_adapter, 'use_so100_processing')}")
+        if hasattr(cfg_adapter, 'use_so100_processing'):
+            print(f"  cfg_adapter.use_so100_processing: {cfg_adapter.use_so100_processing}")
+        
+        if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
             print("🚀 Using unified sample pool training...")
             # 从配置读取可调参数
-            cfg_conf = cfg_adapter.policy.config
-            batch_size_cfg = getattr(cfg_conf, 'unified_pool_batch_size', None)
-            shuffle_cfg   = getattr(cfg_conf, 'unified_pool_shuffle', None)
+            batch_size_cfg = config.get('unified_pool_batch_size', 8)  # 🔥 修复：从主配置读取
+            shuffle_cfg = config.get('unified_pool_shuffle', True)
+            
+            print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
 
             loss = cfg_adapter.compute_weighted_loss_unified(
                 episodes=episodes,
@@ -706,6 +744,8 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
             )
         else:
             print("🔧 Using legacy episode-by-episode training...")
+            if use_unified_pool:
+                print("  注意：配置了unified_pool_batch_size但SO100处理未启用")
             loss = cfg_adapter.compute_weighted_loss(episodes, advantages, device)
 
         # 梯度更新
