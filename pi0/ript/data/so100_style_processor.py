@@ -170,28 +170,37 @@ class SO100StyleProcessor:
     def convert_to_openpi_format(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         """
         Convert sample to OpenPI format following so100_train.py pattern.
-        
+
         Args:
             sample: Raw sample from process_trajectory_to_samples
-            
+
         Returns:
             Sample in OpenPI format compatible with model training
         """
         # Extract observation components
         obs = sample['observation']
-        
+
+        # 🔥 确保所有tensor都在CPU上（稍后统一转移到GPU）
+        def ensure_cpu_tensor(tensor_data):
+            if isinstance(tensor_data, torch.Tensor):
+                return tensor_data.cpu()
+            elif isinstance(tensor_data, np.ndarray):
+                return torch.from_numpy(tensor_data).cpu()
+            else:
+                return torch.tensor(tensor_data).cpu()
+
         # Convert to OpenPI format (following so100_train.py lines 71-75)
         openpi_sample = {
             "image": {
-                "base_0_rgb": obs['image']['base_0_rgb'],
-                "left_wrist_0_rgb": obs['image']['left_wrist_0_rgb']
+                "base_0_rgb": ensure_cpu_tensor(obs['image']['base_0_rgb']).float(),
+                "left_wrist_0_rgb": ensure_cpu_tensor(obs['image']['left_wrist_0_rgb']).float()
             },
-            "state": obs['state'],
-            "action": torch.from_numpy(sample['action']).float(),
-            "action_is_pad": torch.from_numpy(sample['action_is_pad']),
+            "state": ensure_cpu_tensor(obs['state']).float(),
+            "action": torch.from_numpy(sample['action']).float().cpu(),
+            "action_is_pad": torch.from_numpy(sample['action_is_pad']).cpu(),
             "prompt": obs.get('prompt', [''])
         }
-        
+
         return openpi_sample
     
     def validate_sample_format(self, sample: Dict[str, Any]) -> bool:

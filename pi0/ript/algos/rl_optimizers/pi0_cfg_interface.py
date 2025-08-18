@@ -566,8 +566,11 @@ class PI0_CFG_Adapter(RLModelInterface):
         # 获取CFG参数
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
 
+        # 🔥 确保优势tensor在正确设备上
+        advantages = advantages.to(device)
+
         # 二值化优势
-        w_pos = (advantages > 0).float()
+        w_pos = (advantages > 0).float().to(device)
 
         B = batch.get('batch_size', batch['state'].shape[0])
 

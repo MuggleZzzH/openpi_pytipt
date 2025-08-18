@@ -160,20 +160,45 @@ class TrajectoryToSampleGenerator:
             states.append(sample['state'])
             actions.append(sample['action'])
             action_is_pads.append(sample['action_is_pad'])
-            prompts.extend(sample['prompt'])  # Flatten prompt list
+
+            # 🔥 修复prompt处理：sample['prompt']是列表，取第一个元素
+            sample_prompt = sample['prompt']
+            if isinstance(sample_prompt, list):
+                prompts.append(sample_prompt[0] if sample_prompt else '')
+            else:
+                prompts.append(sample_prompt)
         
-        # Stack tensors
-        batch = {
-            'image': {
-                'base_0_rgb': torch.stack(base_images).to(device),
-                'left_wrist_0_rgb': torch.stack(wrist_images).to(device)
-            },
-            'state': torch.stack(states).to(device),
-            'action': torch.stack(actions).to(device),
-            'action_is_pad': torch.stack(action_is_pads).to(device),
-            'prompt': prompts,
-            'batch_size': batch_size
-        }
+        # 🔥 确保所有tensor都在正确的设备上
+        try:
+            # Stack tensors with explicit device transfer
+            base_images_tensor = torch.stack(base_images)
+            wrist_images_tensor = torch.stack(wrist_images)
+            states_tensor = torch.stack(states)
+            actions_tensor = torch.stack(actions)
+            action_is_pads_tensor = torch.stack(action_is_pads)
+
+            # 显式转移到目标设备
+            batch = {
+                'image': {
+                    'base_0_rgb': base_images_tensor.to(device),
+                    'left_wrist_0_rgb': wrist_images_tensor.to(device)
+                },
+                'state': states_tensor.to(device),
+                'action': actions_tensor.to(device),
+                'action_is_pad': action_is_pads_tensor.to(device),
+                'prompt': prompts,
+                'batch_size': batch_size
+            }
+
+        except Exception as e:
+            print(f"❌ Tensor stacking/device transfer failed: {e}")
+            print(f"   Sample tensor devices:")
+            for i, sample in enumerate(samples[:3]):  # 检查前3个样本
+                print(f"   Sample {i}:")
+                print(f"     base_image device: {sample['image']['base_0_rgb'].device}")
+                print(f"     state device: {sample['state'].device}")
+                print(f"     action device: {sample['action'].device}")
+            raise
         
         print(f"✓ Batch collation complete:")
         print(f"  - Batch size: {batch_size}")
