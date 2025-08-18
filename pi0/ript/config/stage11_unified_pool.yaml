@@ -9,11 +9,16 @@ output_dir: "./output/stage11_unified_pool"
 
 # === 任务配置 ===
 task:
-  benchmark_name: "libero_goal"
+  benchmark_name: "LIBERO_SPATIAL"         # 🔥 改为LIBERO标准基准名
   task_names_to_use:
-    - "put_the_bowl_on_the_stove"
+    - "LIBERO_SPATIAL_0"                   # 🔥 改为LIBERO标准任务名
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
   max_episode_length: 60  # 🔥 进一步限制episode长度减少样本数
+
+# 🔥 新增：LIBERO数据集配置
+use_libero_demos: true                     # 启用LIBERO demo加载
+libero_data_prefix: "/path/to/libero/datasets"  # LIBERO数据集路径（需要修改为实际路径）
+benchmark_name: "LIBERO_SPATIAL"          # 与task.benchmark_name保持一致
 
 # === 算法配置 ===
 algo:
@@ -68,6 +73,13 @@ features:
   enable_file_counter: false
   adaptive_cfg: false
   early_stop_percentage: 1.0
+
+  # 🔥 新增：并行环境初始状态同步控制
+  parallel_env_sync:
+    enabled: true                    # 启用并行环境同步
+    fixed_init_state_id: 0          # 固定使用的初始状态ID
+    verify_sync: true               # 验证同步性
+    sync_tolerance: 1e-6            # 状态差异容忍度
   
   # 动态采样配置
   dynamic_sampling:
