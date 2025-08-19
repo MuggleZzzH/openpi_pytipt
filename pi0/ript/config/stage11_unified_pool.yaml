@@ -17,7 +17,7 @@ task:
 
 # 🔥 新增：LIBERO数据集配置
 use_libero_demos: true                     # 启用LIBERO demo加载
-libero_data_prefix: "/zhaohan/ZJH/ript-vla_copy/datasets"  # LIBERO数据集根路径
+libero_data_prefix: "/zhaohan/ZJH/openpi_pytorch/datasets"  # LIBERO数据集根路径
 benchmark_name: "libero_spatial"          # 与task.benchmark_name保持一致
 
 # === 算法配置 ===
@@ -34,7 +34,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: false  # 启用CFG测试
+  cfg_enabled: true  # 启用CFG测试
   train_expert_only: true
   freeze_vision_encoder: true
 
