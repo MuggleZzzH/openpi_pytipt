@@ -670,12 +670,14 @@ class PI0_CFG_Adapter(RLModelInterface):
 
         # CFG分支计算（内存优化）
         if getattr(self.policy.model, 'cfg_enabled', True):
-            print(f"🔮 CFG双分支计算: batch_size={B}")
+            print(f"🔮 CFG双分支计算 (IQL风格): batch_size={B}, 相同输入+不同CFG标志")
 
             # 🔥 分阶段计算避免内存峰值
             with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                # Step 1: 条件分支
-                outputs = self.policy.forward(batch)
+                # Step 1: 条件分支（IQL风格：设置CFG标志为1）
+                pos_batch = batch.copy()
+                pos_batch['is_positive'] = torch.ones(B, device=device, dtype=torch.long)
+                outputs = self.policy.forward(pos_batch)
                 # 兼容 (pred, dict) 或 dict 两种返回
                 if isinstance(outputs, tuple):
                     loss_dict_pos = outputs[1]
@@ -684,12 +686,13 @@ class PI0_CFG_Adapter(RLModelInterface):
                 per_step_per_dim_pos = loss_dict_pos['losses']  # (B, T, D)
 
                 # 立即清理中间结果
-                del outputs, loss_dict_pos
+                del outputs, loss_dict_pos, pos_batch
                 torch.cuda.empty_cache()
 
-                # Step 2: 无条件分支
+                # Step 2: 无条件分支（IQL风格：相同输入，只改变CFG标志）
                 uncond_batch = batch.copy()
-                uncond_batch['prompt'] = [''] * B
+                # 🔥 方案2：不清空prompt，保持语言信息，只改变CFG标志
+                uncond_batch['is_positive'] = torch.zeros(B, device=device, dtype=torch.long)
                 uncond_outputs = self.policy.forward(uncond_batch)
                 if isinstance(uncond_outputs, tuple):
                     loss_dict_uncond = uncond_outputs[1]

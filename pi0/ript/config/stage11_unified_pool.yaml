@@ -34,7 +34,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: false  # 启用CFG测试
+  cfg_enabled: true   # 🔥 启用CFG功能（方案2：IQL风格CFG）
   train_expert_only: true
   freeze_vision_encoder: true
 
