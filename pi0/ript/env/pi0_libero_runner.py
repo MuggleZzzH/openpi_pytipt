@@ -1006,9 +1006,12 @@ class LIBEROEnvRunner:
             if self.rank == 0:
                 print(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")
                 if sync_enabled and fixed_init_state_id is not None:
-                    print(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
+                    if fixed_init_state_id == -1:
+                        print("🎲 启用智能随机模式，每次重置随机选择初始状态")
+                    else:
+                        print(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
                 else:
-                    print("🎲 使用随机初始状态模式")
+                    print("🎲 使用完全随机初始状态模式")
 
             # 设置multiprocessing启动方法
             if multiprocessing.get_start_method(allow_none=True) != 'spawn':

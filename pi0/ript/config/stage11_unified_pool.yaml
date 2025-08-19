@@ -34,7 +34,7 @@ algo:
 
 # === 策略配置 ===
 policy:
-  cfg_enabled: true  # 启用CFG测试
+  cfg_enabled: false  # 启用CFG测试
   train_expert_only: true
   freeze_vision_encoder: true
 
@@ -76,14 +76,15 @@ features:
 
   # 🔥 新增：并行环境初始状态同步控制
   parallel_env_sync:
-    enabled: true                    # 启用并行环境同步
-    fixed_init_state_id: 0          # 固定使用的初始状态ID
-    verify_sync: true               # 验证同步性
+    enabled: true                    # 启用智能随机选择
+    fixed_init_state_id: -1         # 🎲 -1表示随机选择，>=0表示固定ID
+    verify_sync: false              # 随机模式下不验证同步性
     sync_tolerance: 1e-6            # 状态差异容忍度
+    random_sampling: true           # 🔥 新增：启用随机采样模式
   
   # 动态采样配置
   dynamic_sampling:
-    enabled: false
+    enabled: true
 
 # === 🎯 统一样本池配置说明 ===
 # 
@@ -101,5 +102,5 @@ features:
 # - 更高的数据利用率
 
 # === 可调超参数（避免硬编码） ===
-unified_pool_batch_size: 12   # 统一样本池每个batch大小 - 修复显存累积后适当提升
+unified_pool_batch_size: 8   # 统一样本池每个batch大小 - 修复显存累积后适当提升
 unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序

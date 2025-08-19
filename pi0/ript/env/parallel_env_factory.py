@@ -13,19 +13,29 @@ from typing import Optional
 
 class SyncedInitStateWrapper:
     """
-    同步初始状态包装器
+    智能初始状态包装器
 
-    确保并行环境都使用相同的初始状态ID，解决随机初始状态导致的不同步问题。
+    支持两种模式：
+    1. 固定模式：所有环境使用相同的初始状态ID（同步）
+    2. 随机模式：每次重置随机选择初始状态ID
     """
 
     def __init__(self, env, fixed_init_state_id: int):
         """
         Args:
             env: 被包装的环境
-            fixed_init_state_id: 固定的初始状态ID
+            fixed_init_state_id: 初始状态ID配置
+                - >= 0: 固定使用指定ID（同步模式）
+                - -1: 随机选择ID（随机模式）
         """
+        import random
         self.env = env
         self.fixed_init_state_id = fixed_init_state_id
+        self.random_mode = (fixed_init_state_id == -1)
+        self.random = random.Random()  # 独立的随机数生成器
+        
+        # 获取环境支持的初始状态数量
+        self.num_init_states = getattr(env, 'num_init_states', 1)
 
         # 代理所有属性到原始环境
         for attr in ['action_space', 'observation_space', 'task_description',
@@ -35,16 +45,22 @@ class SyncedInitStateWrapper:
 
     def reset(self, init_state_id: Optional[int] = None):
         """
-        重置环境，强制使用固定的初始状态ID
+        重置环境，根据模式选择初始状态ID
 
         Args:
-            init_state_id: 忽略此参数，始终使用固定的ID
+            init_state_id: 传入的初始状态ID（在固定模式下忽略）
 
         Returns:
             observation: 环境观测
         """
-        # 🔥 关键修复：忽略传入的init_state_id，使用固定值
-        return self.env.reset(init_state_id=self.fixed_init_state_id)
+        if self.random_mode:
+            # 🎲 随机模式：从可用的初始状态中随机选择
+            selected_id = self.random.randint(0, self.num_init_states - 1)
+            print(f"🎲 随机选择初始状态ID: {selected_id}/{self.num_init_states}")
+            return self.env.reset(init_state_id=selected_id)
+        else:
+            # 🔒 固定模式：使用指定的初始状态ID
+            return self.env.reset(init_state_id=self.fixed_init_state_id)
 
     def __getattr__(self, name):
         """代理其他属性到原始环境"""
@@ -137,7 +153,9 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
             task_id=task_id
         )
 
-        # 🔥 关键修复：如果指定了固定初始状态ID，创建同步包装器
+        # 🔥 智能初始状态包装器：
+        # - fixed_init_state_id >= 0: 固定同步模式
+        # - fixed_init_state_id == -1: 智能随机模式
         if fixed_init_state_id is not None:
             env = SyncedInitStateWrapper(env, fixed_init_state_id)
 
