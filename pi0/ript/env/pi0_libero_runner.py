@@ -1187,10 +1187,29 @@ class LIBEROEnvRunner:
             print(f"🔧 最终决定: use_parallel_init = {use_parallel_init}")
         if use_parallel_init and init_states is not None:
             try:
-                obs_any = env.set_init_state(init_states)
+                # 🔥 修复：确保状态格式正确
+                processed_states = self._process_init_states_for_parallel(init_states, env_num)
+
+                # 🔥 修复：使用原版RIPT的调用方式
+                if hasattr(env, 'reset') and 'init_states' in env.reset.__code__.co_varnames:
+                    # 原版RIPT风格：env.reset(init_states=states)
+                    obs_any, info = env.reset(init_states=processed_states)
+                    if self.rank == 0:
+                        print(f"✅ 使用原版RIPT风格并行状态设置成功")
+                else:
+                    # 回退到直接调用
+                    obs_any = env.set_init_state(processed_states)
+                    if self.rank == 0:
+                        print(f"✅ 使用直接调用并行状态设置成功")
             except Exception as e:
                 if self.rank == 0:
-                    print(f"⚠️ set_init_state 调用失败，继续使用默认初始状态: {e}")
+                    print(f"⚠️ 并行状态设置失败: {e}")
+                    print(f"   状态类型: {type(init_states)}")
+                    if hasattr(init_states, 'shape'):
+                        print(f"   状态形状: {init_states.shape}")
+                    print(f"   状态数据类型: {init_states.dtype if hasattr(init_states, 'dtype') else 'N/A'}")
+                # 重新reset环境
+                obs_any = env.reset()
         else:
             if self.rank == 0 and init_states is not None:
                 print("ℹ️ 并行模式下已跳过 set_init_state（use_parallel_init_state=false）")
@@ -1749,4 +1768,41 @@ class LIBEROEnvRunner:
             return False
         except:
             return False
+
+    def _process_init_states_for_parallel(self, init_states, env_num):
+        """处理初始状态以适配并行环境（修复MuJoCo格式问题）"""
+        try:
+            if init_states is None:
+                return None
+
+            # 转换为numpy数组
+            if isinstance(init_states, torch.Tensor):
+                init_states = init_states.cpu().numpy()
+
+            # 确保是numpy数组
+            if not isinstance(init_states, np.ndarray):
+                init_states = np.array(init_states)
+
+            # 🔥 关键修复：确保数据类型为float64（MuJoCo期望）
+            if init_states.dtype != np.float64:
+                init_states = init_states.astype(np.float64)
+
+            # 确保形状正确
+            if init_states.ndim == 1:
+                # 单个状态，复制给所有环境
+                init_states = np.tile(init_states, (env_num, 1))
+            elif init_states.ndim == 2:
+                if init_states.shape[0] == 1:
+                    # 单个状态，复制给所有环境
+                    init_states = np.tile(init_states[0], (env_num, 1))
+                elif init_states.shape[0] != env_num:
+                    # 状态数量不匹配，使用第一个状态
+                    init_states = np.tile(init_states[0], (env_num, 1))
+
+            print(f"🔧 处理后的并行状态: 形状={init_states.shape}, 类型={init_states.dtype}")
+            return init_states
+
+        except Exception as e:
+            print(f"⚠️ 状态处理失败: {e}")
+            return None
     
