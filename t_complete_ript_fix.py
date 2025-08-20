@@ -69,8 +69,8 @@ def test_complete_data_flow():
             print(f"   状态值范围: [{extracted_state.min():.3f}, {extracted_state.max():.3f}]")
             
             # 5. 测试状态检查函数
-            from pi0.ript.env.pi0_libero_runner import PI0LiberoRunner
-            runner = PI0LiberoRunner(None, None, None)  # 创建临时实例
+            from pi0.ript.env.pi0_libero_runner import LIBEROEnvRunner
+            runner = LIBEROEnvRunner()  # 创建临时实例
             
             is_mujoco = runner._is_mujoco_state(extracted_state.numpy())
             print(f"✅ MuJoCo状态检查: {is_mujoco}")
@@ -138,8 +138,8 @@ def test_config_alignment():
         checks = [
             ('defaults', lambda c: 'paths' in c.get('defaults', [])),
             ('data_prefix', lambda c: '${paths.data_prefix}' in str(c.get('data_prefix', ''))),
-            ('dataset.load_state', lambda c: c.get('dataset', {}).get('load_state', False)),
-            ('use_libero_demos', lambda c: c.get('use_libero_demos', False)),
+            ('dataset.load_state', lambda c: c.get('dataset', {}).get('load_state', False) == True),
+            ('use_libero_demos', lambda c: c.get('use_libero_demos', False) == True),
         ]
         
         all_passed = True
@@ -196,8 +196,8 @@ def simulate_training_step(mujoco_state):
         print("   模拟环境状态设置...")
         
         # 检查状态格式
-        from pi0.ript.env.pi0_libero_runner import PI0LiberoRunner
-        runner = PI0LiberoRunner(None, None, None)
+        from pi0.ript.env.pi0_libero_runner import LIBEROEnvRunner
+        runner = LIBEROEnvRunner()
         
         for i, state in enumerate(env_init_states):
             is_mujoco = runner._is_mujoco_state(state)
