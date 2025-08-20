@@ -231,9 +231,8 @@ try:
     from pi0.ript.algos.rl_optimizers.pi0_cfg_interface import PI0_CFG_Adapter
     print("✓ RIPT核心组件")
 
-    # 🔥 新增：LIBERO demo数据加载器
-    from pi0.ript.data.libero_demo_loader import create_libero_demo_dataloader
-    print("✓ LIBERO demo加载器")
+    # 🔥 使用RIPT对齐的数据加载器（修复MuJoCo状态问题）
+    print("✓ 使用RIPT对齐数据加载器")
     
     # # 导入简化的环境runner
     # try:
@@ -922,30 +921,43 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     num_train_steps = config['training']['num_train_steps']
     task_names = config['task'].get('task_names_to_use', ['LIBERO_SPATIAL_0'])
 
-    # 🔥 新增：创建LIBERO demo数据加载器
+    # 🔥 创建RIPT对齐的LIBERO demo数据加载器
     use_libero_demos = config.get('use_libero_demos', True)
     if use_libero_demos:
         try:
-            # 从环境变量或配置中获取数据路径
-            libero_data_prefix = config.get('libero_data_prefix', '/path/to/libero/datasets')
-            benchmark_name = config.get('benchmark_name', 'LIBERO_SPATIAL')
+            # 从配置中获取数据路径
+            libero_data_prefix = config.get('libero_data_prefix', '/zhaohan/ZJH/openpi_pytorch/datasets')
+            benchmark_name = config.get('benchmark_name', 'libero_spatial')  # 🔥 使用小写格式
 
-            demo_dataloader = create_libero_demo_dataloader(
+            # 🔥 使用RIPT对齐的数据集（包含MuJoCo状态）
+            dataset = build_dataset_ript_aligned(
                 data_prefix=libero_data_prefix,
+                suite_name="libero",
                 benchmark_name=benchmark_name,
-                batch_size=demo_batch_size,
-                n_demos=50,  # 每个任务50个demo
                 task_names_to_use=task_names if task_names != ['LIBERO_SPATIAL_0'] else None,
-                shuffle=True,
-                num_workers=0  # 避免多进程问题
+                load_state=True,  # 🔥 关键：加载MuJoCo状态
+                seq_len=600,
+                n_demos=50
             )
+
+            # 🔥 使用RIPT对齐的collate函数
+            from torch.utils.data import DataLoader
+            demo_dataloader = DataLoader(
+                dataset,
+                batch_size=demo_batch_size,
+                shuffle=True,
+                collate_fn=collate_fn_ript_aligned,  # 🔥 关键：使用RIPT对齐的collate
+                num_workers=0
+            )
+
             demo_data_iter = iter(demo_dataloader)
-            print(f"✅ LIBERO demo数据加载器创建成功")
+            print(f"✅ RIPT对齐demo数据加载器创建成功")
             print(f"  数据路径: {libero_data_prefix}")
             print(f"  基准: {benchmark_name}")
-            print(f"  数据集大小: {len(demo_dataloader.dataset)}")
+            print(f"  数据集大小: {len(dataset)}")
+            print(f"  🔥 包含MuJoCo状态: True")
         except Exception as e:
-            print(f"⚠️ LIBERO demo加载器创建失败: {e}")
+            print(f"⚠️ RIPT对齐demo加载器创建失败: {e}")
             print("  将使用传统的环境重置方式")
             demo_dataloader = None
             demo_data_iter = None

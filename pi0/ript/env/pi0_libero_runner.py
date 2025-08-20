@@ -653,25 +653,26 @@ class LIBEROEnvRunner:
             # 🔥 关键修改：尝试设置初始状态
             if target_init_state is not None:
                 try:
-                    # 方案1: 如果环境支持set_init_state
-                    if hasattr(env, 'set_init_state'):
-                        obs = env.set_init_state(target_init_state)
-                        print(f"✅ 串行模式：成功设置初始状态 {i}")
-                    # 方案2: 如果环境支持reset_to
-                    elif hasattr(env, 'reset_to'):
-                        obs = env.reset_to(target_init_state)
-                        print(f"✅ 串行模式：通过reset_to设置初始状态 {i}")
-                    else:
-                        # 方案3: 回退到普通reset，但记录警告
-                        obs = env.reset()
-                        print(f"⚠️ 串行模式：环境不支持set_init_state，使用随机初始状态")
-                        # 记录实际的初始状态用于后续验证
-                        if is_vector_env and isinstance(obs, list):
-                            actual_obs = obs[0]
+                    # 🔥 与原版RIPT对齐的状态设置
+                    if self._is_mujoco_state(target_init_state):
+                        # 方案1: 原版RIPT风格 - reset(init_states=mujoco_states)
+                        if hasattr(env, 'reset'):
+                            obs, info = env.reset(init_states=target_init_state)
+                            print(f"✅ 串行模式：RIPT风格状态设置成功 {i}")
                         else:
-                            actual_obs = obs
-                        actual_init_state = self._extract_state_from_obs(actual_obs)
-                        target_init_state = actual_init_state  # 更新为实际状态
+                            # 回退到直接设置
+                            obs = env.set_init_state(target_init_state)
+                            print(f"✅ 串行模式：直接MuJoCo状态设置成功 {i}")
+                    else:
+                        # 方案2: 观测字典或其他格式
+                        if hasattr(env, 'set_init_state'):
+                            obs = env.set_init_state(target_init_state)
+                            print(f"✅ 串行模式：观测状态设置成功 {i}")
+                        else:
+                            obs = env.reset()
+                            print(f"⚠️ 串行模式：不支持状态设置，使用随机初始状态")
+                            actual_init_state = self._extract_state_from_obs(obs)
+                            target_init_state = actual_init_state
                 except Exception as e:
                     print(f"⚠️ 设置初始状态失败: {e}，回退到随机reset")
                     obs = env.reset()
@@ -1719,4 +1720,21 @@ class LIBEROEnvRunner:
         enable_true_parallel = features_config.get('enable_true_parallel_envs', False)
 
         return enable_parallel and enable_true_parallel and batch_size > 1
+
+    def _is_mujoco_state(self, state_data):
+        """检查是否为MuJoCo状态向量（与原版RIPT对齐）"""
+        try:
+            if isinstance(state_data, dict):
+                return False  # 观测字典不是MuJoCo状态
+
+            if hasattr(state_data, 'shape'):
+                # 检查是否为高维状态向量（MuJoCo状态通常>100维）
+                if len(state_data.shape) == 1 and state_data.shape[0] > 50:
+                    return True
+                elif len(state_data.shape) == 2 and state_data.shape[-1] > 50:
+                    return True
+
+            return False
+        except:
+            return False
     
