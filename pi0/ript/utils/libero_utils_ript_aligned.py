@@ -119,39 +119,71 @@ class RIPTAlignedDataset(Dataset):
         return demos
     
     def _load_real_demo(self, demo_file: str, task_idx: int, task_name: str) -> Dict:
-        """加载真实的demo文件"""
+        """加载真实的demo文件（修复：正确读取HDF5结构）"""
         try:
             with h5py.File(demo_file, 'r') as f:
-                # 🔥 加载观测数据
+                print(f"🔍 检查demo文件结构: {demo_file}")
+
+                # 🔥 修复：按照原版RIPT的方式读取数据
                 obs_data = {}
-                if self.load_obs and 'obs' in f:
-                    obs_data = {
-                        'agentview_rgb': np.array(f['obs/agentview_rgb'][0]),
-                        'robot0_eef_pos': np.array(f['obs/robot0_eef_pos'][0]),
-                        'robot0_joint_pos': np.array(f['obs/robot0_joint_pos'][0]),
-                    }
-                
-                # 🔥 关键：加载MuJoCo状态数据
                 states_data = None
-                if self.load_state:
-                    if 'states' in f:
-                        states_data = np.array(f['states'][:])
-                    else:
-                        print(f"⚠️ {demo_file} 缺少states数据，生成模拟状态")
-                        states_data = self._generate_mock_states()
-                
+
+                # 检查是否有data目录（标准LIBERO格式）
+                if 'data' in f:
+                    print(f"✅ 找到data目录，包含demos: {list(f['data'].keys())}")
+
+                    # 选择第一个demo（通常是demo_0）
+                    demo_ids = list(f['data'].keys())
+                    if demo_ids:
+                        demo_id = demo_ids[0]  # 使用第一个demo
+                        demo_group = f['data'][demo_id]
+                        print(f"📋 使用demo: {demo_id}")
+
+                        # 🔥 加载观测数据（从第一个时间步）
+                        if self.load_obs and 'obs' in demo_group:
+                            obs_group = demo_group['obs']
+                            obs_data = {}
+
+                            # 读取第一个时间步的观测
+                            if 'agentview_rgb' in obs_group:
+                                obs_data['agentview_rgb'] = np.array(obs_group['agentview_rgb'][0])
+                            if 'ee_pos' in obs_group:
+                                obs_data['robot0_eef_pos'] = np.array(obs_group['ee_pos'][0])
+                            if 'joint_states' in obs_group:
+                                obs_data['robot0_joint_pos'] = np.array(obs_group['joint_states'][0])
+
+                        # 🔥 关键修复：正确加载MuJoCo状态数据
+                        if self.load_state and 'states' in demo_group:
+                            # 读取第一个时间步的状态作为初始状态
+                            full_states = np.array(demo_group['states'])  # Shape: (timesteps, state_dim)
+                            initial_state = full_states[0:1]  # 取第一个时间步，保持2D: (1, state_dim)
+                            states_data = initial_state
+
+                            print(f"✅ 成功加载MuJoCo状态:")
+                            print(f"   完整轨迹形状: {full_states.shape}")
+                            print(f"   初始状态形状: {states_data.shape}")
+                        else:
+                            print(f"⚠️ {demo_file} 在 {demo_id} 中缺少states数据")
+
+                # 如果没有找到states数据，生成模拟数据
+                if states_data is None:
+                    print(f"⚠️ 未找到states数据，生成模拟状态")
+                    states_data = self._generate_mock_states()
+
                 return {
                     'task_id': task_idx,
                     'task_name': task_name,
                     'initial_obs': obs_data,
                     'init_state': {
                         'states': torch.tensor(states_data, dtype=torch.float32),
-                        'pad_mask': torch.ones(len(states_data), dtype=torch.bool)
-                    } if states_data is not None else None
+                        'pad_mask': torch.ones(states_data.shape[0], dtype=torch.bool)  # 对应时间步数
+                    }
                 }
-                
+
         except Exception as e:
             print(f"⚠️ 加载demo失败 {demo_file}: {e}")
+            import traceback
+            print(f"错误详情: {traceback.format_exc()}")
             return self._create_mock_demo(task_idx, task_name)
     
     def _create_mock_demo(self, task_idx: int, task_name: str) -> Dict:
