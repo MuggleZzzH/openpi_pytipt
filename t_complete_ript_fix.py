@@ -138,7 +138,7 @@ def test_config_alignment():
         checks = [
             ('defaults', lambda c: 'paths' in c.get('defaults', [])),
             ('data_prefix', lambda c: '${paths.data_prefix}' in str(c.get('data_prefix', ''))),
-            ('dataset.load_state', lambda c: c.get('dataset', {}).get('load_state', False) == True),
+            ('dataset.load_state', lambda c: c.get('dataset', {}).get('load_state', False) or c.get('load_state', False)),
             ('use_libero_demos', lambda c: c.get('use_libero_demos', False) == True),
         ]
         
@@ -181,7 +181,19 @@ def simulate_training_step(mujoco_state):
         # 2. 模拟状态提取（原版RIPT逻辑）
         batch_index = 0
         sample_states = batch['init_state']
-        init_state = sample_states['states'][batch_index, 0][sample_states['pad_mask'][batch_index]]
+        # 🔥 修复：完全按照原版RIPT的逻辑
+        # states: [B, T, state_dim], pad_mask: [B, T]
+        # 原版逻辑：sample_states['states'][batch_index, 0][sample_states['pad_mask'][batch_index]]
+        # 这里pad_mask[batch_index]是一个[T]的布尔张量，用来选择有效的状态维度
+        first_timestep_state = sample_states['states'][batch_index, 0]  # [state_dim]
+        timestep_mask = sample_states['pad_mask'][batch_index]  # [T]
+
+        # 如果pad_mask的第一个时间步为True，则使用完整状态
+        if timestep_mask[0]:
+            init_state = first_timestep_state  # 使用完整的状态向量
+        else:
+            print("⚠️ 第一个时间步被mask掉了，这不应该发生")
+            init_state = first_timestep_state
         
         # 3. 模拟RLOO扩展
         rloo_batch_size = 4

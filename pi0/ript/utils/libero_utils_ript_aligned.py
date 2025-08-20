@@ -255,36 +255,47 @@ def collate_fn_ript_aligned(batch):
     # 🔥 处理init_state字段（与原版RIPT完全一致）
     if 'init_state' in batch[0] and batch[0]['init_state'] is not None:
         states = [item['init_state']['states'] for item in batch]
-        max_len = max(s.shape[-1] for s in states)
-        
+
+        # 🔥 修复：正确处理状态维度
+        # states的形状应该是 [T, state_dim]，我们需要找到最大的T
+        max_seq_len = max(s.shape[0] for s in states)  # 序列长度维度
+        max_state_dim = max(s.shape[-1] for s in states)  # 状态维度
+
         padded_states = []
         masks = []
         modified_batch = []
-        
+
         for item in batch:
-            # 填充状态到相同长度
+            # 获取状态张量 [T, state_dim]
             tensor = item['init_state']['states'].float()
-            pad_size = max_len - tensor.shape[-1]
-            padded = torch.nn.functional.pad(tensor, (0, pad_size))
+            seq_len, state_dim = tensor.shape
+
+            # 填充序列长度到max_seq_len
+            seq_pad_size = max_seq_len - seq_len
+            state_pad_size = max_state_dim - state_dim
+
+            # 填充：(left_pad, right_pad) for last dim, (left_pad, right_pad) for second last dim
+            padded = torch.nn.functional.pad(tensor, (0, state_pad_size, 0, seq_pad_size))
             padded_states.append(padded)
-            
-            mask = torch.ones(tensor.shape[-1], dtype=torch.bool)
-            mask = torch.nn.functional.pad(mask, (0, pad_size), value=False)
+
+            # 创建对应的mask [T]
+            mask = torch.ones(seq_len, dtype=torch.bool)
+            mask = torch.nn.functional.pad(mask, (0, seq_pad_size), value=False)
             masks.append(mask)
-            
+
             # 创建不包含init_state的item
             modified_item = {key: item[key] for key in item.keys() if key != 'init_state'}
             modified_batch.append(modified_item)
-        
+
         # 正常collate其他字段
         collated_batch = default_collate(modified_batch)
-        
+
         # 🔥 添加处理好的init_state（与原版RIPT格式一致）
         collated_batch['init_state'] = {
-            'states': torch.stack(padded_states),
-            'pad_mask': torch.stack(masks)
+            'states': torch.stack(padded_states),    # [B, T, state_dim]
+            'pad_mask': torch.stack(masks)           # [B, T]
         }
-        
+
         return collated_batch
     else:
         # 如果没有init_state，使用默认collate
