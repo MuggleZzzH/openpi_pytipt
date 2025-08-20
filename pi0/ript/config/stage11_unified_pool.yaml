@@ -10,8 +10,8 @@ exp_name: stage11_unified_pool_test
 
 # === 基本路径配置（使用paths.yaml中的配置）===
 policy_path: "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
-output_dir: "${paths.output_prefix}/stage11_unified_pool"  # 🔥 使用paths配置
-data_prefix: ${paths.data_prefix}  # 🔥 与原版RIPT对齐
+output_dir: "/zhaohan/ZJH/openpi_pytorch/experiments/stage11_unified_pool"  # 🔥 直接使用绝对路径
+data_prefix: "/zhaohan/ZJH/openpi_pytorch/datasets"  # 🔥 直接使用绝对路径
 
 # === 任务配置 ===
 task:
@@ -23,7 +23,7 @@ task:
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                     # 启用LIBERO demo加载
-libero_data_prefix: ${paths.data_prefix}   # 🔥 使用paths配置
+libero_data_prefix: "/zhaohan/ZJH/openpi_pytorch/datasets"   # 🔥 直接使用绝对路径
 benchmark_name: "libero_spatial"          # 与task.benchmark_name保持一致
 
 # 🔥 数据集配置（与原版RIPT对齐）
@@ -35,6 +35,8 @@ dataset:
   load_next_obs: true
   get_pad_mask: true
   load_state: true  # 🔥 关键：加载MuJoCo状态数据
+  # 🔥 添加缺失的配置项
+  _target_: pi0.ript.utils.libero_utils_ript_aligned.build_dataset_ript_aligned
 
 # === 算法配置 ===
 algo:
@@ -55,7 +57,8 @@ policy:
   freeze_vision_encoder: true
 
 # === 🚀 数据处理配置 - 启用统一样本池 ===
-dataset:
+# 注意：dataset配置已在上面定义，这里添加额外的处理配置
+data_processing:
   num_init_states: 1
   state_dim: 8
   
@@ -71,12 +74,22 @@ dataset:
 training:
   num_train_steps: 3  # 快速测试
   seed: 42
+  n_steps: 3
+  rollout_steps: 1
+  log_interval: 1
+  save_interval: 1
+  load_obs: true
   save_freq: 1
 
 # === 日志配置 ===
 logging:
   use_wandb: false
   log_freq: 1
+  group: null
+  mode: online
+  project: "openpi-ript-vla"
+  resume: true
+  save_code: true
 
 # === 特性开关 - 简化配置 ===
 features:
@@ -117,13 +130,7 @@ features:
 # - 简化的优势传播，无复杂映射
 # - 更高的数据利用率
 
-# === 训练配置（与原版RIPT对齐）===
-training:
-  n_steps: 3
-  rollout_steps: 1
-  log_interval: 1
-  save_interval: 1
-  load_obs: true
+# === 训练配置（与原版RIPT对齐）- 已合并到上面的training部分 ===
 
 # === 数据加载配置（与原版RIPT对齐）===
 train_dataloader:
@@ -133,13 +140,7 @@ train_dataloader:
   persistent_workers: false
   pin_memory: true
 
-# === 日志配置（与原版RIPT对齐）===
-logging:
-  group: null
-  mode: online
-  project: ${common.wandb_project}
-  resume: true
-  save_code: true
+# === 日志配置（与原版RIPT对齐）- 已合并到上面的logging部分 ===
 
 # === 可调超参数（避免硬编码） ===
 unified_pool_batch_size: 8   # 统一样本池每个batch大小 - 修复显存累积后适当提升

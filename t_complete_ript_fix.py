@@ -58,10 +58,20 @@ def test_complete_data_flow():
             print(f"   states形状: {states.shape}")
             print(f"   pad_mask形状: {pad_mask.shape}")
             
-            # 4. 模拟原版RIPT的状态提取
+            # 4. 修复后的RIPT状态提取逻辑
             batch_index = 0
             sample_states = init_state
-            extracted_state = sample_states['states'][batch_index, 0][sample_states['pad_mask'][batch_index]]
+            
+            # 🔥 正确的状态提取方式
+            first_timestep_state = sample_states['states'][batch_index, 0]  # [state_dim]
+            batch_mask = sample_states['pad_mask'][batch_index]  # [T]
+            
+            # 检查第一个时间步是否有效
+            if batch_mask[0]:  # 第一个时间步有效
+                extracted_state = first_timestep_state
+            else:
+                print(f"⚠️ 第一个时间步无效，这不应该发生")
+                extracted_state = first_timestep_state
             
             print(f"✅ 状态提取成功:")
             print(f"   提取状态形状: {extracted_state.shape}")

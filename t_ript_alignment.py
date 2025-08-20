@@ -47,7 +47,7 @@ def test_dataset_creation():
             data_prefix="/zhaohan/ZJH/openpi_pytorch/datasets",
             suite_name="libero",
             benchmark_name="libero_spatial",
-            task_names_to_use=["pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"],
+            task_names_to_use=["pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate_demo"],
             load_state=True,  # 🔥 关键：加载MuJoCo状态
             seq_len=600
         )

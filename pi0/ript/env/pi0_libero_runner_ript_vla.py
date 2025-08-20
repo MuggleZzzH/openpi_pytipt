@@ -121,7 +121,7 @@ class PI0LiberoRunner:
         self.num_steps_wait = 20  # LIBERO simulator warmup - 🔧 修复：使用与参考脚本相同的20步
         
         # 🔧 默认强制批处理模式，避免SubprocVectorEnv的模型复制问题
-        self._force_batch_mode = True  # 设为False可启用真正并行
+        self._force_batch_mode = False  # 设为False可启用真正并行
         
         # 加载归一化参数
         self._load_norm_stats()
@@ -172,7 +172,7 @@ class PI0LiberoRunner:
             
             if self.rank == 0:
                 print(f"🚀 创建 {env_num} 个并行环境 (真正并行)")
-                
+            print("真正并行")
             env = SubprocVectorEnv([env_factory for _ in range(env_num)])
         else:
             # 🔧 修复：批处理模式 - 在主进程创建单个环境，模拟并行
@@ -194,7 +194,7 @@ class PI0LiberoRunner:
             }
             single_env = OffScreenRenderEnv(**env_args)
             single_env.seed(0)
-            
+            print(f"🔧 使用批处理模式模拟 {env_num} 个并行环境（避免内存问题）")
             # 包装成批处理环境
             env = BatchProcessingWrapper(single_env, env_num)
         

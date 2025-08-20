@@ -106,7 +106,7 @@ class RIPTAlignedDataset(Dataset):
         
         for task_idx, task_name in enumerate(self.task_names_to_use):
             # 🔥 尝试加载真实的demo文件
-            demo_file = os.path.join(self.dataset_path, f"{task_name}.hdf5")
+            demo_file = os.path.join(self.dataset_path, f"{task_name}_demo.hdf5")
             
             if os.path.exists(demo_file):
                 demo_data = self._load_real_demo(demo_file, task_idx, task_name)
