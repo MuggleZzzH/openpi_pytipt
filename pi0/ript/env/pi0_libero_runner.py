@@ -1171,8 +1171,20 @@ class LIBEROEnvRunner:
         try:
             if getattr(self, 'config', None) and hasattr(self.config, 'features'):
                 use_parallel_init = bool(getattr(self.config.features, 'use_parallel_init_state', False))
-        except Exception:
+                if self.rank == 0:
+                    print(f"🔧 并行状态设置配置: use_parallel_init_state = {use_parallel_init}")
+        except Exception as e:
             use_parallel_init = False
+            if self.rank == 0:
+                print(f"⚠️ 读取并行状态配置失败: {e}")
+                print(f"   config存在: {getattr(self, 'config', None) is not None}")
+                if getattr(self, 'config', None):
+                    print(f"   features存在: {hasattr(self.config, 'features')}")
+                    if hasattr(self.config, 'features'):
+                        print(f"   features内容: {self.config.features}")
+
+        if self.rank == 0:
+            print(f"🔧 最终决定: use_parallel_init = {use_parallel_init}")
         if use_parallel_init and init_states is not None:
             try:
                 obs_any = env.set_init_state(init_states)
