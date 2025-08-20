@@ -1,0 +1,31 @@
+# 🔥 与原版RIPT对齐的路径配置
+# 参考: /Users/mugglezzzh/Library/CloudStorage/OneDrive-个人/桌面/VLA/ript-vla/config/paths.yaml
+
+paths:
+  # 🔥 数据集根目录 - 包含专家演示数据（带MuJoCo状态）
+  data_prefix: /zhaohan/ZJH/openpi_pytorch/datasets
+  
+  # 🔥 实验输出目录
+  output_prefix: /zhaohan/ZJH/openpi_pytorch/experiments
+  
+  # 🔥 模型检查点目录
+  checkpoint_prefix: /zhaohan/ZJH/openpi_pytorch/checkpoints
+  
+  # 🔥 日志目录
+  log_prefix: /zhaohan/ZJH/openpi_pytorch/logs
+
+# 🔥 通用配置
+common:
+  wandb_project: openpi-ript-vla
+  wandb_entity: null  # 设置你的wandb entity
+  
+# 🔥 数据集特定路径
+dataset_paths:
+  # LIBERO数据集路径（包含MuJoCo状态的专家演示）
+  libero_spatial: ${paths.data_prefix}/libero/libero_spatial
+  libero_object: ${paths.data_prefix}/libero/libero_object  
+  libero_goal: ${paths.data_prefix}/libero/libero_goal
+  libero_long: ${paths.data_prefix}/libero/libero_long
+  
+  # 初始状态文件路径（benchmark预设状态）
+  init_states: ${paths.data_prefix}/init_files

@@ -28,6 +28,12 @@ import traceback
 import time
 from tqdm import tqdm
 
+# 🔥 添加RIPT对齐的数据集工具
+from pi0.ript.utils.libero_utils_ript_aligned import (
+    build_dataset_ript_aligned,
+    collate_fn_ript_aligned
+)
+
 import hashlib
 
 # 修复tokenizers并行化警告和EGL错误
@@ -406,13 +412,30 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
     print(f"正在收集 {num_rollouts} 个rollouts...")
 
     try:
-        # 🔥 新增：处理demo初始状态
+        # 🔥 处理demo初始状态（与原版RIPT对齐）
         if demo_initial_state is not None:
             print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
-            # 从demo中提取初始状态信息
             task_id = demo_initial_state['task_id'][0].item()
-            # 将demo的初始观测转换为环境可用的初始状态
-            all_init_states = [demo_initial_state['initial_obs']]
+
+            # 🔥 与原版RIPT对齐：优先使用MuJoCo状态
+            if 'init_state' in demo_initial_state and demo_initial_state['init_state'] is not None:
+                # 使用demo中的MuJoCo状态（与原版RIPT一致）
+                init_state_data = demo_initial_state['init_state']
+                states = init_state_data['states']  # (T, state_dim)
+                pad_mask = init_state_data['pad_mask']  # (T,)
+
+                # 提取第一个有效状态（与原版RIPT逻辑一致）
+                valid_indices = torch.where(pad_mask)[0]
+                if len(valid_indices) > 0:
+                    first_valid_state = states[valid_indices[0]]  # (state_dim,)
+                    all_init_states = [first_valid_state.numpy()]
+                    print(f"  ✅ 使用demo MuJoCo状态，维度: {first_valid_state.shape}")
+                else:
+                    print(f"  ⚠️ demo状态无有效数据，回退到观测")
+                    all_init_states = [demo_initial_state['initial_obs']]
+            else:
+                print(f"  ⚠️ demo缺少MuJoCo状态，使用观测数据")
+                all_init_states = [demo_initial_state['initial_obs']]
         else:
             # 获取任务的初始状态和task_id
             task_id = 0  # 简化处理，使用第一个任务
