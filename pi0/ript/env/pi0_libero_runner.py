@@ -653,26 +653,15 @@ class LIBEROEnvRunner:
             # 🔥 关键修改：尝试设置初始状态
             if target_init_state is not None:
                 try:
-                    # 🔥 与原版RIPT对齐的状态设置
-                    if self._is_mujoco_state(target_init_state):
-                        # 方案1: 原版RIPT风格 - reset(init_states=mujoco_states)
-                        if hasattr(env, 'reset'):
-                            obs, info = env.reset(init_states=target_init_state)
-                            print(f"✅ 串行模式：RIPT风格状态设置成功 {i}")
-                        else:
-                            # 回退到直接设置
-                            obs = env.set_init_state(target_init_state)
-                            print(f"✅ 串行模式：直接MuJoCo状态设置成功 {i}")
-                    else:
-                        # 方案2: 观测字典或其他格式
-                        if hasattr(env, 'set_init_state'):
-                            obs = env.set_init_state(target_init_state)
-                            print(f"✅ 串行模式：观测状态设置成功 {i}")
-                        else:
-                            obs = env.reset()
-                            print(f"⚠️ 串行模式：不支持状态设置，使用随机初始状态")
-                            actual_init_state = self._extract_state_from_obs(obs)
-                            target_init_state = actual_init_state
+                    # 🔥 简化：使用原版RIPT的调用方式
+                    # 确保状态是连续的numpy数组
+                    if isinstance(target_init_state, np.ndarray):
+                        target_init_state = np.ascontiguousarray(target_init_state.astype(np.float64))
+                    
+                    # 先reset，再set_init_state（与原版RIPT完全一致）
+                    obs = env.reset()
+                    obs = env.set_init_state(target_init_state)
+                    print(f"✅ 串行模式：状态设置成功 {i}，状态维度: {target_init_state.shape if hasattr(target_init_state, 'shape') else 'N/A'}")
                 except Exception as e:
                     print(f"⚠️ 设置初始状态失败: {e}，回退到随机reset")
                     obs = env.reset()
@@ -1190,17 +1179,23 @@ class LIBEROEnvRunner:
                 # 🔥 修复：确保状态格式正确
                 processed_states = self._process_init_states_for_parallel(init_states, env_num)
 
-                # 🔥 修复：使用原版RIPT的调用方式
-                if hasattr(env, 'reset') and 'init_states' in env.reset.__code__.co_varnames:
-                    # 原版RIPT风格：env.reset(init_states=states)
-                    obs_any, info = env.reset(init_states=processed_states)
+                # 🔥 修复：确保状态数据能正确序列化到子进程
+                if processed_states is not None and len(processed_states) > 0:
+                    # 🔥 修复：使用原始RIPT的正确方式 - 通过reset方法传递初始状态
+                    # 确保状态数据格式正确（numpy数组格式，与原始RIPT保持一致）
+                    if isinstance(processed_states, list):
+                        # 转换为numpy数组，保持[env_num, state_dim]格式
+                        init_states_array = np.array(processed_states, dtype=np.float64)
+                    else:
+                        init_states_array = processed_states
+                    
+                    # 🔥 关键修复：使用reset方法而不是set_init_state方法
+                    obs_any = env.reset(init_states=init_states_array)
                     if self.rank == 0:
-                        print(f"✅ 使用原版RIPT风格并行状态设置成功")
+                        print(f"✅ 并行状态设置成功，状态数量: {len(init_states_array)}")
                 else:
-                    # 回退到直接调用
-                    obs_any = env.set_init_state(processed_states)
-                    if self.rank == 0:
-                        print(f"✅ 使用直接调用并行状态设置成功")
+                    # 没有初始状态时，使用普通reset
+                    obs_any = env.reset()
             except Exception as e:
                 if self.rank == 0:
                     print(f"⚠️ 并行状态设置失败: {e}")
@@ -1211,8 +1206,11 @@ class LIBEROEnvRunner:
                 # 重新reset环境
                 obs_any = env.reset()
         else:
-            if self.rank == 0 and init_states is not None:
-                print("ℹ️ 并行模式下已跳过 set_init_state（use_parallel_init_state=false）")
+            if self.rank == 0:
+                if init_states is not None:
+                    print("ℹ️ 并行模式下跳过状态设置，使用随机初始化（避免MuJoCo状态格式不兼容）")
+                else:
+                    print("ℹ️ 并行模式下使用随机初始化")
         obs_list = self._ensure_list_of_dict_obs(obs_any, env_num)
         
         if self.rank == 0:
@@ -1759,15 +1757,17 @@ class LIBEROEnvRunner:
                 return False  # 观测字典不是MuJoCo状态
 
             if hasattr(state_data, 'shape'):
-                # 检查是否为高维状态向量（MuJoCo状态通常>100维）
-                if len(state_data.shape) == 1 and state_data.shape[0] > 50:
+                # 检查是否为高维状态向量（MuJoCo状态通常>50维，包括92维）
+                if len(state_data.shape) == 1 and state_data.shape[0] >= 50:
                     return True
-                elif len(state_data.shape) == 2 and state_data.shape[-1] > 50:
+                elif len(state_data.shape) == 2 and state_data.shape[-1] >= 50:
                     return True
 
             return False
         except:
             return False
+    
+
 
     def _process_init_states_for_parallel(self, init_states, env_num):
         """处理初始状态以适配并行环境（修复MuJoCo格式问题）"""

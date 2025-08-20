@@ -13,54 +13,86 @@ from typing import Optional
 
 class SyncedInitStateWrapper:
     """
-    智能初始状态包装器
-
-    支持两种模式：
-    1. 固定模式：所有环境使用相同的初始状态ID（同步）
-    2. 随机模式：每次重置随机选择初始状态ID
+    简化的初始状态包装器
+    
+    🔥 专门为RIPT-VLA风格训练设计：
+    1. 优先支持传入的init_states参数（与原始RIPT保持一致）
+    2. 彻底删除随机选择逻辑，确保可预测性
+    3. 如无init_states，则使用标准环境reset
     """
 
-    def __init__(self, env, fixed_init_state_id: int):
+    def __init__(self, env, fixed_init_state_id: int = 0):
         """
         Args:
             env: 被包装的环境
-            fixed_init_state_id: 初始状态ID配置
-                - >= 0: 固定使用指定ID（同步模式）
-                - -1: 随机选择ID（随机模式）
+            fixed_init_state_id: 保留兼容性，但不再使用随机模式
         """
-        import random
         self.env = env
-        self.fixed_init_state_id = fixed_init_state_id
-        self.random_mode = (fixed_init_state_id == -1)
-        self.random = random.Random()  # 独立的随机数生成器
-        
-        # 获取环境支持的初始状态数量
-        self.num_init_states = getattr(env, 'num_init_states', 1)
+        self.fixed_init_state_id = fixed_init_state_id if fixed_init_state_id >= 0 else 0
 
         # 代理所有属性到原始环境
         for attr in ['action_space', 'observation_space', 'task_description',
                      'num_init_states', 'step', 'close', 'seed']:
             if hasattr(env, attr):
                 setattr(self, attr, getattr(env, attr))
+        
+        print(f"🔧 SyncedInitStateWrapper: 初始化完成")
+        print(f"   - 随机选择逻辑: 已彻底删除 ✅")
+        print(f"   - 固定init_state_id: {self.fixed_init_state_id}")
+        print(f"   - init_states优先级: 最高 ✅")
 
-    def reset(self, init_state_id: Optional[int] = None):
+    def reset(self, init_state_id: Optional[int] = None, init_states=None, **kwargs):
         """
-        重置环境，根据模式选择初始状态ID
+        重置环境 - 简化版本，彻底删除随机逻辑
+        
+        🔥 专门为RIPT-VLA训练设计：完全可预测，无随机性
+        🔥 优先级顺序：
+        1. init_states (最高，与原始RIPT保持一致)
+        2. init_state_id (次高)
+        3. 标准重置 (默认)
 
         Args:
-            init_state_id: 传入的初始状态ID（在固定模式下忽略）
+            init_state_id: 传入的初始状态ID
+            init_states: 原始RIPT风格的状态数组（最高优先级）
+            **kwargs: 其他传递给底层环境的参数
 
         Returns:
             observation: 环境观测
         """
-        if self.random_mode:
-            # 🎲 随机模式：从可用的初始状态中随机选择
-            selected_id = self.random.randint(0, self.num_init_states - 1)
-            print(f"🎲 随机选择初始状态ID: {selected_id}/{self.num_init_states}")
-            return self.env.reset(init_state_id=selected_id)
-        else:
-            # 🔒 固定模式：使用指定的初始状态ID
-            return self.env.reset(init_state_id=self.fixed_init_state_id)
+        # 🔥 兼容原始RIPT: 如果传入了init_states，采用原始RIPT的处理方式
+        if init_states is not None:
+            print(f"🔄 SyncedInitStateWrapper: 使用传入的init_states (最高优先级)")
+            print(f"🎯 SyncedInitStateWrapper: 采用原始RIPT模式 - 先reset再set_init_state")
+            # 1. 先普通重置
+            obs = self.env.reset(**kwargs)
+            # 2. 再设置初始状态 (与原始RIPT保持一致)
+            if hasattr(self.env, 'set_init_state'):
+                # 🔥 关键修复：确保状态数据维度正确
+                import numpy as np
+                if isinstance(init_states, (list, np.ndarray)):
+                    init_states_array = np.array(init_states)
+                    # 如果是2D数组 [env_num, state_dim]，取第一个环境的状态
+                    if init_states_array.ndim > 1:
+                        # 去掉batch维度，只传递单个状态向量
+                        single_state = init_states_array.flatten() if init_states_array.shape[0] == 1 else init_states_array[0]
+                        print(f"🔧 SyncedInitStateWrapper: 维度修复 {init_states_array.shape} -> {single_state.shape}")
+                        print(f"✅ SyncedInitStateWrapper: 成功设置init_states")
+                        self.env.set_init_state(single_state)
+                    else:
+                        self.env.set_init_state(init_states_array)
+                else:
+                    self.env.set_init_state(init_states)
+            print(f"🎉 SyncedInitStateWrapper: init_states处理完成，返回观测")
+            return obs
+        
+        # 🔥 彻底删除随机逻辑：只使用简单的默认重置或固定ID
+        if init_state_id is not None:
+            print(f"🔧 SyncedInitStateWrapper: 使用传入的init_state_id: {init_state_id}")
+            return self.env.reset(init_state_id=init_state_id, **kwargs)
+        
+        # 默认使用标准重置，确保完全可预测
+        print(f"🔧 SyncedInitStateWrapper: 使用标准环境重置")
+        return self.env.reset(**kwargs)
 
     def __getattr__(self, name):
         """代理其他属性到原始环境"""

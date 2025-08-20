@@ -80,4 +80,4 @@ gemini_refer/
 # 屏蔽所有名字中带有test的文件和文件夹
 test*
 *test*
-*/test*/
+*/test*/core.*
