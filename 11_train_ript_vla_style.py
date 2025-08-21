@@ -28,6 +28,11 @@ import traceback
 import time
 from tqdm import tqdm
 
+# 🔥 早期设置multiprocessing，避免子进程重复设置
+import multiprocessing as mp
+if mp.get_start_method(allow_none=True) != "spawn":
+    mp.set_start_method("spawn", force=True)
+
 # 🔥 添加RIPT对齐的数据集工具
 from pi0.ript.utils.libero_utils_ript_aligned import (
     build_dataset_ript_aligned,
@@ -1038,6 +1043,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     else:
                         print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
                               f"成功率 {np.mean(successes):.2%} (动态采样已禁用)")
+                    
+                    # 🔥 更新全局episode计数器，确保下次轮换继续
+                    env_runner.update_episode_counter(len(group_episodes))
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
         

@@ -91,13 +91,20 @@ class RIPTAlignedDataset(Dataset):
         self.seq_len = seq_len
         self.load_obs = load_obs
         self.get_pad_mask = get_pad_mask
+        self.n_demos = n_demos  # 🔥 存储demo数量参数
         
         # 🔥 加载demo数据
         self.demos = self._load_demos()
         
+        # 🔥 计算实际可用的demo总数
+        total_available_demos = sum(demo.get('available_demo_count', 1) for demo in self.demos)
+        if total_available_demos == 0:
+            total_available_demos = 50  # 默认值，基于之前的观察
+            
         print(f"✅ RIPT对齐数据集初始化完成:")
         print(f"   任务数量: {len(self.task_names_to_use)}")
-        print(f"   Demo数量: {len(self.demos)}")
+        print(f"   加载的Demo数量: {len(self.demos)}")
+        print(f"   可用Demo总数: {total_available_demos}")
         print(f"   加载状态: {self.load_state}")
     
     def _load_demos(self) -> List[Dict]:
@@ -132,12 +139,17 @@ class RIPTAlignedDataset(Dataset):
                 if 'data' in f:
                     print(f"✅ 找到data目录，包含demos: {list(f['data'].keys())}")
 
-                    # 选择第一个demo（通常是demo_0）
-                    demo_ids = list(f['data'].keys())
+                    # 🔥 修复统计报告：显示实际可用demo数量
+                    demo_ids = sorted(list(f['data'].keys()))
+                    n_demos_available = len(demo_ids)
+                    
+                    print(f"📋 发现 {n_demos_available} 个demo: {demo_ids[:10]}{'...' if len(demo_ids) > 10 else ''}")
+                    
+                    # 选择第一个demo用于数据加载（但记录总数用于统计）
                     if demo_ids:
                         demo_id = demo_ids[0]  # 使用第一个demo
                         demo_group = f['data'][demo_id]
-                        print(f"📋 使用demo: {demo_id}")
+                        print(f"📋 使用demo: {demo_id} (共有{n_demos_available}个可用)")
 
                         # 🔥 加载观测数据（从第一个时间步）
                         if self.load_obs and 'obs' in demo_group:
@@ -177,7 +189,8 @@ class RIPTAlignedDataset(Dataset):
                     'init_state': {
                         'states': torch.tensor(states_data, dtype=torch.float32),
                         'pad_mask': torch.ones(states_data.shape[0], dtype=torch.bool)  # 对应时间步数
-                    }
+                    },
+                    'available_demo_count': n_demos_available  # 🔥 包含实际可用demo数量
                 }
 
         except Exception as e:
@@ -205,7 +218,8 @@ class RIPTAlignedDataset(Dataset):
             'init_state': {
                 'states': torch.tensor(mock_states, dtype=torch.float32),
                 'pad_mask': torch.ones(len(mock_states), dtype=torch.bool)
-            }
+            },
+            'available_demo_count': 1  # 🔥 Mock demo只有1个
         }
     
     def _generate_mock_states(self) -> np.ndarray:

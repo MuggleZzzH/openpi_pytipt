@@ -106,7 +106,7 @@ features:
   # 🔥 RIPT对齐：并行环境初始状态同步控制
   parallel_env_sync:
     enabled: true                    # 启用同步控制
-    fixed_init_state_id: 0          # 🔒 固定使用第一个状态ID，与demo状态对齐
+    fixed_init_state_id: -1         # 🔄 -1 表示让wrapper按顺序轮换，不固定特定ID
     verify_sync: true               # 验证状态同步性
     sync_tolerance: 1e-6            # 状态差异容忍度
     random_sampling: false          # 🚫 禁用随机采样，确保确定性

@@ -10,6 +10,9 @@ import gym
 import numpy as np
 from typing import Optional
 
+# 🔥 移除全局计数器，改用主进程传递episode_offset方式
+# 避免多进程环境中全局变量重置问题
+
 
 class SyncedInitStateWrapper:
     """
@@ -22,32 +25,44 @@ class SyncedInitStateWrapper:
     4. 完全移除随机逻辑，确保可复现的评测结果
     """
 
-    def __init__(self, env, fixed_init_state_id: int, init_states_array=None):
+    def __init__(self, env, fixed_init_state_id: int, init_states_array=None, episode_offset=0):
         """
         Args:
             env: 被包装的环境
             fixed_init_state_id: 保留兼容性，实际使用顺序轮换
             init_states_array: 从主进程传递的初始状态数组
+            episode_offset: 主进程传递的episode偏移量，确保全局连续轮换
         """
         self.env = env
         
-        # 🔥 RIPT对齐：全局顺序轮换计数器
-        self.counter = 0  # 全局episode计数器
+        # 🔥 RIPT对齐：使用主进程传递的episode偏移量
+        self.episode_offset = episode_offset
+        self.local_counter = 0  # 本次环境实例的局部计数器
         
         # 🔥 RIPT对齐：使用主进程传递的初始状态数组
         self.init_states = init_states_array
         if self.init_states is not None:
             import numpy as np
-            if isinstance(self.init_states, (list, tuple)):
+            # 🔥 修复numpy数组类型判断问题
+            if isinstance(self.init_states, np.ndarray):
+                self.num_init_states = self.init_states.shape[0]
+                print(f"✅ SyncedInitStateWrapper: 接收到 {self.num_init_states} 个初始状态 (numpy格式)")
+                print(f"   状态维度: {self.init_states.shape}")
+            elif isinstance(self.init_states, (list, tuple)) and len(self.init_states) > 0:
                 self.num_init_states = len(self.init_states)
-                print(f"✅ SyncedInitStateWrapper: 接收到 {self.num_init_states} 个初始状态")
+                print(f"✅ SyncedInitStateWrapper: 接收到 {self.num_init_states} 个初始状态 (list/tuple格式)")
+                first_state = self.init_states[0]
+                if isinstance(first_state, (list, tuple)):
+                    print(f"   状态维度: {len(first_state)}")
+                elif hasattr(first_state, 'shape'):
+                    print(f"   状态维度: {first_state.shape}")
             else:
                 self.init_states = None
-                self.num_init_states = 50
-                print(f"⚠️ SyncedInitStateWrapper: 初始状态格式错误，使用默认数量50")
+                self.num_init_states = 0
+                print(f"⚠️ SyncedInitStateWrapper: 初始状态格式错误 (类型: {type(self.init_states)})，轮换功能禁用")
         else:
-            self.num_init_states = 50
-            print(f"⚠️ SyncedInitStateWrapper: 未接收到初始状态数组，使用默认数量50")
+            self.num_init_states = 0
+            print(f"⚠️ SyncedInitStateWrapper: 未接收到初始状态数组，轮换功能禁用")
 
         # 代理所有属性到原始环境
         for attr in ['action_space', 'observation_space', 'task_description',
@@ -69,21 +84,22 @@ class SyncedInitStateWrapper:
             obs = self.env.reset(**kwargs)  # 🔥 RIPT对齐：先reset
             if hasattr(self.env, 'set_init_state') and init_states is not None:
                 import numpy as np
-                # 处理多维数组：取第一个状态并展平
-                if isinstance(init_states, (list, np.ndarray)):
-                    init_states_array = np.array(init_states)
-                    if init_states_array.ndim > 1:
-                        single_state = init_states_array.flatten() if init_states_array.shape[0] == 1 else init_states_array[0]
-                    else:
-                        single_state = init_states_array
-                    self.env.set_init_state(single_state)  # 🔥 RIPT对齐：后set_init_state
-                else:
-                    self.env.set_init_state(init_states)
+                # 🔥 修复：直接使用传入的状态，不再获取第一行
+                snapshot = np.asarray(init_states).squeeze()
+                print(f"🎯 优先级1: 使用传入状态, 形状={snapshot.shape}")
+                self.env.set_init_state(snapshot)  # 🔥 RIPT对齐：后set_init_state
             return obs
         
         # === 优先级2: 全局顺序轮换（与原版RIPT完全对齐）===
-        selected_id = self.counter % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
-        self.counter += 1
+        if self.num_init_states <= 0:
+            # 无状态数组时使用环境默认初始化
+            obs = self.env.reset(**kwargs)
+            return obs
+            
+        # 🔥 使用主进程episode偏移量 + 局部计数器实现全局连续轮换
+        global_episode_idx = self.episode_offset + self.local_counter
+        selected_id = global_episode_idx % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
+        self.local_counter += 1
         
         # 🔥 RIPT对齐：完全按原版方式 env.reset() + env.set_init_state(snapshot)
         obs = self.env.reset(**kwargs)
@@ -92,7 +108,19 @@ class SyncedInitStateWrapper:
             if self.init_states is not None:
                 # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
                 import numpy as np
-                snapshot = np.array(self.init_states[selected_id])
+                
+                # 获取对应的初始状态
+                raw_snapshot = self.init_states[selected_id]
+                
+                # 🔥 确保状态格式正确
+                if isinstance(raw_snapshot, (list, tuple)):
+                    snapshot = np.array(raw_snapshot, dtype=np.float32)
+                elif hasattr(raw_snapshot, 'shape'):
+                    snapshot = np.array(raw_snapshot, dtype=np.float32)
+                else:
+                    snapshot = np.array([raw_snapshot], dtype=np.float32)
+                
+                print(f"🎯 全局轮换: episode_{global_episode_idx} → state_id={selected_id}, 形状={snapshot.shape}")
                 self.env.set_init_state(snapshot)
             else:
                 # 无初始状态数组时的兜底：使用环境默认行为
@@ -166,7 +194,7 @@ def create_libero_env_independent(benchmark_name: str, env_name: str = None, tas
 
 
 def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int = None,
-                      fixed_init_state_id: int = None, init_states_array=None):
+                      fixed_init_state_id: int = None, init_states_array=None, episode_offset=0):
     """
     创建环境工厂函数 - 供SubprocVectorEnv使用
 
@@ -175,7 +203,8 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
         env_name: 环境名称 (可选)
         task_id: 任务ID (可选)
         fixed_init_state_id: 保留兼容性 (可选)
-        init_states_array: 从主进程传递的初始状态数组 (关键！)
+        init_states_array: 从主进程传递的初始状态数组
+        episode_offset: 主进程传递的episode偏移量，确保全局连续轮换
 
     Returns:
         callable: 无参数的环境工厂函数
@@ -187,8 +216,10 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
             task_id=task_id
         )
 
-        # 🔥 RIPT对齐：传递主进程获取的初始状态数组给wrapper
-        env = SyncedInitStateWrapper(env, fixed_init_state_id, init_states_array=init_states_array)
+        # 🔥 RIPT对齐：传递主进程管理的episode偏移量和初始状态数组
+        env = SyncedInitStateWrapper(env, fixed_init_state_id, 
+                                   init_states_array=init_states_array,
+                                   episode_offset=episode_offset)
 
         return env  # SubprocVectorEnv只需要环境对象
 
