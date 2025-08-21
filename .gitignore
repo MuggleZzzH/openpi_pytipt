@@ -57,6 +57,7 @@ lerobot_dataset/
 lerobot/
 CleanDiffuser/
 gemini_refer/
+experiments/
 *.log
 *.jpg
 *.jpeg
