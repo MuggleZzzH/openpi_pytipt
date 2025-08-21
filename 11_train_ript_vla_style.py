@@ -401,6 +401,60 @@ def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool
     return episodes
 
 
+class DemoStateSampler:
+    """RIPT对齐的Demo状态采样器 - 确保有序轮换，避免重复使用相同状态"""
+    
+    def __init__(self):
+        self.demo_state_idx = 0  # 当前demo中的状态索引
+        self.demo_episode_idx = 0  # 当前demo episode索引
+        
+    def get_next_init_state(self, demo_initial_state):
+        """
+        从demo中获取下一个初始状态（按顺序轮换）
+        
+        Args:
+            demo_initial_state: LIBERO demo数据
+            
+        Returns:
+            tuple: (selected_state_numpy, init_state_hash, state_description)
+        """
+        if demo_initial_state is None:
+            return None, None, "无demo数据"
+            
+        if 'init_state' not in demo_initial_state or demo_initial_state['init_state'] is None:
+            return demo_initial_state['initial_obs'], "obs_fallback", "使用观测数据（无MuJoCo状态）"
+            
+        # 使用demo中的MuJoCo状态
+        init_state_data = demo_initial_state['init_state']
+        states = init_state_data['states']  # (T, state_dim)
+        pad_mask = init_state_data['pad_mask']  # (T,)
+        
+        # 获取所有有效状态索引
+        valid_indices = torch.where(pad_mask)[0]
+        if len(valid_indices) == 0:
+            return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
+        
+        # 🔥 关键：按顺序轮换选择状态，而不是总是选择第一个
+        current_valid_idx = self.demo_state_idx % len(valid_indices)
+        selected_state_idx = valid_indices[current_valid_idx]
+        selected_state = states[selected_state_idx]
+        
+        # 更新索引（下次调用时会选择下一个状态）
+        self.demo_state_idx += 1
+        
+        # 生成状态哈希用于追踪
+        state_hash = f"demo_{demo_initial_state['task_id'][0].item()}_state_{selected_state_idx.item()}"
+        state_desc = f"Demo {demo_initial_state['task_id'][0].item()} 状态 {current_valid_idx+1}/{len(valid_indices)}"
+        
+        print(f"  🎯 轮换选择: {state_desc} (索引: {selected_state_idx.item()})")
+        
+        return selected_state.numpy(), state_hash, state_desc
+
+
+# 全局状态采样器实例
+global_demo_sampler = DemoStateSampler()
+
+
 def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None, demo_initial_state=None):
     """
     RIPT-VLA风格的rollout收集（增强版：支持per-init跳过和demo初始状态）
@@ -411,30 +465,20 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
     print(f"正在收集 {num_rollouts} 个rollouts...")
 
     try:
-        # 🔥 处理demo初始状态（与原版RIPT对齐）
+        # 🔥 处理demo初始状态（RIPT对齐 + 状态轮换）
+        state_hash = None  # 用于统计跟踪
         if demo_initial_state is not None:
             print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
             task_id = demo_initial_state['task_id'][0].item()
 
-            # 🔥 与原版RIPT对齐：优先使用MuJoCo状态
-            if 'init_state' in demo_initial_state and demo_initial_state['init_state'] is not None:
-                # 使用demo中的MuJoCo状态（与原版RIPT一致）
-                init_state_data = demo_initial_state['init_state']
-                states = init_state_data['states']  # (T, state_dim)
-                pad_mask = init_state_data['pad_mask']  # (T,)
-
-                # 提取第一个有效状态（与原版RIPT逻辑一致）
-                valid_indices = torch.where(pad_mask)[0]
-                if len(valid_indices) > 0:
-                    first_valid_state = states[valid_indices[0]]  # (state_dim,)
-                    all_init_states = [first_valid_state.numpy()]
-                    print(f"  ✅ 使用demo MuJoCo状态，维度: {first_valid_state.shape}")
-                else:
-                    print(f"  ⚠️ demo状态无有效数据，回退到观测")
-                    all_init_states = [demo_initial_state['initial_obs']]
+            # 🔥 使用状态采样器进行有序轮换
+            selected_state, state_hash, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
+            if selected_state is not None:
+                all_init_states = [selected_state]
+                print(f"  ✅ {state_desc}")
             else:
-                print(f"  ⚠️ demo缺少MuJoCo状态，使用观测数据")
-                all_init_states = [demo_initial_state['initial_obs']]
+                all_init_states = None
+                print(f"  ⚠️ 状态采样失败，将使用环境默认初始化")
         else:
             # 获取任务的初始状态和task_id
             task_id = 0  # 简化处理，使用第一个任务
@@ -445,10 +489,14 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
         
         # 🔥 如果有统计跟踪器，先检查是否应该跳过这个任务
         if stats_tracker and all_init_states is not None:
-            # 随机选择一个初始状态来检查（简化版，实际可以更精细）
-            sample_init_idx = np.random.randint(0, len(all_init_states))
-            sample_init_state = all_init_states[sample_init_idx]
-            init_hash = stats_tracker._compute_init_hash(task_id, sample_init_state)
+            # 🔥 RIPT对齐：使用精确的状态哈希，而不是随机选择
+            if state_hash is not None:
+                # 使用从demo采样器获取的精确状态哈希
+                init_hash = state_hash
+            else:
+                # 回退到第一个状态（避免随机性）
+                sample_init_state = all_init_states[0]
+                init_hash = stats_tracker._compute_init_hash(task_id, sample_init_state)
             
             if stats_tracker.should_skip_init(task_id, init_hash, num_rollouts):
                 stats_tracker.increment_skip_count(task_id, init_hash)
@@ -652,71 +700,29 @@ def update_policy_with_gradient_accumulation_fallback(policy, optimizer, cfg_ada
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             advantages = advantages.to(device)
             
-            # 🚀 检查是否使用统一样本池方法
-            use_unified_pool = config is not None and config.get('unified_pool_batch_size') is not None
+            # 🚀 RIPT对齐：强制使用SO100处理，不允许回退
+            if not (hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing):
+                raise RuntimeError("❌ RIPT对齐要求：必须启用use_so100_processing配置")
             
-            if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
-                print("🚀 使用统一样本池训练（所有轨迹）...")
-                # 从config读取参数
-                batch_size_cfg = config.get('unified_pool_batch_size', 8)
-                shuffle_cfg = config.get('unified_pool_shuffle', True)
-                print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
-                
-                loss = cfg_adapter.compute_weighted_loss_unified(
-                    episodes=episodes,  # 🔥 使用所有episodes
-                    advantages=advantages,  # 🔥 使用所有advantages
-                    device=device,
-                    batch_size=batch_size_cfg,
-                    shuffle_samples=shuffle_cfg,
-                    scaler=scaler,
-                    optimizer=optimizer,
-                    gradient_accumulation_steps=gradient_accumulation_steps
-                )
-                
-                total_loss = loss.item()
-                print(f"✅ 统一样本池训练完成，总损失: {total_loss}")
-                
-            else:
-                print("🔧 回退到原始梯度累积训练...")
-                gradient_step = 0
-                
-                # 🔥 原始mini-batch梯度累积逻辑（fallback）
-                for batch_start in range(0, total_episodes, mini_batch_size):
-                    batch_end = min(batch_start + mini_batch_size, total_episodes)
-                    
-                    # 提取mini_batch
-                    mini_episodes = episodes[batch_start:batch_end]
-                    mini_advantages = advantages[batch_start:batch_end]
-                    
-                    # mini-batch训练逻辑
-                    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-                        mini_advantages = mini_advantages.to(device)
-                        
-                        # 传统episode-by-episode训练
-                        loss = cfg_adapter.compute_weighted_loss(mini_episodes, mini_advantages, device)
-                        
-                        # 梯度累积
-                        normalized_loss = loss / gradient_accumulation_steps
-                        if scaler is not None:
-                            scaler.scale(normalized_loss).backward()
-                        else:
-                            normalized_loss.backward()
-                        
-                        total_loss += loss.item()
-                        gradient_step += 1
-                
-                # 参数更新
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-                if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad()
-                
-                print(f"✅ 传统梯度累积训练完成，总损失: {total_loss}")
+            print("🚀 使用SO100统一样本池训练（RIPT对齐模式）...")
+            # 从config读取参数，提供合理默认值
+            batch_size_cfg = config.get('unified_pool_batch_size', 8) if config else 8
+            shuffle_cfg = config.get('unified_pool_shuffle', True) if config else True
+            print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
+            
+            loss = cfg_adapter.compute_weighted_loss_unified(
+                episodes=episodes,  # 🔥 使用所有episodes
+                advantages=advantages,  # 🔥 使用所有advantages
+                device=device,
+                batch_size=batch_size_cfg,
+                shuffle_samples=shuffle_cfg,
+                scaler=scaler,
+                optimizer=optimizer,
+                gradient_accumulation_steps=gradient_accumulation_steps
+            )
+            
+            total_loss = loss.item()
+            print(f"✅ SO100统一样本池训练完成，总损失: {total_loss}")
     
     except Exception as e:
         print(f"❌ 训练失败: {e}")
@@ -741,37 +747,24 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
         # 计算加权损失
         advantages = advantages.to(device)
 
-        # 🚀 使用统一样本池方法（你想要的理想架构）
-        use_unified_pool = config.get('unified_pool_batch_size') is not None  # 🔥 修复：检查是否配置了统一样本池
-        
-        # 🔥 调试信息
-        print(f"🔍 调试信息:")
-        print(f"  unified_pool_batch_size: {config.get('unified_pool_batch_size')}")
-        print(f"  use_unified_pool: {use_unified_pool}")
-        print(f"  hasattr(cfg_adapter, 'use_so100_processing'): {hasattr(cfg_adapter, 'use_so100_processing')}")
-        if hasattr(cfg_adapter, 'use_so100_processing'):
-            print(f"  cfg_adapter.use_so100_processing: {cfg_adapter.use_so100_processing}")
-        
-        if use_unified_pool and hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing:
-            print("🚀 Using unified sample pool training...")
-            # 从配置读取可调参数
-            batch_size_cfg = config.get('unified_pool_batch_size', 8)  # 🔥 修复：从主配置读取
-            shuffle_cfg = config.get('unified_pool_shuffle', True)
+        # 🚀 RIPT对齐：强制使用SO100处理，不允许回退
+        if not (hasattr(cfg_adapter, 'use_so100_processing') and cfg_adapter.use_so100_processing):
+            raise RuntimeError("❌ RIPT对齐要求：必须启用use_so100_processing配置")
             
-            print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
+        print("🚀 使用SO100统一样本池训练（RIPT对齐模式）...")
+        # 从配置读取可调参数，提供合理默认值
+        batch_size_cfg = config.get('unified_pool_batch_size', 8) if config else 8
+        shuffle_cfg = config.get('unified_pool_shuffle', True) if config else True
+        
+        print(f"  配置参数: batch_size={batch_size_cfg}, shuffle={shuffle_cfg}")
 
-            loss = cfg_adapter.compute_weighted_loss_unified(
-                episodes=episodes,
-                advantages=advantages,
-                device=device,
-                batch_size=batch_size_cfg,
-                shuffle_samples=shuffle_cfg
-            )
-        else:
-            print("🔧 Using legacy episode-by-episode training...")
-            if use_unified_pool:
-                print("  注意：配置了unified_pool_batch_size但SO100处理未启用")
-            loss = cfg_adapter.compute_weighted_loss(episodes, advantages, device)
+        loss = cfg_adapter.compute_weighted_loss_unified(
+            episodes=episodes,
+            advantages=advantages,
+            device=device,
+            batch_size=batch_size_cfg,
+            shuffle_samples=shuffle_cfg
+        )
 
         # 梯度更新
         optimizer.zero_grad()
@@ -871,18 +864,19 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 创建CFG适配器（必需，用于损失计算）
     # 🔥 Phase 3: 数据处理配置 (Legacy + SO100)
     dataset_config = config.get('dataset', {})
+    data_processing_config = config.get('data_processing', {})
     policy_config = config.get('policy', {})
 
     # CFG状态检查
     cfg_enabled = getattr(policy.model, 'cfg_enabled', True)
 
-    # SO100处理配置 (Phase 3新增)
-    use_so100_processing = dataset_config.get('use_so100_processing', False)
+    # SO100处理配置 (Phase 3新增) - 修复：从正确的配置路径读取
+    use_so100_processing = data_processing_config.get('use_so100_processing', False)
 
-    # Legacy窗口化配置 (向后兼容)
-    windowing_mode = dataset_config.get('windowing_mode', 'last')
-    window_stride = dataset_config.get('window_stride', 10)
-    max_windows_per_episode = dataset_config.get('max_windows_per_episode', 1)
+    # Legacy窗口化配置 (向后兼容) - 修复：从正确的配置路径读取
+    windowing_mode = data_processing_config.get('windowing_mode', 'last')
+    window_stride = data_processing_config.get('window_stride', 10)
+    max_windows_per_episode = data_processing_config.get('max_windows_per_episode', 1)
 
     print(f"\n🔧 训练配置:")
     print(f"  CFG模式: {'启用' if cfg_enabled else '禁用'}")
@@ -1001,17 +995,18 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         for group_idx in range(demo_batch_size):
             print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
 
-            # 🔥 新增：获取demo初始状态（如果可用）
+            # 🔥 获取demo初始状态（RIPT对齐轮换模式）
             demo_batch = None
             if demo_data_iter is not None:
                 try:
                     demo_batch = next(demo_data_iter)
                     print(f"  📋 使用LIBERO demo: 任务{demo_batch['task_id'][0].item()}")
                 except StopIteration:
-                    # 重新开始数据迭代器
+                    # 🔥 RIPT对齐：重新开始demo迭代（确保数据多样性）
                     demo_data_iter = iter(demo_dataloader)
                     demo_batch = next(demo_data_iter)
                     print(f"  📋 重新开始demo迭代: 任务{demo_batch['task_id'][0].item()}")
+                    print(f"  🔄 状态采样器继续轮换（不重置），确保状态多样性")
                 except Exception as e:
                     print(f"  ⚠️ Demo获取失败: {e}")
                     demo_batch = None

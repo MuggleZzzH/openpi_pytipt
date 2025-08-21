@@ -17,8 +17,8 @@ task:
   benchmark_name: "libero_spatial"         # 🔥 修复：使用小写格式
   task_names_to_use:
     - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"    # 🔥 修复：从LIBERO官方任务映射获取
-  num_parallel_envs: 4  # 🔥 单环境避免内存问题
-  max_episode_length: 100  # 🔥 进一步限制episode长度减少样本数
+  num_parallel_envs: 2  # 🔥 单环境避免内存问题
+  max_episode_length: 51  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                     # 启用LIBERO demo加载
@@ -40,9 +40,9 @@ dataset:
 # === 算法配置 ===
 algo:
   demo_batch_size: 2
-  rloo_batch_size: 4  # 🔥 减少episodes数量避免OOM
+  rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
-  gradient_accumulation_steps: 4  # 🔥 增加累积步数补偿小batch
+  gradient_accumulation_steps: 2  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.01
   cfg_uncond_weight: 0.1
   rollout_skip_threshold: 3
@@ -58,8 +58,8 @@ policy:
 # === 🚀 数据处理配置 - 启用统一样本池 ===
 # 注意：dataset配置已在上面定义，这里添加额外的处理配置
 data_processing:
-  num_init_states: 1
-  state_dim: 8
+  num_init_states: 50
+  state_dim: 92
   
   # 启用SO100处理 + 统一样本池
   use_so100_processing: true
@@ -103,17 +103,17 @@ features:
   adaptive_cfg: false
   early_stop_percentage: 1.0
 
-  # 🔥 新增：并行环境初始状态同步控制
+  # 🔥 RIPT对齐：并行环境初始状态同步控制
   parallel_env_sync:
-    enabled: true                    # 启用智能随机选择
-    fixed_init_state_id: -1         # 🎲 -1表示随机选择，>=0表示固定ID
-    verify_sync: false              # 随机模式下不验证同步性
+    enabled: true                    # 启用同步控制
+    fixed_init_state_id: 0          # 🔒 固定使用第一个状态ID，与demo状态对齐
+    verify_sync: true               # 验证状态同步性
     sync_tolerance: 1e-6            # 状态差异容忍度
-    random_sampling: true           # 🔥 新增：启用随机采样模式
+    random_sampling: false          # 🚫 禁用随机采样，确保确定性
   
   # 动态采样配置
   dynamic_sampling:
-    enabled: true
+    enabled: false
 
 # === 🎯 统一样本池配置说明 ===
 # 

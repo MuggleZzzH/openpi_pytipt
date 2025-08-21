@@ -231,7 +231,7 @@ def main():
                 episode_frames.append(final_frame)
         
         # 计算episode成功率（简化：基于总奖励）
-        success = total_reward > 0.5  # 简化的成功判断
+        success = total_reward > 0.1  # 🔥 RIPT对齐：调整成功判断阈值
         
         episode_data = {
             'observations': episode_observations,

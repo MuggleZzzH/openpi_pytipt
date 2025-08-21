@@ -1119,30 +1119,21 @@ class PI0_CFG_Adapter(RLModelInterface):
         assert advantages.dim() == 1, f"advantages必须是1维tensor，当前维度: {advantages.dim()}"
         assert isinstance(advantages, torch.Tensor), f"advantages必须是torch.Tensor类型，当前类型: {type(advantages)}"
 
-        # 🔥 Phase 2: Choose processing method based on configuration
-        if self.use_so100_processing:
-            print("🚀 Using SO100-style sample processing...")
-            batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
+        # 🔥 RIPT对齐：强制使用SO100处理，不允许回退到legacy
+        if not self.use_so100_processing:
+            raise RuntimeError("❌ RIPT对齐要求：必须启用use_so100_processing配置")
+            
+        print("🚀 使用SO100样本处理（RIPT对齐模式）...")
+        batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
 
-            # Map episode advantages to sample advantages
-            sample_advantages = self.map_episode_advantages_to_samples_so100(advantages, episode_to_samples_map)
+        # Map episode advantages to sample advantages
+        sample_advantages = self.map_episode_advantages_to_samples_so100(advantages, episode_to_samples_map)
 
-            # Create owner indices for compatibility
-            owner_indices = batch['owner_indices']
+        # Create owner indices for compatibility
+        owner_indices = batch['owner_indices']
 
-            # Use sample advantages instead of episode advantages
-            window_advantages = sample_advantages
-
-        else:
-            print("🔧 Using legacy windowing processing...")
-            # 🔥 Legacy: 窗口化批次处理
-            batch, owner_indices = self.process_episodes(episodes, device)
-
-            # 🔥 优势映射和归一化处理 (legacy approach)
-            B = batch["state"].shape[0]
-            window_advantages = torch.zeros(B, device=device, dtype=advantages.dtype)
-            for window_idx, episode_idx in enumerate(owner_indices):
-                window_advantages[window_idx] = advantages[episode_idx]
+        # Use sample advantages instead of episode advantages
+        window_advantages = sample_advantages
         
         # === 窗口化批次验证 ===
         assert "action_is_pad" in batch, "batch中必须包含action_is_pad字段"
@@ -1150,11 +1141,8 @@ class PI0_CFG_Adapter(RLModelInterface):
         assert action_is_pad.dtype == torch.bool, f"action_is_pad必须是bool类型，当前类型: {action_is_pad.dtype}"
         assert action_is_pad.dim() == 2, f"action_is_pad必须是2维tensor (B,T)，当前维度: {action_is_pad.dim()}"
         
-        # Get batch size (works for both processing methods)
-        if self.use_so100_processing:
-            B = batch["batch_size"]  # SO100 processing provides batch_size directly
-        else:
-            B = batch["state"].shape[0]  # Legacy windowing uses tensor shape
+        # Get batch size from SO100 processing
+        B = batch["batch_size"]  # SO100 processing provides batch_size directly
 
         assert len(owner_indices) == B, f"owner_indices长度({len(owner_indices)})必须与批次大小({B})匹配"
         

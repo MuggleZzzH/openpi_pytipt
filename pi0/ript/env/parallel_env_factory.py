@@ -13,86 +13,92 @@ from typing import Optional
 
 class SyncedInitStateWrapper:
     """
-    简化的初始状态包装器
-    
-    🔥 专门为RIPT-VLA风格训练设计：
-    1. 优先支持传入的init_states参数（与原始RIPT保持一致）
-    2. 彻底删除随机选择逻辑，确保可预测性
-    3. 如无init_states，则使用标准环境reset
+    RIPT对齐的初始状态包装器
+
+    功能：
+    1. 与原版RIPT完全一致的顺序轮换：selected_id = counter % num_init_states
+    2. 统一调用接口：env.reset() + env.set_init_state(snapshot)
+    3. 支持并行环境一致性：通过init_states参数广播相同状态
+    4. 完全移除随机逻辑，确保可复现的评测结果
     """
 
-    def __init__(self, env, fixed_init_state_id: int = 0):
+    def __init__(self, env, fixed_init_state_id: int, init_states_array=None):
         """
         Args:
             env: 被包装的环境
-            fixed_init_state_id: 保留兼容性，但不再使用随机模式
+            fixed_init_state_id: 保留兼容性，实际使用顺序轮换
+            init_states_array: 从主进程传递的初始状态数组
         """
         self.env = env
-        self.fixed_init_state_id = fixed_init_state_id if fixed_init_state_id >= 0 else 0
+        
+        # 🔥 RIPT对齐：全局顺序轮换计数器
+        self.counter = 0  # 全局episode计数器
+        
+        # 🔥 RIPT对齐：使用主进程传递的初始状态数组
+        self.init_states = init_states_array
+        if self.init_states is not None:
+            import numpy as np
+            if isinstance(self.init_states, (list, tuple)):
+                self.num_init_states = len(self.init_states)
+                print(f"✅ SyncedInitStateWrapper: 接收到 {self.num_init_states} 个初始状态")
+            else:
+                self.init_states = None
+                self.num_init_states = 50
+                print(f"⚠️ SyncedInitStateWrapper: 初始状态格式错误，使用默认数量50")
+        else:
+            self.num_init_states = 50
+            print(f"⚠️ SyncedInitStateWrapper: 未接收到初始状态数组，使用默认数量50")
 
         # 代理所有属性到原始环境
         for attr in ['action_space', 'observation_space', 'task_description',
                      'num_init_states', 'step', 'close', 'seed']:
             if hasattr(env, attr):
                 setattr(self, attr, getattr(env, attr))
-        
-        print(f"🔧 SyncedInitStateWrapper: 初始化完成")
-        print(f"   - 随机选择逻辑: 已彻底删除 ✅")
-        print(f"   - 固定init_state_id: {self.fixed_init_state_id}")
-        print(f"   - init_states优先级: 最高 ✅")
 
-    def reset(self, init_state_id: Optional[int] = None, init_states=None, **kwargs):
+    def reset(self, init_state_id: Optional[int] = None, **kwargs):
         """
-        重置环境 - 简化版本，彻底删除随机逻辑
+        RIPT对齐的环境重置：统一接口 + 顺序轮换
         
-        🔥 专门为RIPT-VLA训练设计：完全可预测，无随机性
-        🔥 优先级顺序：
-        1. init_states (最高，与原始RIPT保持一致)
-        2. init_state_id (次高)
-        3. 标准重置 (默认)
-
-        Args:
-            init_state_id: 传入的初始状态ID
-            init_states: 原始RIPT风格的状态数组（最高优先级）
-            **kwargs: 其他传递给底层环境的参数
-
-        Returns:
-            observation: 环境观测
+        优先级：
+        1. 并行环境传入init_states数组（用于多worker一致性）
+        2. 全局顺序轮换（与原版RIPT eval对齐）
         """
-        # 🔥 兼容原始RIPT: 如果传入了init_states，采用原始RIPT的处理方式
-        if init_states is not None:
-            print(f"🔄 SyncedInitStateWrapper: 使用传入的init_states (最高优先级)")
-            print(f"🎯 SyncedInitStateWrapper: 采用原始RIPT模式 - 先reset再set_init_state")
-            # 1. 先普通重置
-            obs = self.env.reset(**kwargs)
-            # 2. 再设置初始状态 (与原始RIPT保持一致)
-            if hasattr(self.env, 'set_init_state'):
-                # 🔥 关键修复：确保状态数据维度正确
+        # === 优先级1: 并行环境传入init_states数组 ===
+        if 'init_states' in kwargs:
+            init_states = kwargs.pop('init_states')
+            obs = self.env.reset(**kwargs)  # 🔥 RIPT对齐：先reset
+            if hasattr(self.env, 'set_init_state') and init_states is not None:
                 import numpy as np
+                # 处理多维数组：取第一个状态并展平
                 if isinstance(init_states, (list, np.ndarray)):
                     init_states_array = np.array(init_states)
-                    # 如果是2D数组 [env_num, state_dim]，取第一个环境的状态
                     if init_states_array.ndim > 1:
-                        # 去掉batch维度，只传递单个状态向量
                         single_state = init_states_array.flatten() if init_states_array.shape[0] == 1 else init_states_array[0]
-                        print(f"🔧 SyncedInitStateWrapper: 维度修复 {init_states_array.shape} -> {single_state.shape}")
-                        print(f"✅ SyncedInitStateWrapper: 成功设置init_states")
-                        self.env.set_init_state(single_state)
                     else:
-                        self.env.set_init_state(init_states_array)
+                        single_state = init_states_array
+                    self.env.set_init_state(single_state)  # 🔥 RIPT对齐：后set_init_state
                 else:
                     self.env.set_init_state(init_states)
-            print(f"🎉 SyncedInitStateWrapper: init_states处理完成，返回观测")
             return obs
         
-        # 🔥 彻底删除随机逻辑：只使用简单的默认重置或固定ID
-        if init_state_id is not None:
-            print(f"🔧 SyncedInitStateWrapper: 使用传入的init_state_id: {init_state_id}")
-            return self.env.reset(init_state_id=init_state_id, **kwargs)
+        # === 优先级2: 全局顺序轮换（与原版RIPT完全对齐）===
+        selected_id = self.counter % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
+        self.counter += 1
         
-        # 默认使用标准重置，确保完全可预测
-        print(f"🔧 SyncedInitStateWrapper: 使用标准环境重置")
-        return self.env.reset(**kwargs)
+        # 🔥 RIPT对齐：完全按原版方式 env.reset() + env.set_init_state(snapshot)
+        obs = self.env.reset(**kwargs)
+        
+        if hasattr(self.env, 'set_init_state'):
+            if self.init_states is not None:
+                # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
+                import numpy as np
+                snapshot = np.array(self.init_states[selected_id])
+                self.env.set_init_state(snapshot)
+            else:
+                # 无初始状态数组时的兜底：使用环境默认行为
+                pass  # 环境会使用默认的随机初始化
+        
+        return obs
 
     def __getattr__(self, name):
         """代理其他属性到原始环境"""
@@ -160,24 +166,20 @@ def create_libero_env_independent(benchmark_name: str, env_name: str = None, tas
 
 
 def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int = None,
-                      fixed_init_state_id: int = None):
+                      fixed_init_state_id: int = None, init_states_array=None):
     """
     创建环境工厂函数 - 供SubprocVectorEnv使用
-
-    这个函数返回一个lambda，该lambda调用独立的环境创建函数。
-    关键在于返回的lambda不捕获任何外部变量引用。
 
     Args:
         benchmark_name: LIBERO基准名称
         env_name: 环境名称 (可选)
         task_id: 任务ID (可选)
-        fixed_init_state_id: 固定的初始状态ID，用于确保并行环境同步 (可选)
+        fixed_init_state_id: 保留兼容性 (可选)
+        init_states_array: 从主进程传递的初始状态数组 (关键！)
 
     Returns:
         callable: 无参数的环境工厂函数
     """
-    # 注意：这里使用闭包捕获参数，但不捕获任何包含模型的对象
-    # 只捕获基本的字符串和整数参数，CloudPickle可以安全序列化
     def env_factory():
         env, task_description = create_libero_env_independent(
             benchmark_name=benchmark_name,
@@ -185,11 +187,8 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
             task_id=task_id
         )
 
-        # 🔥 智能初始状态包装器：
-        # - fixed_init_state_id >= 0: 固定同步模式
-        # - fixed_init_state_id == -1: 智能随机模式
-        if fixed_init_state_id is not None:
-            env = SyncedInitStateWrapper(env, fixed_init_state_id)
+        # 🔥 RIPT对齐：传递主进程获取的初始状态数组给wrapper
+        env = SyncedInitStateWrapper(env, fixed_init_state_id, init_states_array=init_states_array)
 
         return env  # SubprocVectorEnv只需要环境对象
 
