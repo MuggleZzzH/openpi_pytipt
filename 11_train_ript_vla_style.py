@@ -412,18 +412,22 @@ class DemoStateSampler:
     """RIPT对齐的Demo状态采样器 - 确保有序轮换，避免重复使用相同状态"""
     
     def __init__(self):
-        self.demo_state_idx = 0  # 当前demo中的状态索引
+        self.demo_state_idx = 0  # 当前demo中的状态索引（单样本模式）
         self.demo_episode_idx = 0  # 当前demo episode索引
+        # 🔥 扩展：分demo轮换游标 (task_id, demo_idx) -> state_cursor
+        self.per_demo_state_cursor = {}
+        # 🔥 扩展：批内demo轮换游标
+        self.batch_demo_cursor = 0
         
     def get_next_init_state(self, demo_initial_state):
         """
         从demo中获取下一个初始状态（按顺序轮换）
         
         Args:
-            demo_initial_state: LIBERO demo数据
+            demo_initial_state: LIBERO demo数据（可为单条样本或批）
             
         Returns:
-            tuple: (selected_state_numpy, init_state_hash, state_description)
+            tuple: (selected_state_numpy, init_state_hash_label, state_description)
         """
         if demo_initial_state is None:
             return None, None, "无demo数据"
@@ -431,31 +435,110 @@ class DemoStateSampler:
         if 'init_state' not in demo_initial_state or demo_initial_state['init_state'] is None:
             return demo_initial_state['initial_obs'], "obs_fallback", "使用观测数据（无MuJoCo状态）"
             
-        # 使用demo中的MuJoCo状态
+        # 兼容批次输入或单条输入
         init_state_data = demo_initial_state['init_state']
-        states = init_state_data['states']  # (T, state_dim)
-        pad_mask = init_state_data['pad_mask']  # (T,)
+        states = init_state_data['states']  # 可能是 [T, D] 或 [B, T, D]
+        pad_mask = init_state_data['pad_mask']  # 可能是 [T] 或 [B, T]
         
-        # 获取所有有效状态索引
-        valid_indices = torch.where(pad_mask)[0]
+        import torch as _torch
+        import hashlib as _hashlib
+        
+        # 单条样本路径：保持原逻辑
+        if states.ndim == 2:
+            valid_indices = _torch.where(pad_mask)[0]
+            if len(valid_indices) == 0:
+                return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
+            current_valid_idx = self.demo_state_idx % len(valid_indices)
+            selected_state_idx = valid_indices[current_valid_idx]
+            selected_state = states[selected_state_idx]
+            self.demo_state_idx += 1
+            state_hash = f"demo_{demo_initial_state['task_id'][0].item()}_state_{selected_state_idx.item()}"
+            state_desc = f"Demo {demo_initial_state['task_id'][0].item()} 状态 {current_valid_idx+1}/{len(valid_indices)}"
+            return selected_state.numpy(), state_hash, state_desc
+        
+        # 批次路径：[B, T, D]
+        B = states.shape[0]
+        # 默认使用第一个demo项
+        demo_idx = self.batch_demo_cursor % B
+        task_ids = demo_initial_state['task_id'] if isinstance(demo_initial_state['task_id'], _torch.Tensor) else None
+        task_id_val = task_ids[demo_idx].item() if task_ids is not None and task_ids.numel() > demo_idx else 0
+        
+        valid_indices = _torch.where(pad_mask[demo_idx])[0]
         if len(valid_indices) == 0:
-            return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
+            return demo_initial_state['initial_obs'], "obs_fallback", "批内demo状态无有效数据，回退到观测"
+        cursor_key = (int(task_id_val), int(demo_idx))
+        current_idx = self.per_demo_state_cursor.get(cursor_key, 0) % len(valid_indices)
+        selected_state_idx = valid_indices[current_idx]
+        selected_state = states[demo_idx, selected_state_idx]
+        # 更新游标（该demo内）
+        self.per_demo_state_cursor[cursor_key] = current_idx + 1
+        # 推进批内demo轮换游标
+        self.batch_demo_cursor = (self.batch_demo_cursor + 1) % max(1, B)
         
-        # 🔥 关键：按顺序轮换选择状态，而不是总是选择第一个
-        current_valid_idx = self.demo_state_idx % len(valid_indices)
-        selected_state_idx = valid_indices[current_valid_idx]
-        selected_state = states[selected_state_idx]
-        
-        # 更新索引（下次调用时会选择下一个状态）
-        self.demo_state_idx += 1
-        
-        # 生成状态哈希用于追踪
-        state_hash = f"demo_{demo_initial_state['task_id'][0].item()}_state_{selected_state_idx.item()}"
-        state_desc = f"Demo {demo_initial_state['task_id'][0].item()} 状态 {current_valid_idx+1}/{len(valid_indices)}"
-        
-        print(f"  🎯 轮换选择: {state_desc} (索引: {selected_state_idx.item()})")
-        
+        state_hash = f"demo_{task_id_val}_state_{selected_state_idx.item()}"
+        state_desc = f"Demo[{demo_idx}] task {task_id_val} 状态 {current_idx+1}/{len(valid_indices)}"
         return selected_state.numpy(), state_hash, state_desc
+
+    def get_next_k_init_states(self, demo_batch, k: int):
+        """从一个批次的demo中，轮换选择最多k个初始状态，覆盖尽可能多的不同demo/时间索引。"""
+        if demo_batch is None or 'init_state' not in demo_batch or demo_batch['init_state'] is None:
+            return [], [], "无demo数据"
+        init_state = demo_batch['init_state']
+        states = init_state['states']  # [B, T, D]
+        pad = init_state['pad_mask']   # [B, T]
+        import torch as _torch
+        import hashlib as _hashlib
+        
+        if states.ndim == 2:
+            # 退化到单条逻辑
+            one_state, one_hash_label, desc = self.get_next_init_state(demo_batch)
+            return ([one_state] if one_state is not None else []), ([one_hash_label] if one_state is not None else []), desc
+        
+        B, T, D = states.shape
+        task_ids = demo_batch['task_id'] if isinstance(demo_batch['task_id'], _torch.Tensor) else None
+        selected_states = []
+        selected_hashes = []
+        descs = []
+        # 轮换起点为当前batch_demo_cursor
+        start_demo = self.batch_demo_cursor % B
+        demo_order = list(range(start_demo, B)) + list(range(0, start_demo))
+        
+        # round-robin 按demo选取状态
+        d_ptrs = {b: self.per_demo_state_cursor.get((int(task_ids[b].item()) if task_ids is not None else 0, b), 0) for b in range(B)}
+        counts = 0
+        while counts < k:
+            progressed = False
+            for b in demo_order:
+                if counts >= k:
+                    break
+                valid_idx = _torch.where(pad[b])[0]
+                if len(valid_idx) == 0:
+                    continue
+                cur = d_ptrs[b] % len(valid_idx)
+                idx = valid_idx[cur]
+                state_np = states[b, idx].numpy()
+                # 记录
+                selected_states.append(state_np)
+                # 用简单标签（实际hash统一由tracker计算）
+                tid = int(task_ids[b].item()) if task_ids is not None else 0
+                label = f"demo_{tid}_state_{int(idx.item())}"
+                selected_hashes.append(label)
+                descs.append(f"Demo[{b}] task {tid} t={int(idx.item())}")
+                # 前进该demo的指针
+                d_ptrs[b] = cur + 1
+                counts += 1
+                progressed = True
+                if counts >= k:
+                    break
+            if not progressed:
+                break  # 无法继续选取
+        # 回写游标与批轮换游标
+        for b in range(B):
+            tid = int(task_ids[b].item()) if task_ids is not None else 0
+            self.per_demo_state_cursor[(tid, b)] = d_ptrs.get(b, 0)
+        self.batch_demo_cursor = (start_demo + 1) % max(1, B)
+        
+        return selected_states, selected_hashes, ", ".join(descs) if descs else "无可用状态"
 
 
 # 全局状态采样器实例
@@ -474,18 +557,19 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
     try:
         # 🔥 处理demo初始状态（RIPT对齐 + 状态轮换）
         precomputed_init_hash = None  # 用于统计跟踪的哈希（统一口径）
+        precomputed_init_hashes = []  # 多状态路径
         if demo_initial_state is not None:
             print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
             task_id = demo_initial_state['task_id'][0].item()
 
-            # 🔥 使用状态采样器进行有序轮换
-            selected_state, _state_hash_label, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
-            if selected_state is not None:
-                all_init_states = [selected_state]
-                # 统一使用tracker的哈希口径（与runner一致的SHA-256全长）
+            # 🔥 支持一次选择K个初始状态（覆盖不同demo/时间）
+            selected_states, state_labels, state_desc = global_demo_sampler.get_next_k_init_states(demo_initial_state, num_rollouts)
+            if selected_states:
+                all_init_states = selected_states
                 if stats_tracker is not None:
-                    precomputed_init_hash = stats_tracker._compute_init_hash(task_id, selected_state)
-                print(f"  ✅ {state_desc}")
+                    precomputed_init_hashes = [stats_tracker._compute_init_hash(task_id, s) for s in selected_states]
+                    precomputed_init_hash = precomputed_init_hashes[0]
+                print(f"  ✅ 选择{len(selected_states)}个初始状态: {state_desc}")
             else:
                 all_init_states = None
                 print(f"  ⚠️ 状态采样失败，将使用环境默认初始化")
@@ -499,7 +583,7 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
         
         # 🔥 如果有统计跟踪器，先检查是否应该跳过这个任务
         if stats_tracker and all_init_states is not None:
-            # 优先使用基于selected_state的哈希；否则对样本初始状态计算
+            # 使用选择的第一个状态作为预判哈希
             if precomputed_init_hash is not None:
                 init_hash = precomputed_init_hash
             else:
@@ -543,10 +627,7 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
         
         # 🔥 更新统计跟踪器
         if stats_tracker and collected_rollouts:
-            # 提取成功率信息
             successes = [ep.get('success', False) for ep in collected_rollouts]
-            
-            # 获取init_hash（使用episode中的或计算得到的）
             init_hash = None
             for ep in collected_rollouts:
                 if 'init_hash' in ep:
@@ -555,7 +636,6 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                 elif 'computed_init_hash' in ep:
                     init_hash = ep['computed_init_hash']
                     break
-            
             if init_hash:
                 stats_tracker.update_stats(task_id, init_hash, successes)
         
