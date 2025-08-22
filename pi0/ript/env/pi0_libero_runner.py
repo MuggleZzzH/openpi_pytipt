@@ -1486,6 +1486,16 @@ class LIBEROEnvRunner:
             if video_path:
                 episode_data["video_path"] = str(video_path)
             
+            # 🔥 对齐串行模式：附带初始状态与哈希，供统计与对齐
+            try:
+                # 初始观测转换为8维状态（与串行路径一致）
+                init_state_vec = self._extract_state_from_obs(episode['observations'][0]) if episode['observations'] else None
+                if init_state_vec is not None:
+                    episode_data["init_state"] = init_state_vec
+                    episode_data["init_hash"] = self._compute_state_hash(init_state_vec)
+            except Exception as _:
+                pass
+            
             results.append((episode['success'], episode['total_reward'], episode_data))
         
         return results

@@ -85,7 +85,9 @@ class RolloutStatsTracker:
         else:
             data_bytes = str(init_state_data).encode()
         
-        return hashlib.sha256(data_bytes).hexdigest()[:16]  # 短哈希
+        import hashlib
+        # 与runner保持一致：完整的SHA-256字符串（不截断）
+        return hashlib.sha256(data_bytes).hexdigest()
     
     def should_skip_init(self, task_id: int, init_hash: str, rloo_batch_size: int) -> bool:
         """
@@ -471,15 +473,18 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
 
     try:
         # 🔥 处理demo初始状态（RIPT对齐 + 状态轮换）
-        state_hash = None  # 用于统计跟踪
+        precomputed_init_hash = None  # 用于统计跟踪的哈希（统一口径）
         if demo_initial_state is not None:
             print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
             task_id = demo_initial_state['task_id'][0].item()
 
             # 🔥 使用状态采样器进行有序轮换
-            selected_state, state_hash, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
+            selected_state, _state_hash_label, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
             if selected_state is not None:
                 all_init_states = [selected_state]
+                # 统一使用tracker的哈希口径（与runner一致的SHA-256全长）
+                if stats_tracker is not None:
+                    precomputed_init_hash = stats_tracker._compute_init_hash(task_id, selected_state)
                 print(f"  ✅ {state_desc}")
             else:
                 all_init_states = None
@@ -494,18 +499,16 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
         
         # 🔥 如果有统计跟踪器，先检查是否应该跳过这个任务
         if stats_tracker and all_init_states is not None:
-            # 🔥 RIPT对齐：使用精确的状态哈希，而不是随机选择
-            if state_hash is not None:
-                # 使用从demo采样器获取的精确状态哈希
-                init_hash = state_hash
+            # 优先使用基于selected_state的哈希；否则对样本初始状态计算
+            if precomputed_init_hash is not None:
+                init_hash = precomputed_init_hash
             else:
-                # 回退到第一个状态（避免随机性）
                 sample_init_state = all_init_states[0]
                 init_hash = stats_tracker._compute_init_hash(task_id, sample_init_state)
             
             if stats_tracker.should_skip_init(task_id, init_hash, num_rollouts):
                 stats_tracker.increment_skip_count(task_id, init_hash)
-                print(f"🚫 跳过此次收集：init ({task_id}, {init_hash}) 最近全成功")
+                print(f"🚫 跳过此次收集：init ({task_id}, {init_hash[:16]}) 最近全成功")
                 return []
         
         # 直接调用环境runner的方法

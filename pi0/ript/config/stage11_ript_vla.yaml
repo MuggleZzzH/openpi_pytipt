@@ -61,7 +61,7 @@ features:
   enable_parallel_envs: true  # 开启并行环境（向量化）
   enable_true_parallel_envs: true  # 🔥 关闭真正多进程并行（防止内存问题）
   enable_smart_sampling: true      # Runner日志用的智能采样开关
-  use_parallel_init_state: false    # 🔥 开启：并行时调用set_init_state
+  use_parallel_init_state: true     # 🔥 开启：并行时调用set_init_state
   save_video: false               # 🔥 关闭视频保存（减少显存占用）
   
   # === 🔥 增强功能开关 ===
