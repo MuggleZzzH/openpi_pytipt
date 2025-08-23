@@ -40,7 +40,7 @@ dataset:
 # === 算法配置 ===
 algo:
   demo_batch_size: 2
-  rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
+  rloo_batch_size: 4  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
   gradient_accumulation_steps: 2  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.01

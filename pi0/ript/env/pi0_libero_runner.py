@@ -1115,14 +1115,23 @@ class LIBEROEnvRunner:
         while count < eval_loop_num:
             # 选择当前轮次的初始状态
             start_idx = count * env_num
-            end_idx = min(start_idx + env_num, len(all_init_states))
-            indices = np.arange(start_idx, end_idx) % len(all_init_states)
-            
-            # 🔥 修复：兼容列表和numpy数组索引
+            # 🔥 修复：始终生成 env_num 个索引，环形取模，避免空索引
             if isinstance(all_init_states, list):
-                current_init_states = [all_init_states[i] for i in indices]
+                total = len(all_init_states)
+                if total == 0:
+                    current_init_states = None
+                    indices = []
+                else:
+                    indices = (np.arange(env_num) + start_idx) % total
+                    current_init_states = [all_init_states[i] for i in indices]
             else:
-                current_init_states = all_init_states[indices]
+                total = len(all_init_states)
+                if total == 0:
+                    current_init_states = None
+                    indices = []
+                else:
+                    indices = (np.arange(env_num) + start_idx) % total
+                    current_init_states = all_init_states[indices]
             
             if self.rank == 0:
                 print(f"并行轮次 {count+1}/{eval_loop_num}, 状态索引: {indices}")
@@ -1777,6 +1786,8 @@ class LIBEROEnvRunner:
         try:
             if init_states is None:
                 return None
+            if isinstance(init_states, (list, tuple)) and len(init_states) == 0:
+                return None
 
             # 转换为numpy数组
             if isinstance(init_states, torch.Tensor):
@@ -1801,6 +1812,16 @@ class LIBEROEnvRunner:
                 elif init_states.shape[0] != env_num:
                     # 状态数量不匹配，使用第一个状态
                     init_states = np.tile(init_states[0], (env_num, 1))
+            elif init_states.ndim == 3:
+                # 🔥 修复：处理3D数组 (batch, seq, dim) -> 取第一个batch的第一个状态
+                if init_states.shape[0] == 1:
+                    # 只有一个batch，取第一个状态并复制给所有环境
+                    first_state = init_states[0, 0]  # 取第一个batch的第一个状态
+                    init_states = np.tile(first_state, (env_num, 1))
+                else:
+                    # 多个batch，取第一个batch的第一个状态
+                    first_state = init_states[0, 0]
+                    init_states = np.tile(first_state, (env_num, 1))
 
             print(f"🔧 处理后的并行状态: 形状={init_states.shape}, 类型={init_states.dtype}")
             return init_states

@@ -303,6 +303,7 @@ class RIPTAlignedDataset(Dataset):
         item = {
             'task_id': torch.tensor([demo['task_id']]),
             'task_name': demo['task_name'],
+            'demo_id': demo.get('demo_id', None),
         }
         
         # 添加观测数据
@@ -372,6 +373,9 @@ def collate_fn_ript_aligned(batch):
         filtered_items.append(filtered_item)
     
     collated_batch = default_collate(filtered_items)
+    # demo_id 直接拼接为list（与task_name一致做法）
+    if isinstance(batch[0].get('demo_id', None), (str, int)):
+        collated_batch['demo_id'] = [it.get('demo_id', None) for it in batch]
     
     # 🔥 处理init_state字段（序列格式，供轮换器使用）
     if 'init_state' in batch[0] and batch[0]['init_state'] is not None:

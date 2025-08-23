@@ -440,27 +440,30 @@ class DemoStateSampler:
             return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
         
         # 🔥 关键修复：同demo用同一状态，不同demo轮换状态
-        demo_id = demo_initial_state['task_id'][0].item()
+        # 构建 demo 唯一键：task_name|demo_id（均来自collate后的batch）
+        task_name_str = str(demo_initial_state['task_name'][0])
+        demo_id_val = demo_initial_state.get('demo_id', [None])[0]
+        demo_uid = f"{task_name_str}|{demo_id_val}"
         
-        if demo_id not in self.demo_to_state_cache:
+        if demo_uid not in self.demo_to_state_cache:
             # 新demo：分配下一个状态索引
             current_valid_idx = self.next_state_idx % len(valid_indices)
-            self.demo_to_state_cache[demo_id] = current_valid_idx
+            self.demo_to_state_cache[demo_uid] = current_valid_idx
             self.next_state_idx += 1
-            print(f"  🎯 新demo {demo_id}: 分配状态索引 {current_valid_idx}")
+            print(f"  🎯 新demo {demo_uid}: 分配状态索引 {current_valid_idx}")
         else:
             # 已知demo：复用之前分配的状态索引
-            current_valid_idx = self.demo_to_state_cache[demo_id]
-            print(f"  🎯 复用demo {demo_id}: 状态索引 {current_valid_idx}")
+            current_valid_idx = self.demo_to_state_cache[demo_uid]
+            print(f"  🎯 复用demo {demo_uid}: 状态索引 {current_valid_idx}")
         
         selected_state_idx = valid_indices[current_valid_idx]
         selected_state = states[selected_state_idx]
         
         # 生成状态哈希用于追踪
-        state_hash = f"demo_{demo_id}_state_{selected_state_idx.item()}"
-        state_desc = f"Demo {demo_id} 状态 {current_valid_idx+1}/{len(valid_indices)}"
+        state_hash = f"demo_{demo_uid}_state_{selected_state_idx.item()}"
+        state_desc = f"Demo {demo_uid} 状态 {current_valid_idx+1}/{len(valid_indices)} (索引: {selected_state_idx.item()})"
         
-        print(f"  🎯 轮换选择: {state_desc} (索引: {selected_state_idx.item()})")
+        print(f"  🎯 轮换选择: {state_desc}")
         
         return selected_state.numpy(), state_hash, state_desc
 
@@ -777,17 +780,11 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
             advantages=advantages,
             device=device,
             batch_size=batch_size_cfg,
-            shuffle_samples=shuffle_cfg
+            shuffle_samples=shuffle_cfg,
+            optimizer=optimizer,
+            scaler=None,
+            gradient_accumulation_steps=1
         )
-
-        # 梯度更新
-        optimizer.zero_grad()
-        loss.backward()
-
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-
-        optimizer.step()
 
         loss_value = loss.item()
         print(f"✓ 策略更新完成，损失: {loss_value:.6f}")
@@ -855,6 +852,17 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     直接在主函数中处理所有逻辑，减少抽象层
     """
     print("🚀 开始RIPT-VLA风格的训练循环")
+    
+    # 统一设置随机种子（保证可复现）
+    try:
+        import random
+        seed = int(config.get('training', {}).get('seed', 42))
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"✅ 随机种子已设置: {seed}")
+    except Exception as _e:
+        print(f"⚠️ 随机种子设置失败: {_e}")
     
     # 🔥 设置数值优化和显存管理
     print("🔧 设置数值优化...")
@@ -977,6 +985,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     print(f"  demo_batch_size: {demo_batch_size} (每步收集的组数)")
     print(f"  rloo_batch_size: {rloo_batch_size} (每组内样本数)")
     print(f"  有效批次大小: {demo_batch_size * rloo_batch_size}")
+    dynamic_sampling_enabled = config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
+    print(f"  动态采样: {'启用' if dynamic_sampling_enabled else '禁用'} (features.dynamic_sampling.enabled)")
     
     print(f"\n开始训练循环:")
     print(f"  训练步数: {num_train_steps}")
@@ -1026,10 +1036,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     demo_batch = None
 
             # 收集一组rollouts（传递demo初始状态和统计跟踪器）
+            current_task_name = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
             group_episodes = collect_rollouts_ript_vla_style(
-                env_runner, task_names[0] if not demo_batch else demo_batch['task_name'][0],
+                env_runner, current_task_name,
                 rloo_batch_size,
-                enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False),
+                enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
                 stats_tracker=stats_tracker,
                 demo_initial_state=demo_batch  # 🔥 新增：传递demo初始状态
             )
@@ -1052,9 +1063,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     else:
                         print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
                               f"成功率 {np.mean(successes):.2%} (动态采样已禁用)")
-                    
-                    # 🔥 更新全局episode计数器，确保下次轮换继续
-                    env_runner.update_episode_counter(len(group_episodes))
+
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
         
@@ -1108,12 +1117,16 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         # 6. CFG评估（每10步进行一次，仅在CFG启用时）
         if (step + 1) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
             try:
-                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
+                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")
                 # 可选：动态调整收集时使用的CFG强度
-                env_runner.config.collection_cfg_scale = best_cfg
+                # 🔥 修复：写入正确的algo路径
+                if hasattr(env_runner.config, 'algo'):
+                    env_runner.config.algo.collection_cfg_scale = best_cfg
+                if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+                    env_runner.config['algo']['collection_cfg_scale'] = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
         elif (step + 1) % 10 == 0:

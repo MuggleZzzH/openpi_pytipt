@@ -50,7 +50,6 @@ class SyncedInitStateWrapper:
         # 🔥 RIPT对齐：使用主进程传递的初始状态数组
         self.init_states = init_states_array
         if self.init_states is not None:
-            import numpy as np
             # 🔥 修复numpy数组类型判断问题
             if isinstance(self.init_states, np.ndarray):
                 self.num_init_states = self.init_states.shape[0]
@@ -90,7 +89,6 @@ class SyncedInitStateWrapper:
         # === 优先级1: 传入状态按worker切片处理（正式业务调用）===
         if 'init_states' in kwargs:
             # 🔥 关键修复：从kwargs中移除init_states，避免传递给不支持的底层环境
-            import numpy as np
             init_states = kwargs.pop('init_states')  # 移除避免传递给底层
             
             # 先进行普通reset
@@ -122,7 +120,25 @@ class SyncedInitStateWrapper:
                 
                 # 🔥 使用CleanDiffuser支持的接口设置状态
                 if hasattr(self.env, 'set_init_state'):
-                    self.env.set_init_state(snapshot)
+                    try:
+                        print(f"🔧 调试: snapshot类型={type(snapshot)}, 形状={snapshot.shape}, dtype={snapshot.dtype}")
+                        if hasattr(snapshot, 'ndim'):
+                            print(f"🔧 调试: snapshot维度={snapshot.ndim}, 前5个值={snapshot[:5] if len(snapshot) > 5 else snapshot}")
+                        
+                        # 🔥 重要修复：确保状态是1D数组且为float64
+                        if snapshot.ndim > 1:
+                            snapshot = snapshot.flatten()
+                        snapshot = np.ascontiguousarray(snapshot, dtype=np.float64)
+                        print(f"🔧 处理后snapshot: 形状={snapshot.shape}, dtype={snapshot.dtype}")
+                        
+                        self.env.set_init_state(snapshot)
+                    except Exception as e:
+                        print(f"❌ set_init_state失败: {e}")
+                        print(f"   snapshot类型: {type(snapshot)}")
+                        print(f"   snapshot形状: {getattr(snapshot, 'shape', 'N/A')}")
+                        # 尝试fallback：直接reset而不设置状态
+                        print(f"⚠️ 回退到普通reset")
+                        return self.env.reset(**kwargs)
             
             return obs
         
@@ -133,7 +149,20 @@ class SyncedInitStateWrapper:
             
             # 🔥 使用缓存的状态直接调用set_init_state
             if hasattr(self.env, 'set_init_state'):
-                self.env.set_init_state(self.cached_snapshot)
+                try:
+                    print(f"🔧 调试: cached_snapshot类型={type(self.cached_snapshot)}, 形状={self.cached_snapshot.shape}")
+                    
+                    # 🔥 重要修复：确保缓存状态格式正确
+                    cached_state = self.cached_snapshot.copy()
+                    if cached_state.ndim > 1:
+                        cached_state = cached_state.flatten()
+                    cached_state = np.ascontiguousarray(cached_state, dtype=np.float64)
+                    
+                    self.env.set_init_state(cached_state)
+                except Exception as e:
+                    print(f"❌ 缓存状态设置失败: {e}")
+                    print(f"⚠️ 回退到普通reset")
+                    return self.env.reset(**kwargs)
             
             return obs
         
@@ -147,7 +176,7 @@ class SyncedInitStateWrapper:
         if self.cached_snapshot is None and not self.has_received_init_states:
             # 这是真正的热身reset：新环境且从未收到过正式业务调用
             obs = self.env.reset(**kwargs)
-            print(f"🔥 热身reset: 使用默认初始化（等待业务调用）")
+            print(f"[init] 预启动 reset（未设置 init_states）")
             return obs
             
         # 🔥 固定状态ID语义处理
@@ -163,7 +192,6 @@ class SyncedInitStateWrapper:
         # 🔥 全局轮换分支：有init_states时才进入
         if self.init_states is not None:
             # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
-            import numpy as np
             
             # 获取对应的初始状态
             raw_snapshot = self.init_states[selected_id]
