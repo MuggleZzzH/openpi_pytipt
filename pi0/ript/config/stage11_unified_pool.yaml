@@ -93,7 +93,7 @@ logging:
 # === 特性开关 - 简化配置 ===
 features:
   use_ript_vla_runner: false
-  enable_parallel_envs: true      # 禁用并行环境避免卡死
+  enable_parallel_envs: true    
   enable_true_parallel_envs: true
   enable_smart_sampling: false
   use_parallel_init_state: true  # 🔥 重新启用并行状态设置（已修复格式问题）
