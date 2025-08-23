@@ -1224,8 +1224,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 print(f"✓ 完整检查点已保存: {checkpoint_path}")
     
     # 🔥 保存最终统计数据
-    stats_tracker.save_stats()
-    print(f"📊 最终统计: {len(stats_tracker.rollout_stats)} 个不同的init状态")
+    if stats_tracker is not None:
+        stats_tracker.save_stats()
+        print(f"📊 最终统计: {len(stats_tracker.rollout_stats)} 个不同的init状态")
+    else:
+        print("📊 统计跟踪已禁用")
     
     # 保存最终结果
     final_results_path = output_dir / "final_training_results.json"

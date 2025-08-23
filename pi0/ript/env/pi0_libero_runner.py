@@ -983,16 +983,18 @@ class LIBEROEnvRunner:
             sync_enabled = sync_config.get('enabled', True)
             fixed_init_state_id = sync_config.get('fixed_init_state_id', 0) if sync_enabled else None
 
-            env_factory = create_env_factory(
-                benchmark_name=self.benchmark_name,
-                env_name=env_name,
-                task_id=None,  # 自动推断
-                fixed_init_state_id=fixed_init_state_id,  # 🔥 新增：固定初始状态ID
-                init_states_array=all_init_states  # 🔥 传递初始状态数组
-            )
-
-            # 创建多个环境工厂实例
-            env_factories = [env_factory for _ in range(self.num_parallel_envs)]
+            # 🔥 修复：为每个worker创建带有不同worker_idx的工厂
+            env_factories = []
+            for worker_idx in range(self.num_parallel_envs):
+                worker_env_factory = create_env_factory(
+                    benchmark_name=self.benchmark_name,
+                    env_name=env_name,
+                    task_id=None,  # 自动推断
+                    fixed_init_state_id=fixed_init_state_id,  # 🔥 新增：固定初始状态ID
+                    init_states_array=all_init_states,  # 🔥 传递初始状态数组
+                    worker_idx=worker_idx  # 🔥 每个worker有不同的索引
+                )
+                env_factories.append(worker_env_factory)
             
             if self.rank == 0:
                 print(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")

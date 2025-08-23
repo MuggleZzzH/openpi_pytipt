@@ -25,16 +25,18 @@ class SyncedInitStateWrapper:
     4. 完全移除随机逻辑，确保可复现的评测结果
     """
 
-    def __init__(self, env, fixed_init_state_id: int, init_states_array=None, episode_offset=0):
+    def __init__(self, env, fixed_init_state_id: int, init_states_array=None, episode_offset=0, worker_idx=0):
         """
         Args:
             env: 被包装的环境
             fixed_init_state_id: 保留兼容性，实际使用顺序轮换
             init_states_array: 从主进程传递的初始状态数组
             episode_offset: 主进程传递的episode偏移量，确保全局连续轮换
+            worker_idx: 当前worker的索引，用于从batched init_states中切片
         """
         self.env = env
         self.fixed_init_state_id = fixed_init_state_id
+        self.worker_idx = worker_idx  # 🔥 新增：worker索引用于状态切片
         
         # 🔥 RIPT对齐：使用主进程传递的episode偏移量
         self.episode_offset = episode_offset
@@ -85,31 +87,55 @@ class SyncedInitStateWrapper:
         2. 缓存snapshot复用（同demo内rloo batch复用）
         3. 全局顺序轮换（与原版RIPT eval对齐）
         """
-        # === 优先级1: 传入状态直接转发给底层（正式业务调用）===
+        # === 优先级1: 传入状态按worker切片处理（正式业务调用）===
         if 'init_states' in kwargs:
-            # 🔥 关键修复：直接转发init_states给底层，不要手动set_init_state
-            # 让VectorEnv和底层wrapper负责状态设置和格式转换
-            
+            # 🔥 关键修复：从kwargs中移除init_states，避免传递给不支持的底层环境
             import numpy as np
-            init_states = kwargs['init_states']
+            init_states = kwargs.pop('init_states')  # 移除避免传递给底层
             
-            # 🔥 缓存用于同demo内复用（但不主动调用set_init_state）
+            # 先进行普通reset
+            obs = self.env.reset(**kwargs)
+            
+            # 🔥 按worker切片处理状态
             if init_states is not None:
-                self.cached_snapshot = np.asarray(init_states)
-                # 🔥 标记已收到正式业务调用
+                # 确保是numpy数组
+                if isinstance(init_states, (list, tuple)):
+                    init_states_array = np.array(init_states)
+                else:
+                    init_states_array = np.asarray(init_states)
+                
+                # 按worker索引切片得到本worker的状态
+                if len(init_states_array.shape) > 1:
+                    # 多worker情况：(num_workers, 92)
+                    snapshot = init_states_array[self.worker_idx]
+                else:
+                    # 单状态情况：(92,) 直接使用
+                    snapshot = init_states_array
+                
+                # 确保格式正确
+                snapshot = np.ascontiguousarray(snapshot, dtype=np.float64)
+                
+                # 🔥 缓存用于同demo内复用
+                self.cached_snapshot = snapshot.copy()
                 self.has_received_init_states = True
-                print(f"🎯 优先级1: 转发传入状态, 形状={self.cached_snapshot.shape}")
+                print(f"🎯 优先级1: 使用传入状态worker_{self.worker_idx}, 形状={snapshot.shape}")
+                
+                # 🔥 使用CleanDiffuser支持的接口设置状态
+                if hasattr(self.env, 'set_init_state'):
+                    self.env.set_init_state(snapshot)
             
-            # 🔥 直接转发给底层环境，让它处理状态设置
-            return self.env.reset(**kwargs)
+            return obs
         
         # === 优先级2: 缓存snapshot复用（同demo内rloo batch复用）===
         if hasattr(self, 'cached_snapshot') and self.cached_snapshot is not None:
-            # 🔥 修复：使用缓存的状态通过init_states转发，保持同demo复用语义
             print(f"🎯 优先级2: 复用缓存状态, 形状={self.cached_snapshot.shape}")
-            kwargs_with_cache = kwargs.copy()
-            kwargs_with_cache['init_states'] = self.cached_snapshot
-            return self.env.reset(**kwargs_with_cache)
+            obs = self.env.reset(**kwargs)
+            
+            # 🔥 使用缓存的状态直接调用set_init_state
+            if hasattr(self.env, 'set_init_state'):
+                self.env.set_init_state(self.cached_snapshot)
+            
+            return obs
         
         # === 优先级3: 全局顺序轮换（与原版RIPT完全对齐）===
         if self.num_init_states <= 0:
@@ -134,9 +160,7 @@ class SyncedInitStateWrapper:
             selected_id = global_episode_idx % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
             self.local_counter += 1
         
-        # 🔥 默认reset，但如果有init_states会被上面的逻辑拦截
-        obs = self.env.reset(**kwargs)
-        
+        # 🔥 全局轮换分支：有init_states时才进入
         if self.init_states is not None:
             # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
             import numpy as np
@@ -144,21 +168,24 @@ class SyncedInitStateWrapper:
             # 获取对应的初始状态
             raw_snapshot = self.init_states[selected_id]
             
-            # 🔥 确保状态格式正确
+            # 🔥 确保状态格式正确（与优先级1路径保持一致）
             if isinstance(raw_snapshot, (list, tuple)):
-                snapshot = np.array(raw_snapshot, dtype=np.float32)
+                snapshot = np.ascontiguousarray(raw_snapshot, dtype=np.float64)
             elif hasattr(raw_snapshot, 'shape'):
-                snapshot = np.array(raw_snapshot, dtype=np.float32)
+                snapshot = np.ascontiguousarray(raw_snapshot, dtype=np.float64)
             else:
-                snapshot = np.array([raw_snapshot], dtype=np.float32)
+                snapshot = np.ascontiguousarray([raw_snapshot], dtype=np.float64)
             
             print(f"🎯 全局轮换: episode_{global_episode_idx} → state_id={selected_id}, 形状={snapshot.shape}")
             
-            # 🔥 修复：通过init_states转发而不是手动set_init_state
-            kwargs_with_state = kwargs.copy()
-            kwargs_with_state['init_states'] = snapshot
-            return self.env.reset(**kwargs_with_state)
+            # 🔥 修复：先reset再手动set_init_state
+            obs = self.env.reset(**kwargs)
+            if hasattr(self.env, 'set_init_state'):
+                self.env.set_init_state(snapshot)
+            return obs
         
+        # 🔥 兜底：如果没有init_states，使用默认reset
+        obs = self.env.reset(**kwargs)
         return obs
 
     def __getattr__(self, name):
@@ -227,7 +254,7 @@ def create_libero_env_independent(benchmark_name: str, env_name: str = None, tas
 
 
 def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int = None,
-                      fixed_init_state_id: int = None, init_states_array=None, episode_offset=0):
+                      fixed_init_state_id: int = None, init_states_array=None, episode_offset=0, worker_idx=0):
     """
     创建环境工厂函数 - 供SubprocVectorEnv使用
 
@@ -238,6 +265,7 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
         fixed_init_state_id: 保留兼容性 (可选)
         init_states_array: 从主进程传递的初始状态数组
         episode_offset: 主进程传递的episode偏移量，确保全局连续轮换
+        worker_idx: worker索引，用于从batched init_states中切片
 
     Returns:
         callable: 无参数的环境工厂函数
@@ -249,10 +277,11 @@ def create_env_factory(benchmark_name: str, env_name: str = None, task_id: int =
             task_id=task_id
         )
 
-        # 🔥 RIPT对齐：传递主进程管理的episode偏移量和初始状态数组
+        # 🔥 RIPT对齐：传递主进程管理的episode偏移量、初始状态数组和worker索引
         env = SyncedInitStateWrapper(env, fixed_init_state_id, 
                                    init_states_array=init_states_array,
-                                   episode_offset=episode_offset)
+                                   episode_offset=episode_offset,
+                                   worker_idx=worker_idx)
 
         return env  # SubprocVectorEnv只需要环境对象
 
