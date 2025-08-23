@@ -56,9 +56,6 @@ class LIBEROEnvRunner:
         self.rank = rank
         self.world_size = world_size
         
-        # 🔥 RIPT对齐：主进程管理全局episode计数器，避免多进程重置问题
-        self.global_episode_counter = 0
-        
         # 🔥 使用RIPT-VLA官方的任务最大步数设置（基于训练数据统计）
         TASK_MAX_STEPS = {
             'libero_spatial': 220,  # longest training demo has 193 steps
@@ -138,12 +135,6 @@ class LIBEROEnvRunner:
         
         # 加载归一化统计信息
         self._load_norm_stats(norm_stats_path)
-        
-    def update_episode_counter(self, num_episodes):
-        """更新全局episode计数器"""
-        self.global_episode_counter += num_episodes
-        if self.rank == 0:
-            print(f"🔄 Episode计数器更新: +{num_episodes} → 总计{self.global_episode_counter}")
 
     def _ensure_list_of_dict_obs(self, obs_any, env_num: int):
         """Normalize vector-env observation to List[Dict] per environment.
@@ -589,14 +580,14 @@ class LIBEROEnvRunner:
         
     def run_policy_in_env(self, env_name, all_init_states=None, debug_save_video=None, created_env=None):
         """在环境中运行策略，生成轨迹 - 支持并行和串行环境"""
-        save_video = debug_save_video if debug_save_video is not None else getattr(self, 'debug_save_video', False)
+        save_video = debug_save_video if debug_save_video is not None else self.debug_save_video
         
         # 🔥 根据功能开关选择并行或串行模式
         if self.enable_parallel_envs and created_env is None:
             if self.rank == 0:
                 print(f"🚀 使用并行环境模式 (num_parallel_envs={self.num_parallel_envs})")
             # 创建并行环境
-            env, env_id, env_num = self.create_parallel_envs(env_name)
+            env, env_id, env_num = self.create_parallel_envs(env_name, all_init_states)
             created_env = (env, env_id, env_num)
         elif created_env is None:
             if self.rank == 0:
@@ -698,7 +689,7 @@ class LIBEROEnvRunner:
             
             # 热机步骤
             dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-            for _ in range(20):
+            for _ in range(10):
                 if is_vector_env:
                     # VectorEnv期望动作列表
                     step_results = env.step([dummy_action])
@@ -853,9 +844,13 @@ class LIBEROEnvRunner:
                     # 检查成功状态 - 优先使用info中的success，否则基于奖励判断（与4脚本保持一致）
                     if info.get("success", False):
                         success = True
-                    # 🔥 RIPT对齐：如果info中没有success字段，使用调整后的判断逻辑
-                    elif total_reward > 0.1:
+                    # 如果info中没有success字段，使用与4_simple_train_ript.py相同的判断逻辑
+                    elif total_reward > 0.5:
                         success = True
+                    
+                    # 如果任务完成，提前退出
+                    if done:
+                        break
             
             except Exception as e:
                 print(f"执行环境步骤时出错: {e}")
@@ -922,7 +917,7 @@ class LIBEROEnvRunner:
         env, task_description = self.make_env(env_name)
         return env, env_name, 1
     
-    def create_parallel_envs(self, env_name: str):
+    def create_parallel_envs(self, env_name: str, all_init_states=None):
         """创建并行环境"""
         if not self.enable_parallel_envs or not VECTOR_ENV_AVAILABLE or self.num_parallel_envs <= 1:
             # 如果不支持并行环境或只需要1个环境，使用单个环境
@@ -933,7 +928,7 @@ class LIBEROEnvRunner:
         
         # 检查是否启用真正的多进程并行
         if self.enable_true_parallel_envs:
-            return self._create_true_parallel_envs(env_name)
+            return self._create_true_parallel_envs(env_name, all_init_states)
         else:
             # 回退到单环境
             return self._create_single_env(env_name)
@@ -946,7 +941,7 @@ class LIBEROEnvRunner:
         env, task_description = self.make_env(env_name) 
         return env, env_name, 1
     
-    def _create_true_parallel_envs(self, env_name: str):
+    def _create_true_parallel_envs(self, env_name: str, all_init_states=None):
         """🆕 创建真正的多进程并行环境 - 使用独立环境工厂解决序列化问题"""
         if not TRUE_PARALLEL_AVAILABLE:
             if self.rank == 0:
@@ -981,55 +976,19 @@ class LIBEROEnvRunner:
         
         try:
             # 🔑 关键：使用独立环境工厂，避免序列化self对象
-            # 🔥 RIPT对齐：获取初始状态数组传递给wrapper
+            # 🔥 关键修复：使用固定初始状态ID确保并行环境同步
 
             # 从配置中读取同步设置
             sync_config = getattr(self.config, 'features', {}).get('parallel_env_sync', {})
             sync_enabled = sync_config.get('enabled', True)
             fixed_init_state_id = sync_config.get('fixed_init_state_id', 0) if sync_enabled else None
 
-            # 🔥 获取LIBERO初始状态数组（与原版RIPT完全对齐）
-            init_states_array = None
-            try:
-                # 采用与原版RIPT完全相同的方式
-                from libero.libero import benchmark
-                
-                # 获取benchmark字典，然后实例化（与原版RIPT相同）
-                benchmark_dict = benchmark.get_benchmark_dict()
-                task_suite = benchmark_dict[self.benchmark_name]()  # 🔥 无参数构造
-                
-                # 获取任务的初始状态数组 - 与原版RIPT相同
-                task_id = 0  # 默认使用第一个任务
-                raw_init_states = task_suite.get_task_init_states(task_id)
-                
-                # 🔥 确保格式正确：转换为标准Python list，便于序列化
-                import numpy as np
-                if isinstance(raw_init_states, np.ndarray):
-                    init_states_array = raw_init_states.tolist()
-                elif hasattr(raw_init_states, '__len__'):
-                    init_states_array = list(raw_init_states)
-                else:
-                    init_states_array = raw_init_states
-                
-                if self.rank == 0:
-                    print(f"🎯 RIPT对齐：获取到 {len(init_states_array)} 个初始状态")
-                    print(f"   状态格式：{type(init_states_array)}, 单个状态维度：{len(init_states_array[0]) if len(init_states_array) > 0 else 'N/A'}")
-                    
-            except Exception as e:
-                if self.rank == 0:
-                    print(f"⚠️ 无法获取LIBERO初始状态数组: {e}")
-                    print(f"   将使用环境默认初始化")
-
-            # 🔥 传递当前的episode偏移量给环境工厂，确保全局连续轮换
-            current_episode_offset = self.global_episode_counter
-            
             env_factory = create_env_factory(
                 benchmark_name=self.benchmark_name,
                 env_name=env_name,
                 task_id=None,  # 自动推断
-                fixed_init_state_id=fixed_init_state_id,
-                init_states_array=init_states_array,  # 🔥 传递初始状态数组
-                episode_offset=current_episode_offset  # 🔥 传递episode偏移量
+                fixed_init_state_id=fixed_init_state_id,  # 🔥 新增：固定初始状态ID
+                init_states_array=all_init_states  # 🔥 传递初始状态数组
             )
 
             # 创建多个环境工厂实例
@@ -1037,10 +996,17 @@ class LIBEROEnvRunner:
             
             if self.rank == 0:
                 print(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")
-                # 🔥 显示当前episode偏移量信息
-                print(f"🎯 使用RIPT全局顺序轮换模式 (状态池: {len(init_states_array) if init_states_array else 50}, episode_offset: {current_episode_offset})")
+                if sync_enabled and fixed_init_state_id is not None:
+                    if fixed_init_state_id == -1:
+                        print("🎲 启用智能随机模式，每次重置随机选择初始状态")
+                    else:
+                        print(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
+                else:
+                    print("🎲 使用完全随机初始状态模式")
 
-            # multiprocessing启动方法已在主脚本开头设置
+            # 设置multiprocessing启动方法
+            if multiprocessing.get_start_method(allow_none=True) != 'spawn':
+                multiprocessing.set_start_method('spawn', force=True)
 
             # 创建SubprocVectorEnv
             parallel_env = SubprocVectorEnv(env_factories)
@@ -1253,7 +1219,7 @@ class LIBEROEnvRunner:
         
         # 对每个环境进行热身
         dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-        for warmup_step in range(20):
+        for warmup_step in range(10):
             # 🔑 确保actions数组长度与环境数量完全匹配
             actions = [dummy_action.copy() for _ in range(env_num)]
             if self.rank == 0 and warmup_step == 0:
@@ -1426,8 +1392,7 @@ class LIBEROEnvRunner:
                         if self.rank == 0:
                             print(f"⚠️ 收集图像帧失败 (环境{i}): {e}")
                 
-                # 🔥 RIPT对齐：调整成功判断阈值，提高rollout成功率
-                if infos[i].get("success", False) or episode['total_reward'] > 0.1:
+                if infos[i].get("success", False) or episode['total_reward'] > 0.5:
                     episode['success'] = True
                 
                 # 完成条件：本步返回 done 或达到最大步数

@@ -112,18 +112,74 @@ class RIPTAlignedDataset(Dataset):
         demos = []
         
         for task_idx, task_name in enumerate(self.task_names_to_use):
-            # 🔥 尝试加载真实的demo文件
             demo_file = os.path.join(self.dataset_path, f"{task_name}_demo.hdf5")
-            
             if os.path.exists(demo_file):
-                demo_data = self._load_real_demo(demo_file, task_idx, task_name)
+                # 🔥 新逻辑：一次性加载 n_demos 个 demo，与原版 RIPT 对齐
+                demos.extend(self._load_multiple_demos(demo_file, task_idx, task_name))
             else:
                 print(f"⚠️ Demo文件不存在: {demo_file}")
                 demo_data = self._create_mock_demo(task_idx, task_name)
-            
-            demos.append(demo_data)
+                demos.append(demo_data)
         
         return demos
+
+    def _load_multiple_demos(self, demo_file: str, task_idx: int, task_name: str) -> List[Dict]:
+        """一次性加载多个 demo，每个 demo 作为独立样本，数量与 n_demos 对齐"""
+        loaded = []
+        try:
+            with h5py.File(demo_file, 'r') as f:
+                if 'data' not in f:
+                    print(f"⚠️ HDF5 文件缺少 data 组: {demo_file}")
+                    return [self._create_mock_demo(task_idx, task_name)]
+
+                demo_ids = sorted(list(f['data'].keys()))
+                n_to_load = min(self.n_demos, len(demo_ids))
+                print(f"📋 发现 {len(demo_ids)} 个 demo，加载前 {n_to_load} 个 → task={task_name}")
+
+                for i, demo_id in enumerate(demo_ids[:n_to_load]):
+                    demo_group = f['data'][demo_id]
+
+                    # 观测
+                    obs = {}
+                    if self.load_obs and 'obs' in demo_group:
+                        g = demo_group['obs']
+                        if 'agentview_rgb' in g:
+                            obs['agentview_rgb'] = np.array(g['agentview_rgb'][0])
+                        if 'ee_pos' in g:
+                            obs['robot0_eef_pos'] = np.array(g['ee_pos'][0])
+                        if 'joint_states' in g:
+                            obs['robot0_joint_pos'] = np.array(g['joint_states'][0])
+
+                    # 状态 - 双轨输出：序列+单快照
+                    if self.load_state and 'states' in demo_group:
+                        full_states = np.array(demo_group['states'])  # [T, state_dim]
+                        init_state_seq = full_states  # 完整序列供轮换器使用
+                        init_state_vec = full_states[0]  # 单快照与原版对齐
+                    else:
+                        mock_states = self._generate_mock_states()
+                        init_state_seq = mock_states  # [1, state_dim] 
+                        init_state_vec = mock_states[0]  # [state_dim]
+
+                    loaded.append({
+                        'task_id': task_idx,
+                        'task_name': task_name,
+                        'demo_id': demo_id,
+                        'initial_obs': obs,
+                        # 保留序列供轮换器使用
+                        'init_state': {
+                            'states': torch.tensor(init_state_seq, dtype=torch.float32),
+                            'pad_mask': torch.ones(init_state_seq.shape[0], dtype=torch.bool)
+                        },
+                        # 新增：单快照与原版对齐
+                        'init_state_vec': {
+                            'states': torch.tensor(init_state_vec, dtype=torch.float32),  # [state_dim]
+                            'pad_mask': torch.tensor(True, dtype=torch.bool)  # 单个状态总是有效
+                        }
+                    })
+        except Exception as e:
+            print(f"⚠️ 多 demo 加载失败 {demo_file}: {e}")
+            loaded.append(self._create_mock_demo(task_idx, task_name))
+        return loaded
     
     def _load_real_demo(self, demo_file: str, task_idx: int, task_name: str) -> Dict:
         """加载真实的demo文件（修复：正确读取HDF5结构）"""
@@ -253,9 +309,11 @@ class RIPTAlignedDataset(Dataset):
         if self.load_obs and demo['initial_obs'] is not None:
             item['initial_obs'] = demo['initial_obs']
         
-        # 🔥 关键：添加MuJoCo状态数据
+        # 🔥 关键：添加MuJoCo状态数据（双轨输出）
         if self.load_state and demo['init_state'] is not None:
-            item['init_state'] = demo['init_state']
+            item['init_state'] = demo['init_state']  # 序列供轮换器使用
+            if 'init_state_vec' in demo:
+                item['init_state_vec'] = demo['init_state_vec']  # 单快照与原版对齐
         
         return item
 
@@ -286,63 +344,74 @@ class MockRIPTDataset(Dataset):
             }
         }
         
-        # 🔥 添加模拟的MuJoCo状态
+        # 🔥 添加模拟的MuJoCo状态（双轨输出）
         if self.load_state:
-            mock_states = np.random.randn(1, 487).astype(np.float32)
+            mock_states_seq = np.random.randn(1, 487).astype(np.float32)  # [1, 487]
+            mock_states_vec = mock_states_seq[0]  # [487]
+            
+            # 序列格式供轮换器使用
             item['init_state'] = {
-                'states': torch.tensor(mock_states, dtype=torch.float32),
+                'states': torch.tensor(mock_states_seq, dtype=torch.float32),
                 'pad_mask': torch.ones(1, dtype=torch.bool)
+            }
+            # 单快照格式与原版对齐
+            item['init_state_vec'] = {
+                'states': torch.tensor(mock_states_vec, dtype=torch.float32),
+                'pad_mask': torch.tensor(True, dtype=torch.bool)
             }
         
         return item
 
 def collate_fn_ript_aligned(batch):
-    """与原版RIPT对齐的collate函数"""
-    # 🔥 处理init_state字段（与原版RIPT完全一致）
+    """与原版RIPT对齐的collate函数（双轨输出）"""
+    
+    # 先处理除状态外的其他字段
+    filtered_items = []
+    for item in batch:
+        filtered_item = {k: v for k, v in item.items() if k not in ['init_state', 'init_state_vec']}
+        filtered_items.append(filtered_item)
+    
+    collated_batch = default_collate(filtered_items)
+    
+    # 🔥 处理init_state字段（序列格式，供轮换器使用）
     if 'init_state' in batch[0] and batch[0]['init_state'] is not None:
         states = [item['init_state']['states'] for item in batch]
 
-        # 🔥 修复：正确处理状态维度
-        # states的形状应该是 [T, state_dim]，我们需要找到最大的T
-        max_seq_len = max(s.shape[0] for s in states)  # 序列长度维度
-        max_state_dim = max(s.shape[-1] for s in states)  # 状态维度
+        # states的形状应该是 [T, state_dim]
+        max_seq_len = max(s.shape[0] for s in states)
+        max_state_dim = max(s.shape[-1] for s in states)
 
         padded_states = []
         masks = []
-        modified_batch = []
 
         for item in batch:
-            # 获取状态张量 [T, state_dim]
             tensor = item['init_state']['states'].float()
             seq_len, state_dim = tensor.shape
 
-            # 填充序列长度到max_seq_len
             seq_pad_size = max_seq_len - seq_len
             state_pad_size = max_state_dim - state_dim
 
-            # 填充：(left_pad, right_pad) for last dim, (left_pad, right_pad) for second last dim
             padded = torch.nn.functional.pad(tensor, (0, state_pad_size, 0, seq_pad_size))
             padded_states.append(padded)
 
-            # 创建对应的mask [T]
             mask = torch.ones(seq_len, dtype=torch.bool)
             mask = torch.nn.functional.pad(mask, (0, seq_pad_size), value=False)
             masks.append(mask)
 
-            # 创建不包含init_state的item
-            modified_item = {key: item[key] for key in item.keys() if key != 'init_state'}
-            modified_batch.append(modified_item)
-
-        # 正常collate其他字段
-        collated_batch = default_collate(modified_batch)
-
-        # 🔥 添加处理好的init_state（与原版RIPT格式一致）
         collated_batch['init_state'] = {
             'states': torch.stack(padded_states),    # [B, T, state_dim]
             'pad_mask': torch.stack(masks)           # [B, T]
         }
 
-        return collated_batch
-    else:
-        # 如果没有init_state，使用默认collate
-        return default_collate(batch)
+    # 🔥 处理init_state_vec字段（单快照格式，与原版RIPT对齐）
+    if 'init_state_vec' in batch[0] and batch[0]['init_state_vec'] is not None:
+        vec_states = [item['init_state_vec']['states'] for item in batch]
+        vec_masks = [item['init_state_vec']['pad_mask'] for item in batch]
+        
+        # 单快照向量格式 [B, state_dim]
+        collated_batch['init_state_vec'] = {
+            'states': torch.stack(vec_states),       # [B, state_dim]
+            'pad_mask': torch.stack(vec_masks)       # [B]
+        }
+
+    return collated_batch

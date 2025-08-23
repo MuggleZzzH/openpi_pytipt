@@ -18,7 +18,7 @@ task:
   task_names_to_use:
     - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"    # 🔥 修复：从LIBERO官方任务映射获取
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: 51  # 🔥 进一步限制episode长度减少样本数
+  max_episode_length: 50  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                     # 启用LIBERO demo加载
@@ -71,7 +71,7 @@ data_processing:
 
 # === 训练配置 ===
 training:
-  num_train_steps: 3  # 快速测试
+  num_train_steps: 2  # 快速测试
   seed: 42
   n_steps: 3
   rollout_steps: 1

@@ -77,14 +77,20 @@ class RolloutStatsTracker:
         print(f"  已有统计: {len(self.rollout_stats)} 个init")
     
     def _compute_init_hash(self, task_id: int, init_state_data: Any) -> str:
-        """计算初始状态的哈希值"""
+        """计算初始状态的稳定哈希值（float64 + contiguous）"""
         if isinstance(init_state_data, torch.Tensor):
-            data_bytes = init_state_data.cpu().numpy().tobytes()
+            # 转换为float64 contiguous numpy数组
+            numpy_data = np.ascontiguousarray(init_state_data.cpu().numpy(), dtype=np.float64)
         elif isinstance(init_state_data, np.ndarray):
-            data_bytes = init_state_data.tobytes()
+            # 确保是float64 contiguous
+            numpy_data = np.ascontiguousarray(init_state_data, dtype=np.float64)
         else:
+            # 回退到字符串
             data_bytes = str(init_state_data).encode()
+            return hashlib.sha256(data_bytes).hexdigest()[:16]
         
+        # 使用稳定的bytes哈希
+        data_bytes = numpy_data.tobytes()
         return hashlib.sha256(data_bytes).hexdigest()[:16]  # 短哈希
     
     def should_skip_init(self, task_id: int, init_hash: str, rloo_batch_size: int) -> bool:
@@ -350,6 +356,10 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     
     return policy, optimizer, device
 
+def is_dynamic_sampling_enabled(config: Dict[str, Any]) -> bool:
+    """统一动态采样配置读取"""
+    return bool(config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False))
+
 def create_environment_runner(config: Dict[str, Any], policy):
     """创建环境runner（RIPT-VLA风格选择）"""
     use_ript_vla = config.get('features', {}).get('use_ript_vla_runner', False)
@@ -407,11 +417,11 @@ def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool
 
 
 class DemoStateSampler:
-    """RIPT对齐的Demo状态采样器 - 确保有序轮换，避免重复使用相同状态"""
+    """RIPT对齐的Demo状态采样器 - 同demo用同一状态，不同demo轮换状态"""
     
     def __init__(self):
-        self.demo_state_idx = 0  # 当前demo中的状态索引
-        self.demo_episode_idx = 0  # 当前demo episode索引
+        self.demo_to_state_cache = {}  # 缓存：demo_id -> 选定的状态索引
+        self.next_state_idx = 0  # 下一个新demo使用的状态索引
         
     def get_next_init_state(self, demo_initial_state):
         """
@@ -431,29 +441,44 @@ class DemoStateSampler:
             
         # 使用demo中的MuJoCo状态
         init_state_data = demo_initial_state['init_state']
-        states = init_state_data['states']  # (T, state_dim)
-        pad_mask = init_state_data['pad_mask']  # (T,)
+        # 🔥 修复：collate后是[B,T,92]格式，需要取单条[T,92]
+        states = init_state_data['states'][0]  # [T, 92]
+        pad_mask = init_state_data['pad_mask'][0]  # [T]
         
         # 获取所有有效状态索引
         valid_indices = torch.where(pad_mask)[0]
         if len(valid_indices) == 0:
             return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
         
-        # 🔥 关键：按顺序轮换选择状态，而不是总是选择第一个
-        current_valid_idx = self.demo_state_idx % len(valid_indices)
+        # 🔥 关键修复：同demo用同一状态，不同demo轮换状态
+        demo_id = demo_initial_state['task_id'][0].item()
+        
+        if demo_id not in self.demo_to_state_cache:
+            # 新demo：分配下一个状态索引
+            current_valid_idx = self.next_state_idx % len(valid_indices)
+            self.demo_to_state_cache[demo_id] = current_valid_idx
+            self.next_state_idx += 1
+            print(f"  🎯 新demo {demo_id}: 分配状态索引 {current_valid_idx}")
+        else:
+            # 已知demo：复用之前分配的状态索引
+            current_valid_idx = self.demo_to_state_cache[demo_id]
+            print(f"  🎯 复用demo {demo_id}: 状态索引 {current_valid_idx}")
+        
         selected_state_idx = valid_indices[current_valid_idx]
         selected_state = states[selected_state_idx]
         
-        # 更新索引（下次调用时会选择下一个状态）
-        self.demo_state_idx += 1
+        # 🔥 确保返回float64格式的contiguous数组
+        selected_state_numpy = np.ascontiguousarray(selected_state.numpy(), dtype=np.float64)
         
-        # 生成状态哈希用于追踪
-        state_hash = f"demo_{demo_initial_state['task_id'][0].item()}_state_{selected_state_idx.item()}"
-        state_desc = f"Demo {demo_initial_state['task_id'][0].item()} 状态 {current_valid_idx+1}/{len(valid_indices)}"
+        # 🔥 使用稳定bytes哈希替代字符串哈希
+        state_bytes = np.ascontiguousarray(selected_state_numpy, dtype=np.float64).tobytes()
+        state_hash = hashlib.sha256(state_bytes).hexdigest()[:16]  # 取前16位
         
-        print(f"  🎯 轮换选择: {state_desc} (索引: {selected_state_idx.item()})")
+        state_desc = f"Demo {demo_id} 状态 {current_valid_idx+1}/{len(valid_indices)} (索引: {selected_state_idx.item()})"
         
-        return selected_state.numpy(), state_hash, state_desc
+        print(f"  🎯 轮换选择: {state_desc}")
+        
+        return selected_state_numpy, state_hash, state_desc
 
 
 # 全局状态采样器实例
@@ -477,9 +502,12 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             task_id = demo_initial_state['task_id'][0].item()
 
             # 🔥 使用状态采样器进行有序轮换
-            selected_state, state_hash, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
+            selected_state, _, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
             if selected_state is not None:
                 all_init_states = [selected_state]
+                # 🔥 使用内容哈希替代字符串哈希
+                if stats_tracker is not None:
+                    state_hash = stats_tracker._compute_init_hash(task_id, selected_state)
                 print(f"  ✅ {state_desc}")
             else:
                 all_init_states = None
@@ -525,12 +553,12 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                 **episode_data
             }
             
-            # 🔥 添加init_hash信息（如果可用）
-            if 'init_hash' not in episode and stats_tracker:
-                # 尝试从episode_data中提取初始状态信息
-                if 'init_state' in episode_data:
-                    init_hash = stats_tracker._compute_init_hash(task_id, episode_data['init_state'])
-                    episode['computed_init_hash'] = init_hash
+            # 🔥 添加init_hash信息（统一使用内容哈希）
+            if stats_tracker and state_hash is not None:
+                episode['init_hash'] = state_hash
+            elif stats_tracker and 'init_state' in episode_data:
+                # 从episode_data中计算内容哈希
+                episode['init_hash'] = stats_tracker._compute_init_hash(task_id, episode_data['init_state'])
             
             collected_rollouts.append(episode)
             rollout_count += 1
@@ -543,14 +571,11 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             # 提取成功率信息
             successes = [ep.get('success', False) for ep in collected_rollouts]
             
-            # 获取init_hash（使用episode中的或计算得到的）
+            # 获取init_hash（统一从episode中读取）
             init_hash = None
             for ep in collected_rollouts:
                 if 'init_hash' in ep:
                     init_hash = ep['init_hash']
-                    break
-                elif 'computed_init_hash' in ep:
-                    init_hash = ep['computed_init_hash']
                     break
             
             if init_hash:
@@ -801,14 +826,20 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
     
     for cfg_scale in cfg_scales:
         print(f"📊 测试CFG={cfg_scale}...")
-        # 临时设置CFG强度
-        original_cfg = getattr(env_runner.config, 'collection_cfg_scale', None)
-        if original_cfg is None and hasattr(env_runner.config, 'algo'):
-            original_cfg = getattr(env_runner.config.algo, 'collection_cfg_scale', None)
-        if original_cfg is None:
-            print("⚠️ CFG扫描：未找到collection_cfg_scale配置，使用1.5")
+        # 🔥 统一从config.algo.collection_cfg_scale读取
+        if hasattr(env_runner.config, 'algo') and hasattr(env_runner.config.algo, 'collection_cfg_scale'):
+            original_cfg = env_runner.config.algo.collection_cfg_scale
+        elif isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+            original_cfg = env_runner.config['algo'].get('collection_cfg_scale', 1.5)
+        else:
+            print("⚠️ CFG扫描：未找到algo.collection_cfg_scale配置，使用1.5")
             original_cfg = 1.5
-        env_runner.config.collection_cfg_scale = cfg_scale
+        
+        # 🔥 双重写入：对象式+字典式确保兼容性
+        if hasattr(env_runner.config, 'algo'):
+            env_runner.config.algo.collection_cfg_scale = cfg_scale
+        if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+            env_runner.config['algo']['collection_cfg_scale'] = cfg_scale
         
         # 运行评估episodes
         success_count = 0
@@ -832,8 +863,11 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
             best_success_rate = success_rate
             best_cfg = cfg_scale
         
-        # 恢复原设置
-        env_runner.config.collection_cfg_scale = original_cfg
+        # 🔥 双重恢复：对象式+字典式
+        if hasattr(env_runner.config, 'algo'):
+            env_runner.config.algo.collection_cfg_scale = original_cfg
+        if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+            env_runner.config['algo']['collection_cfg_scale'] = original_cfg
         
         print(f"   CFG={cfg_scale}: 成功率={success_rate:.2%} ({success_count}/{eval_episodes})")
     
@@ -906,13 +940,17 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 创建环境runner
     env_runner = create_environment_runner(config, policy)
     
-    # 🔥 创建rollout统计跟踪器
-    stats_path = config['algo'].get('rollout_stats_path', './output/stage11_ript_vla/rollout_stats.json')
-    rollout_skip_threshold = config['algo'].get('rollout_skip_threshold', 3)
-    stats_tracker = RolloutStatsTracker(
-        rollout_skip_threshold=rollout_skip_threshold,
-        stats_path=stats_path
-    )
+    # 🔥 创建rollout统计跟踪器（按配置开关）
+    enable_rollout_stats = config['algo'].get('enable_rollout_stats_tracking', False)
+    if enable_rollout_stats:
+        stats_path = config['algo'].get('rollout_stats_path', './output/stage11_ript_vla/rollout_stats.json')
+        rollout_skip_threshold = config['algo'].get('rollout_skip_threshold', 3)
+        stats_tracker = RolloutStatsTracker(
+            rollout_skip_threshold=rollout_skip_threshold,
+            stats_path=stats_path
+        )
+    else:
+        stats_tracker = None
     
     # 🔥 解耦demo_batch_size与rloo_batch_size
     demo_batch_size = config['algo'].get('demo_batch_size', 6)  # 改为默认6，与原版RIPT一致
@@ -994,7 +1032,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print_gpu_memory("步骤开始")
         
         # 1. 按组收集rollouts（解耦demo_batch_size与rloo_batch_size）
-        all_collected_episodes = []
+        all_groups = []  # 保留分组结构用于RLOO计算
         successful_groups = 0
         
         for group_idx in range(demo_batch_size):
@@ -1020,7 +1058,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             group_episodes = collect_rollouts_ript_vla_style(
                 env_runner, task_names[0] if not demo_batch else demo_batch['task_name'][0],
                 rloo_batch_size,
-                enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False),
+                enable_dynamic_sampling=is_dynamic_sampling_enabled(config),
                 stats_tracker=stats_tracker,
                 demo_initial_state=demo_batch  # 🔥 新增：传递demo初始状态
             )
@@ -1029,12 +1067,12 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 successes = [ep.get('success', False) for ep in group_episodes]
                 
                 # 🔥 检查组级动态采样：只在启用时才丢弃全0或全1的组
-                dynamic_sampling_enabled = config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
+                dynamic_sampling_enabled = is_dynamic_sampling_enabled(config)
                 
                 if dynamic_sampling_enabled and len(successes) > 0 and (all(successes) or not any(successes)):
                     print(f"⚠️ 组 {group_idx + 1} 被动态采样丢弃 (uniform successes: {all(successes)})")
                 else:
-                    all_collected_episodes.extend(group_episodes)
+                    all_groups.append(group_episodes)
                     successful_groups += 1
                     
                     if dynamic_sampling_enabled:
@@ -1044,24 +1082,74 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                         print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
                               f"成功率 {np.mean(successes):.2%} (动态采样已禁用)")
                     
-                    # 🔥 更新全局episode计数器，确保下次轮换继续
-                    env_runner.update_episode_counter(len(group_episodes))
+                    # 🔥 本地计数（已删除不存在的update_episode_counter）
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
         
         # 🔥 定期保存统计数据
-        if step % 5 == 0:  # 每5步保存一次
+        if step % 5 == 0 and stats_tracker is not None:  # 每5步保存一次
             stats_tracker.save_stats()
         
-        print(f"📊 组收集完成: {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
+        # 计算总episodes数用于日志
+        total_episodes = sum(len(g) for g in all_groups)
+        print(f"📊 组收集完成: {successful_groups}/{demo_batch_size} 组成功，总episodes: {total_episodes}")
         print_gpu_memory("收集完成")
         
-        if not all_collected_episodes:
-            print("⚠️ 未收集到有效episodes，跳过此步")
+        if not all_groups:
+            print("⚠️ 未收集到有效组，跳过此步")
             continue
         
-        # 2. 计算优势（正宗RLOO方法）
-        advantages = compute_advantages_rloo(all_collected_episodes, rloo_batch_size=rloo_batch_size)
+        # 2. 计算优势（按init_hash分桶RLOO方法）
+        per_group_advs = []
+        all_collected_episodes = []
+        
+        for group_idx, g in enumerate(all_groups):
+            if len(g) != rloo_batch_size:
+                print(f"⚠️ 跳过不完整组 {group_idx}: {len(g)}/{rloo_batch_size} episodes")
+                continue
+            
+            # 🔥 按init_hash分桶确保RLOO在同质轨迹内计算
+            from collections import defaultdict
+            hash_to_episodes = defaultdict(list)
+            
+            # 按init_hash分组
+            for ep in g:
+                init_hash = ep.get('init_hash', 'unknown')
+                hash_to_episodes[init_hash].append(ep)
+            
+            # 对每个桶分别计算RLOO
+            group_advantages = []
+            group_episodes = []
+            
+            for init_hash, bucket_episodes in hash_to_episodes.items():
+                if len(bucket_episodes) > 0:
+                    # 如果桶内样本数够rloo_batch_size，直接计算
+                    if len(bucket_episodes) >= rloo_batch_size:
+                        bucket_advs = compute_advantages_rloo(bucket_episodes[:rloo_batch_size], rloo_batch_size)
+                        group_advantages.append(bucket_advs)
+                        group_episodes.extend(bucket_episodes[:rloo_batch_size])
+                    else:
+                        # 桶内样本不足，使用现有样本计算（降级处理）
+                        bucket_advs = compute_advantages_rloo(bucket_episodes, len(bucket_episodes))
+                        group_advantages.append(bucket_advs)
+                        group_episodes.extend(bucket_episodes)
+                        
+                    print(f"  📦 分桶 {init_hash[:8]}: {len(bucket_episodes)} episodes")
+            
+            if group_advantages:
+                # 拼接同组内各桶的优势
+                group_concat_advs = torch.cat(group_advantages, dim=0)
+                per_group_advs.append(group_concat_advs)
+                all_collected_episodes.extend(group_episodes)
+                print(f"✅ 组 {group_idx} 完成RLOO: {len(hash_to_episodes)} 个分桶")
+            else:
+                print(f"⚠️ 组 {group_idx} 无有效分桶")
+        
+        if not per_group_advs:
+            print("⚠️ 没有有效的RLOO分桶，跳过此步")
+            continue
+            
+        advantages = torch.cat(per_group_advs, dim=0)
         print_gpu_memory("优势计算完成")
         
         # 3. 更新策略（带配置传递以支持梯度累积）

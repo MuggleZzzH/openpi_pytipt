@@ -34,10 +34,16 @@ class SyncedInitStateWrapper:
             episode_offset: 主进程传递的episode偏移量，确保全局连续轮换
         """
         self.env = env
+        self.fixed_init_state_id = fixed_init_state_id
         
         # 🔥 RIPT对齐：使用主进程传递的episode偏移量
         self.episode_offset = episode_offset
         self.local_counter = 0  # 本次环境实例的局部计数器
+        
+        # 🔥 缓存机制：实现同demo内rloo batch复用同一snapshot
+        self.cached_snapshot = None
+        # 🔥 标志位：追踪是否已收到过带init_states的正式业务调用
+        self.has_received_init_states = False
         
         # 🔥 RIPT对齐：使用主进程传递的初始状态数组
         self.init_states = init_states_array
@@ -75,56 +81,83 @@ class SyncedInitStateWrapper:
         RIPT对齐的环境重置：统一接口 + 顺序轮换
         
         优先级：
-        1. 并行环境传入init_states数组（用于多worker一致性）
-        2. 全局顺序轮换（与原版RIPT eval对齐）
+        1. 并行环境传入init_states数组（用于多worker一致性） → 缓存snapshot
+        2. 缓存snapshot复用（同demo内rloo batch复用）
+        3. 全局顺序轮换（与原版RIPT eval对齐）
         """
-        # === 优先级1: 并行环境传入init_states数组 ===
+        # === 优先级1: 传入状态直接转发给底层（正式业务调用）===
         if 'init_states' in kwargs:
-            init_states = kwargs.pop('init_states')
-            obs = self.env.reset(**kwargs)  # 🔥 RIPT对齐：先reset
-            if hasattr(self.env, 'set_init_state') and init_states is not None:
-                import numpy as np
-                # 🔥 修复：直接使用传入的状态，不再获取第一行
-                snapshot = np.asarray(init_states).squeeze()
-                print(f"🎯 优先级1: 使用传入状态, 形状={snapshot.shape}")
-                self.env.set_init_state(snapshot)  # 🔥 RIPT对齐：后set_init_state
-            return obs
+            # 🔥 关键修复：直接转发init_states给底层，不要手动set_init_state
+            # 让VectorEnv和底层wrapper负责状态设置和格式转换
+            
+            import numpy as np
+            init_states = kwargs['init_states']
+            
+            # 🔥 缓存用于同demo内复用（但不主动调用set_init_state）
+            if init_states is not None:
+                self.cached_snapshot = np.asarray(init_states)
+                # 🔥 标记已收到正式业务调用
+                self.has_received_init_states = True
+                print(f"🎯 优先级1: 转发传入状态, 形状={self.cached_snapshot.shape}")
+            
+            # 🔥 直接转发给底层环境，让它处理状态设置
+            return self.env.reset(**kwargs)
         
-        # === 优先级2: 全局顺序轮换（与原版RIPT完全对齐）===
+        # === 优先级2: 缓存snapshot复用（同demo内rloo batch复用）===
+        if hasattr(self, 'cached_snapshot') and self.cached_snapshot is not None:
+            # 🔥 修复：使用缓存的状态通过init_states转发，保持同demo复用语义
+            print(f"🎯 优先级2: 复用缓存状态, 形状={self.cached_snapshot.shape}")
+            kwargs_with_cache = kwargs.copy()
+            kwargs_with_cache['init_states'] = self.cached_snapshot
+            return self.env.reset(**kwargs_with_cache)
+        
+        # === 优先级3: 全局顺序轮换（与原版RIPT完全对齐）===
         if self.num_init_states <= 0:
             # 无状态数组时使用环境默认初始化
             obs = self.env.reset(**kwargs)
             return obs
-            
-        # 🔥 使用主进程episode偏移量 + 局部计数器实现全局连续轮换
-        global_episode_idx = self.episode_offset + self.local_counter
-        selected_id = global_episode_idx % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
-        self.local_counter += 1
         
-        # 🔥 RIPT对齐：完全按原版方式 env.reset() + env.set_init_state(snapshot)
+        # 🔥 正确逻辑：热身reset = 新环境且从未收到过带init_states的调用
+        if self.cached_snapshot is None and not self.has_received_init_states:
+            # 这是真正的热身reset：新环境且从未收到过正式业务调用
+            obs = self.env.reset(**kwargs)
+            print(f"🔥 热身reset: 使用默认初始化（等待业务调用）")
+            return obs
+            
+        # 🔥 固定状态ID语义处理
+        if self.fixed_init_state_id is not None and self.fixed_init_state_id >= 0:
+            # 固定使用指定索引的snapshot
+            selected_id = self.fixed_init_state_id % self.num_init_states
+        else:
+            # 顺序轮换（fixed_init_state_id为-1或None时）
+            global_episode_idx = self.episode_offset + self.local_counter
+            selected_id = global_episode_idx % self.num_init_states  # 🔥 等价于 initial_states[episode_idx]
+            self.local_counter += 1
+        
+        # 🔥 默认reset，但如果有init_states会被上面的逻辑拦截
         obs = self.env.reset(**kwargs)
         
-        if hasattr(self.env, 'set_init_state'):
-            if self.init_states is not None:
-                # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
-                import numpy as np
-                
-                # 获取对应的初始状态
-                raw_snapshot = self.init_states[selected_id]
-                
-                # 🔥 确保状态格式正确
-                if isinstance(raw_snapshot, (list, tuple)):
-                    snapshot = np.array(raw_snapshot, dtype=np.float32)
-                elif hasattr(raw_snapshot, 'shape'):
-                    snapshot = np.array(raw_snapshot, dtype=np.float32)
-                else:
-                    snapshot = np.array([raw_snapshot], dtype=np.float32)
-                
-                print(f"🎯 全局轮换: episode_{global_episode_idx} → state_id={selected_id}, 形状={snapshot.shape}")
-                self.env.set_init_state(snapshot)
+        if self.init_states is not None:
+            # 🎯 完全对齐原版：snapshot = initial_states[episode_idx]
+            import numpy as np
+            
+            # 获取对应的初始状态
+            raw_snapshot = self.init_states[selected_id]
+            
+            # 🔥 确保状态格式正确
+            if isinstance(raw_snapshot, (list, tuple)):
+                snapshot = np.array(raw_snapshot, dtype=np.float32)
+            elif hasattr(raw_snapshot, 'shape'):
+                snapshot = np.array(raw_snapshot, dtype=np.float32)
             else:
-                # 无初始状态数组时的兜底：使用环境默认行为
-                pass  # 环境会使用默认的随机初始化
+                snapshot = np.array([raw_snapshot], dtype=np.float32)
+            
+            print(f"🎯 全局轮换: episode_{global_episode_idx} → state_id={selected_id}, 形状={snapshot.shape}")
+            
+            # 🔥 修复：通过init_states转发而不是手动set_init_state
+            kwargs_with_state = kwargs.copy()
+            kwargs_with_state['init_states'] = snapshot
+            return self.env.reset(**kwargs_with_state)
         
         return obs
 
