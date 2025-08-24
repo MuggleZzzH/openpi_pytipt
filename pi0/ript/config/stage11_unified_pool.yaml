@@ -16,7 +16,19 @@ data_prefix: "/zhaohan/ZJH/openpi_pytorch/datasets"  # 🔥 直接使用绝对�
 task:
   benchmark_name: "libero_spatial"         # 🔥 修复：使用小写格式
   task_names_to_use:
-    - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"    # 🔥 修复：从LIBERO官方任务映射获取
+    # 🎯 多任务测试：选择4个不同的spatial任务进行轮换
+    - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
+    # 💡 要测试单任务模式，注释掉除第一个外的所有任务
+    # 💡 要测试更多任务，取消注释下面的任务：
+    # - "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
   max_episode_length: 50  # 🔥 进一步限制episode长度减少样本数
 
@@ -113,7 +125,7 @@ features:
   
   # 动态采样配置
   dynamic_sampling:
-    enabled: false
+    enabled: true
 
 # === 🎯 统一样本池配置说明 ===
 # 

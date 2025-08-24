@@ -549,14 +549,32 @@ class LIBEROEnvRunner:
                 raise ValueError(f"Unknown benchmark_name: {self.benchmark_name}")
 
             env_id = benchmark_to_env_id[self.benchmark_name]
-            # 🔧 修复：根据任务名称动态确定task_id，与2_test_pi0_on_libero.py保持一致
-            # 对于libero_goal，使用task_id=1 (与2_test_pi0_on_libero.py保持一致)
-            if self.benchmark_name == "libero_goal":
-                task_id = 1  # 与2_test_pi0_on_libero.py保持一致
-            elif self.benchmark_name == "libero_spatial":
-                task_id = 0  # 第一个spatial任务
-            else:
-                task_id = 0  # 其他benchmark的默认任务
+            # 🔧 动态任务映射：使用任务名推断task_id，支持多任务训练
+            try:
+                from libero.libero.benchmark import get_benchmark
+                benchmark = get_benchmark(self.benchmark_name.lower())()
+                task_names = benchmark.get_task_names()
+                if isinstance(env_name, str) and env_name in task_names:
+                    task_id = task_names.index(env_name)
+                    print(f"✅ 动态映射: {env_name} -> task_id={task_id}")
+                else:
+                    # 回退：保持与旧逻辑一致（确保健壮性）
+                    if self.benchmark_name == "libero_goal":
+                        task_id = 1
+                    elif self.benchmark_name == "libero_spatial":
+                        task_id = 0
+                    else:
+                        task_id = 0
+                    print(f"⚠️ 映射回退: {env_name} -> task_id={task_id} (默认)")
+            except Exception as e:
+                # 回退：保持与旧逻辑一致
+                if self.benchmark_name == "libero_goal":
+                    task_id = 1
+                elif self.benchmark_name == "libero_spatial":
+                    task_id = 0
+                else:
+                    task_id = 0
+                print(f"⚠️ 映射失败: {e} -> task_id={task_id} (回退)")
             
             # 创建环境
             env = gym.make(

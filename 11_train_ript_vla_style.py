@@ -485,46 +485,37 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
     print(f"正在收集 {num_rollouts} 个rollouts...")
 
     try:
-        # 🔥 处理demo初始状态（RIPT原版对齐：使用第一帧，无时间步轮换）
+        # 🔥 多任务增强：处理demo初始状态（优先使用第一帧向量）
+        selected_state = None
         state_hash = None  # 用于统计跟踪
         if demo_initial_state is not None:
-            print(f"  📋 使用demo初始状态: 任务 {demo_initial_state['task_name'][0]}")
+            print(f"  📋 使用LIBERO demo: 任务 {demo_initial_state['task_name'][0]}")
             task_id = demo_initial_state['task_id'][0].item()
-            
-            # 获取demo唯一标识
-            task_name_str = str(demo_initial_state['task_name'][0])
-            demo_id_val = demo_initial_state.get('demo_id', [None])[0]
-            demo_uid = f"{task_name_str}|{demo_id_val}"
 
-            # 🔥 优先使用init_state_vec第一帧，避免时间步轮换
-            if 'init_state_vec' in demo_initial_state and demo_initial_state['init_state_vec'] is not None:
-                # 使用专门的第一帧向量
-                selected_state_vec = demo_initial_state['init_state_vec']['states'][0]
-                print(f"  🎯 使用子demo {demo_uid} 的第一帧 (init_state_vec)")
-            elif 'init_state' in demo_initial_state and demo_initial_state['init_state'] is not None:
-                # Fallback：使用序列的第一帧
-                selected_state_vec = demo_initial_state['init_state']['states'][0]
-                print(f"  🎯 使用子demo {demo_uid} 的第一帧 (fallback from init_state)")
+            # 🔥 优先：单帧向量（与"子 demo 第一帧"对齐）
+            if 'init_state_vec' in demo_initial_state:
+                state_vec = demo_initial_state['init_state_vec']['states'][0]   # [D]
+                selected_state = np.ascontiguousarray(state_vec.numpy(), dtype=np.float64)
+                print(f"  ✅ 使用子demo第一帧向量 (init_state_vec, dim={selected_state.shape[0]})")
+            else:
+                # 回退：序列的第一帧
+                init_state_data = demo_initial_state['init_state']
+                states = init_state_data['states'][0]  # [T, D]
+                pad_mask = init_state_data['pad_mask'][0]  # [T]
+                if pad_mask.any():
+                    first_idx = int(torch.where(pad_mask)[0][0].item())
+                    state_vec = states[first_idx]       # [D]
+                    selected_state = np.ascontiguousarray(state_vec.numpy(), dtype=np.float64)
+                    print(f"  ✅ 使用子demo第一帧向量 (回退from init_state, dim={selected_state.shape[0]})")
+
+            if selected_state is not None:
+                all_init_states = [selected_state]      # 单向量 → 并行时由 runner 广播
+                if stats_tracker is not None:
+                    state_hash = stats_tracker._compute_init_hash(task_id, selected_state)
+                print(f"  ✅ 使用子demo第一帧作为初始状态（dim={selected_state.shape[0]}）")
             else:
                 all_init_states = None
-                print(f"  ⚠️ 未找到初始状态数据，将使用环境默认初始化")
-                
-            if 'selected_state_vec' in locals():
-                # 确保格式正确
-                import numpy as np
-                if isinstance(selected_state_vec, torch.Tensor):
-                    selected_state_vec = selected_state_vec.cpu().numpy()
-                selected_state_numpy = np.ascontiguousarray(selected_state_vec, dtype=np.float64)
-                
-                # 构造单一初始状态列表
-                all_init_states = [selected_state_numpy]
-                
-                # 计算稳定的状态哈希
-                state_bytes = selected_state_numpy.tobytes()
-                import hashlib
-                state_hash = hashlib.sha256(state_bytes).hexdigest()[:16]
-                
-                print(f"  ✅ 子demo {demo_uid} 第一帧已设置，state_hash: {state_hash}")
+                print(f"  ⚠️ 初始状态缺失，回退环境默认初始化")
         else:
             # 获取任务的初始状态和task_id
             task_id = 0  # 简化处理，使用第一个任务
@@ -966,47 +957,94 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     num_train_steps = config['training']['num_train_steps']
     task_names = config['task'].get('task_names_to_use', ['LIBERO_SPATIAL_0'])
 
-    # 🔥 创建RIPT对齐的LIBERO demo数据加载器
+    # 🔥 创建多任务RIPT对齐的LIBERO demo数据加载器
     use_libero_demos = config.get('use_libero_demos', True)
     if use_libero_demos:
         try:
             # 从配置中获取数据路径
             libero_data_prefix = config.get('libero_data_prefix', '/zhaohan/ZJH/openpi_pytorch/datasets')
-            benchmark_name = config.get('benchmark_name', 'libero_spatial')  # 🔥 使用小写格式
+            benchmark_name = config.get('benchmark_name', 'libero_spatial')
 
-            # 🔥 使用RIPT对齐的数据集（包含MuJoCo状态）
-            dataset = build_dataset_ript_aligned(
-                data_prefix=libero_data_prefix,
-                suite_name="libero",
-                benchmark_name=benchmark_name,
-                task_names_to_use=task_names if task_names != ['LIBERO_SPATIAL_0'] else None,
-                load_state=True,  # 🔥 关键：加载MuJoCo状态
-                seq_len=600,
-                n_demos=50
-            )
+            # 🔥 多任务支持：自动获取任务名列表
+            if not task_names or task_names == ['LIBERO_SPATIAL_0']:
+                try:
+                    from libero.libero.benchmark import get_benchmark
+                    bm = get_benchmark(benchmark_name.lower())()
+                    task_names = bm.get_task_names()
+                    print(f"🎯 自动获取任务列表: {len(task_names)} 个任务")
+                except Exception as e:
+                    # 回退：保留原来的一个任务
+                    task_names = ['pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate']
+                    print(f"⚠️ 自动获取任务失败，使用默认任务: {e}")
 
-            # 🔥 使用RIPT对齐的collate函数
+            # 🔥 构建每任务一个DataLoader/迭代器的字典结构
             from torch.utils.data import DataLoader
-            demo_dataloader = DataLoader(
-                dataset,
-                batch_size=1,  # 🔥 修改：每次取单个子demo，实现严格demo轮换
-                shuffle=False,  # 🔥 修改：按序轮换，不随机打乱
-                collate_fn=collate_fn_ript_aligned,  # 🔥 关键：使用RIPT对齐的collate
-                num_workers=0
-            )
+            task_to_loader = {}
+            task_to_iter = {}
 
-            demo_data_iter = iter(demo_dataloader)
-            print(f"✅ RIPT对齐demo数据加载器创建成功")
+            for tname in task_names:
+                # 为每个任务创建单独的数据集
+                ds = build_dataset_ript_aligned(
+                    data_prefix=libero_data_prefix,
+                    suite_name="libero",
+                    benchmark_name=benchmark_name,
+                    task_names_to_use=[tname],   # 🔥 单任务过滤
+                    load_state=True,
+                    seq_len=600,
+                    n_demos=50
+                )
+                # 关键：每任务loader只取一个子demo
+                dl = DataLoader(
+                    ds,
+                    batch_size=1,
+                    shuffle=True,                # 🔥 子demo内随机轮换（可改为False实现严格顺序）
+                    collate_fn=collate_fn_ript_aligned,
+                    num_workers=0
+                )
+                task_to_loader[tname] = dl
+                task_to_iter[tname] = iter(dl)
+
+            print(f"✅ 按任务构建DataLoader: {len(task_names)} 个任务")
             print(f"  数据路径: {libero_data_prefix}")
             print(f"  基准: {benchmark_name}")
-            print(f"  数据集大小: {len(dataset)}")
+            print(f"  任务列表: {task_names}")
             print(f"  🔥 包含MuJoCo状态: True")
+            
+            # 🔥 多任务模式提示
+            if len(task_names) > 1:
+                print(f"  🎯 多任务模式: 启用任务轮询，每组轮换不同任务")
+            else:
+                print(f"  📍 单任务模式: 所有组使用同一任务，仅demo轮换")
+                print(f"  💡 提示: 要测试多任务轮换，请在配置中添加更多task_names_to_use")
+
+            # 兼容性：保留原有变量（但会在后续逻辑中被task_to_*替代）
+            demo_dataloader = None
+            demo_data_iter = None
+            
+            # 🔥 为未来eval功能预留信息：存储到运行时配置
+            if hasattr(env_runner, 'runtime') and env_runner.runtime is not None:
+                env_runner.runtime.update({
+                    'task_names': task_names,
+                    'task_to_loader': task_to_loader,   # eval 如需也可复用
+                })
+            else:
+                # 创建运行时配置字典
+                env_runner.runtime = {
+                    'task_names': task_names,
+                    'task_to_loader': task_to_loader,   # eval 如需也可复用
+                }
+            print(f"✅ 多任务运行时配置已设置，支持未来eval功能")
+            
         except Exception as e:
-            print(f"⚠️ RIPT对齐demo加载器创建失败: {e}")
+            print(f"⚠️ 多任务demo加载器创建失败: {e}")
             print("  将使用传统的环境重置方式")
+            task_to_loader = {}
+            task_to_iter = {}
             demo_dataloader = None
             demo_data_iter = None
     else:
+        task_to_loader = {}
+        task_to_iter = {}
         demo_dataloader = None
         demo_data_iter = None
     
@@ -1025,6 +1063,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     
     all_training_metrics = []
     
+    # 🔥 多任务轮询指针（训练步外初始化）
+    task_cursor = 0
+    
     # 🔥 显存监控函数
     def print_gpu_memory(step_name: str):
         if torch.cuda.is_available():
@@ -1033,7 +1074,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             max_allocated = torch.cuda.max_memory_allocated() / 1024**3
             print(f"📊 {step_name} - GPU显存: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, 峰值: {max_allocated:.2f}GB")
     
-    # 🔥 主训练循环 - 按组收集模式
+    # 🔥 主训练循环 - 多任务轮询+按组收集模式
     for step in range(num_train_steps):
         step_start_time = time.time()
         torch.cuda.reset_peak_memory_stats()  # 重置峰值监控
@@ -1048,32 +1089,57 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         for group_idx in range(demo_batch_size):
             print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
 
-            # 🔥 获取demo初始状态（RIPT对齐轮换模式）
+            # 🔥 智能任务选择：多任务轮询 vs 单任务直选
             demo_batch = None
-            if demo_data_iter is not None:
+            if task_to_iter:
+                if len(task_names) > 1:
+                    # 多任务环境：真正的轮询
+                    tname = task_names[(task_cursor + group_idx) % len(task_names)]
+                    print(f"  🎯 多任务轮询: 组{group_idx} -> 任务 {tname}")
+                else:
+                    # 单任务环境：直接使用唯一任务
+                    tname = task_names[0]
+                    print(f"  📍 单任务模式: 组{group_idx} -> 任务 {tname}")
+                
                 try:
-                    demo_batch = next(demo_data_iter)
+                    demo_batch = next(task_to_iter[tname])
                     demo_id = demo_batch.get('demo_id', [None])[0]
-                    print(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                    print(f"  📋 使用子demo: {demo_id} (任务: {tname})")
                 except StopIteration:
-                    # 🔥 RIPT对齐：重新开始demo迭代（确保数据多样性）
-                    demo_data_iter = iter(demo_dataloader)
-                    demo_batch = next(demo_data_iter)
+                    # 重新初始化该任务的迭代器
+                    task_to_iter[tname] = iter(task_to_loader[tname])
+                    demo_batch = next(task_to_iter[tname])
                     demo_id = demo_batch.get('demo_id', [None])[0]
-                    print(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
-                    print(f"  🔄 严格按序轮换demo，每组使用单个demo的第一帧")
+                    print(f"  📋 重新开始任务迭代: 子demo {demo_id} (任务: {tname})")
                 except Exception as e:
                     print(f"  ⚠️ Demo获取失败: {e}")
                     demo_batch = None
+                    tname = task_names[0] if len(task_names) == 1 else task_names[(task_cursor + group_idx) % len(task_names)]
+            else:
+                # 回退到原有逻辑（兼容性）
+                if demo_data_iter is not None:
+                    try:
+                        demo_batch = next(demo_data_iter)
+                        demo_id = demo_batch.get('demo_id', [None])[0]
+                        print(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                    except StopIteration:
+                        demo_data_iter = iter(demo_dataloader)
+                        demo_batch = next(demo_data_iter)
+                        demo_id = demo_batch.get('demo_id', [None])[0]
+                        print(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                    except Exception as e:
+                        print(f"  ⚠️ Demo获取失败: {e}")
+                        demo_batch = None
+                
+                tname = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
 
-            # 收集一组rollouts（传递demo初始状态和统计跟踪器）
-            current_task_name = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
+            # 收集一组rollouts（传递任务名和demo初始状态）
             group_episodes = collect_rollouts_ript_vla_style(
-                env_runner, current_task_name,
+                env_runner, tname,  # 🔥 使用轮询选择的任务名
                 rloo_batch_size,
                 enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
                 stats_tracker=stats_tracker,
-                demo_initial_state=demo_batch  # 🔥 新增：传递demo初始状态
+                demo_initial_state=demo_batch  # 🔥 传递对应任务的demo初始状态
             )
             
             if group_episodes:
@@ -1144,6 +1210,13 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"  损失: {loss:.6f}")
         print(f"  耗时: {step_time:.2f}秒")
         print_gpu_memory("步骤结束")
+        
+        # 🔥 智能任务指针推进（仅在多任务环境下有意义）
+        if task_to_iter and len(task_names) > 1:
+            task_cursor = (task_cursor + demo_batch_size) % len(task_names)
+            print(f"🔄 多任务指针推进到: {task_cursor} (下步起始任务: {task_names[task_cursor]})")
+        elif task_to_iter and len(task_names) == 1:
+            print(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
         
         # 6. CFG评估（每10步进行一次，仅在CFG启用时）
         if (step + 1) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
