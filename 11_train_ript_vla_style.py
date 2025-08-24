@@ -997,7 +997,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 dl = DataLoader(
                     ds,
                     batch_size=1,
-                    shuffle=True,                # 🔥 子demo内随机轮换（可改为False实现严格顺序）
+                    shuffle=False,               # 🔥 严格顺序轮换，与RIPT原版对齐
                     collate_fn=collate_fn_ript_aligned,
                     num_workers=0
                 )
@@ -1013,8 +1013,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             # 🔥 多任务模式提示
             if len(task_names) > 1:
                 print(f"  🎯 多任务模式: 启用任务轮询，每组轮换不同任务")
+                print(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
             else:
                 print(f"  📍 单任务模式: 所有组使用同一任务，仅demo轮换")
+                print(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
                 print(f"  💡 提示: 要测试多任务轮换，请在配置中添加更多task_names_to_use")
 
             # 兼容性：保留原有变量（但会在后续逻辑中被task_to_*替代）
