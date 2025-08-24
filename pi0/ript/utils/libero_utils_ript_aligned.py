@@ -150,30 +150,21 @@ class RIPTAlignedDataset(Dataset):
                         if 'joint_states' in g:
                             obs['robot0_joint_pos'] = np.array(g['joint_states'][0])
 
-                    # 状态 - 双轨输出：序列+单快照
+                    # 状态
                     if self.load_state and 'states' in demo_group:
-                        full_states = np.array(demo_group['states'])  # [T, state_dim]
-                        init_state_seq = full_states  # 完整序列供轮换器使用
-                        init_state_vec = full_states[0]  # 单快照与原版对齐
+                        full_states = np.array(demo_group['states'])
+                        init_state = full_states[0:1]
                     else:
-                        mock_states = self._generate_mock_states()
-                        init_state_seq = mock_states  # [1, state_dim] 
-                        init_state_vec = mock_states[0]  # [state_dim]
+                        init_state = self._generate_mock_states()
 
                     loaded.append({
                         'task_id': task_idx,
                         'task_name': task_name,
                         'demo_id': demo_id,
                         'initial_obs': obs,
-                        # 保留序列供轮换器使用
                         'init_state': {
-                            'states': torch.tensor(init_state_seq, dtype=torch.float32),
-                            'pad_mask': torch.ones(init_state_seq.shape[0], dtype=torch.bool)
-                        },
-                        # 新增：单快照与原版对齐
-                        'init_state_vec': {
-                            'states': torch.tensor(init_state_vec, dtype=torch.float32),  # [state_dim]
-                            'pad_mask': torch.tensor(True, dtype=torch.bool)  # 单个状态总是有效
+                            'states': torch.tensor(init_state, dtype=torch.float32),
+                            'pad_mask': torch.ones(init_state.shape[0], dtype=torch.bool)
                         }
                     })
         except Exception as e:
@@ -303,18 +294,25 @@ class RIPTAlignedDataset(Dataset):
         item = {
             'task_id': torch.tensor([demo['task_id']]),
             'task_name': demo['task_name'],
-            'demo_id': demo.get('demo_id', None),
+            'demo_id': demo.get('demo_id', f"demo_{idx}"),  # 🔥 添加demo_id支持
         }
         
         # 添加观测数据
         if self.load_obs and demo['initial_obs'] is not None:
             item['initial_obs'] = demo['initial_obs']
         
-        # 🔥 关键：添加MuJoCo状态数据（双轨输出）
+        # 🔥 关键：添加MuJoCo状态数据
         if self.load_state and demo['init_state'] is not None:
-            item['init_state'] = demo['init_state']  # 序列供轮换器使用
-            if 'init_state_vec' in demo:
-                item['init_state_vec'] = demo['init_state_vec']  # 单快照与原版对齐
+            item['init_state'] = demo['init_state']
+            # 🔥 RIPT对齐：添加首帧向量（从序列中提取第一帧）
+            if 'states' in demo['init_state'] and demo['init_state']['states'] is not None:
+                states = demo['init_state']['states']
+                if states.ndim >= 2:  # [T, D] 或 [B, T, D]
+                    first_frame = states[0] if states.ndim == 2 else states[0, 0]
+                    item['init_state_vec'] = {
+                        'states': first_frame.unsqueeze(0),  # 包装为 [1, D]
+                        'pad_mask': torch.tensor([True])      # 单帧总是有效
+                    }
         
         return item
 
@@ -345,77 +343,77 @@ class MockRIPTDataset(Dataset):
             }
         }
         
-        # 🔥 添加模拟的MuJoCo状态（双轨输出）
+        # 🔥 添加模拟的MuJoCo状态
         if self.load_state:
-            mock_states_seq = np.random.randn(1, 487).astype(np.float32)  # [1, 487]
-            mock_states_vec = mock_states_seq[0]  # [487]
-            
-            # 序列格式供轮换器使用
+            mock_states = np.random.randn(1, 487).astype(np.float32)
             item['init_state'] = {
-                'states': torch.tensor(mock_states_seq, dtype=torch.float32),
+                'states': torch.tensor(mock_states, dtype=torch.float32),
                 'pad_mask': torch.ones(1, dtype=torch.bool)
-            }
-            # 单快照格式与原版对齐
-            item['init_state_vec'] = {
-                'states': torch.tensor(mock_states_vec, dtype=torch.float32),
-                'pad_mask': torch.tensor(True, dtype=torch.bool)
             }
         
         return item
 
 def collate_fn_ript_aligned(batch):
-    """与原版RIPT对齐的collate函数（双轨输出）"""
-    
-    # 先处理除状态外的其他字段
-    filtered_items = []
-    for item in batch:
-        filtered_item = {k: v for k, v in item.items() if k not in ['init_state', 'init_state_vec']}
-        filtered_items.append(filtered_item)
-    
-    collated_batch = default_collate(filtered_items)
-    # demo_id 直接拼接为list（与task_name一致做法）
-    if isinstance(batch[0].get('demo_id', None), (str, int)):
-        collated_batch['demo_id'] = [it.get('demo_id', None) for it in batch]
-    
-    # 🔥 处理init_state字段（序列格式，供轮换器使用）
+    """与原版RIPT对齐的collate函数"""
+    # 🔥 处理init_state字段（与原版RIPT完全一致）
     if 'init_state' in batch[0] and batch[0]['init_state'] is not None:
         states = [item['init_state']['states'] for item in batch]
 
-        # states的形状应该是 [T, state_dim]
-        max_seq_len = max(s.shape[0] for s in states)
-        max_state_dim = max(s.shape[-1] for s in states)
+        # 🔥 修复：正确处理状态维度
+        # states的形状应该是 [T, state_dim]，我们需要找到最大的T
+        max_seq_len = max(s.shape[0] for s in states)  # 序列长度维度
+        max_state_dim = max(s.shape[-1] for s in states)  # 状态维度
 
         padded_states = []
         masks = []
+        modified_batch = []
 
         for item in batch:
+            # 获取状态张量 [T, state_dim]
             tensor = item['init_state']['states'].float()
             seq_len, state_dim = tensor.shape
 
+            # 填充序列长度到max_seq_len
             seq_pad_size = max_seq_len - seq_len
             state_pad_size = max_state_dim - state_dim
 
+            # 填充：(left_pad, right_pad) for last dim, (left_pad, right_pad) for second last dim
             padded = torch.nn.functional.pad(tensor, (0, state_pad_size, 0, seq_pad_size))
             padded_states.append(padded)
 
+            # 创建对应的mask [T]
             mask = torch.ones(seq_len, dtype=torch.bool)
             mask = torch.nn.functional.pad(mask, (0, seq_pad_size), value=False)
             masks.append(mask)
 
+            # 创建不包含init_state和init_state_vec的item
+            excluded_keys = {'init_state', 'init_state_vec'}
+            modified_item = {key: item[key] for key in item.keys() if key not in excluded_keys}
+            modified_batch.append(modified_item)
+
+        # 正常collate其他字段
+        collated_batch = default_collate(modified_batch)
+
+        # 🔥 添加处理好的init_state（与原版RIPT格式一致）
         collated_batch['init_state'] = {
             'states': torch.stack(padded_states),    # [B, T, state_dim]
             'pad_mask': torch.stack(masks)           # [B, T]
         }
-
-    # 🔥 处理init_state_vec字段（单快照格式，与原版RIPT对齐）
-    if 'init_state_vec' in batch[0] and batch[0]['init_state_vec'] is not None:
-        vec_states = [item['init_state_vec']['states'] for item in batch]
-        vec_masks = [item['init_state_vec']['pad_mask'] for item in batch]
         
-        # 单快照向量格式 [B, state_dim]
-        collated_batch['init_state_vec'] = {
-            'states': torch.stack(vec_states),       # [B, state_dim]
-            'pad_mask': torch.stack(vec_masks)       # [B]
-        }
+        # 🔥 RIPT对齐：处理init_state_vec（首帧向量）
+        if 'init_state_vec' in batch[0] and batch[0]['init_state_vec'] is not None:
+            vec_states = [item['init_state_vec']['states'] for item in batch]
+            vec_masks = [item['init_state_vec']['pad_mask'] for item in batch]
+            collated_batch['init_state_vec'] = {
+                'states': torch.stack(vec_states),    # [B, 1, D]
+                'pad_mask': torch.stack(vec_masks)    # [B, 1]
+            }
+        
+        # 🔥 处理demo_id字段
+        if 'demo_id' in batch[0]:
+            collated_batch['demo_id'] = [item['demo_id'] for item in batch]
 
-    return collated_batch
+        return collated_batch
+    else:
+        # 如果没有init_state，使用默认collate
+        return default_collate(batch)
