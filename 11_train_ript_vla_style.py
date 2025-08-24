@@ -407,24 +407,15 @@ def _dynamic_filter_rollouts(episodes: List[Dict], enable_dynamic_sampling: bool
 
 
 class DemoStateSampler:
-    """RIPT对齐的Demo状态采样器 - 支持不同轮换模式"""
+    """RIPT对齐的Demo状态采样器 - 同demo用同一状态，不同demo轮换状态"""
     
-    def __init__(self, config=None):
+    def __init__(self):
         self.demo_to_state_cache = {}  # 缓存：demo_id -> 选定的状态索引
         self.next_state_idx = 0  # 下一个新demo使用的状态索引
         
-        # 读取轮换模式配置
-        if config:
-            demo_rotation_mode = config.get('features', {}).get('demo_rotation', {}).get('mode', 'by_demo_first_frame')
-        else:
-            demo_rotation_mode = 'by_demo_first_frame'
-        
-        self.rotation_mode = demo_rotation_mode
-        print(f"🔧 DemoStateSampler初始化: 轮换模式={self.rotation_mode}")
-        
     def get_next_init_state(self, demo_initial_state):
         """
-        从demo中获取首帧初始状态（按子demo轮换）
+        从demo中获取下一个初始状态（按顺序轮换）
         
         Args:
             demo_initial_state: LIBERO demo数据
@@ -434,64 +425,47 @@ class DemoStateSampler:
         """
         if demo_initial_state is None:
             return None, None, "无demo数据"
-        
-        # 🔥 RIPT对齐：优先使用init_state_vec（首帧快照）
-        if 'init_state_vec' in demo_initial_state and demo_initial_state['init_state_vec'] is not None:
-            # 使用预处理的首帧向量
-            init_state_vec_data = demo_initial_state['init_state_vec']
-            first_frame_state = init_state_vec_data['states'][0]  # 取第一个batch的首帧 [D]
             
-            # 构建子demo唯一键：task_name|demo_id
-            task_name_str = str(demo_initial_state['task_name'][0])
-            demo_id_val = demo_initial_state.get('demo_id', [None])[0]
-            demo_uid = f"{task_name_str}|{demo_id_val}"
-            
-            # 确保状态格式正确
-            selected_state = np.ascontiguousarray(first_frame_state.numpy().flatten(), dtype=np.float64)
-            
-            # 生成内容哈希（用于RLOO分桶）
-            import hashlib
-            state_hash = hashlib.sha256(selected_state.tobytes()).hexdigest()[:16]
-            
-            state_desc = f"子demo {demo_uid} 首帧(t=0)"
-            print(f"  🎯 使用子demo首帧: {state_desc}, state_dim={len(selected_state)}")
-            
-            return selected_state, state_hash, state_desc
-        
-        # 🔥 回退：使用init_state序列的第一帧
-        elif 'init_state' in demo_initial_state and demo_initial_state['init_state'] is not None:
-            init_state_data = demo_initial_state['init_state']
-            states = init_state_data['states'][0]  # 取第一个batch [T, D]
-            pad_mask = init_state_data['pad_mask'][0]  # 取第一个batch [T]
-            
-            # 获取第一个有效状态（通常是t=0）
-            valid_indices = torch.where(pad_mask)[0]
-            if len(valid_indices) == 0:
-                return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
-            
-            first_valid_idx = valid_indices[0]  # 使用第一个有效状态
-            selected_state = states[first_valid_idx]
-            
-            # 构建子demo唯一键
-            task_name_str = str(demo_initial_state['task_name'][0])
-            demo_id_val = demo_initial_state.get('demo_id', [None])[0]
-            demo_uid = f"{task_name_str}|{demo_id_val}"
-            
-            # 确保状态格式正确
-            selected_state = np.ascontiguousarray(selected_state.numpy().flatten(), dtype=np.float64)
-            
-            # 生成内容哈希
-            import hashlib
-            state_hash = hashlib.sha256(selected_state.tobytes()).hexdigest()[:16]
-            
-            state_desc = f"子demo {demo_uid} 首帧(t={first_valid_idx.item()})"
-            print(f"  🎯 回退使用序列首帧: {state_desc}, state_dim={len(selected_state)}")
-            
-            return selected_state, state_hash, state_desc
-        
-        else:
-            # 最终回退到观测数据
+        if 'init_state' not in demo_initial_state or demo_initial_state['init_state'] is None:
             return demo_initial_state['initial_obs'], "obs_fallback", "使用观测数据（无MuJoCo状态）"
+            
+        # 使用demo中的MuJoCo状态
+        init_state_data = demo_initial_state['init_state']
+        states = init_state_data['states']  # (T, state_dim)
+        pad_mask = init_state_data['pad_mask']  # (T,)
+        
+        # 获取所有有效状态索引
+        valid_indices = torch.where(pad_mask)[0]
+        if len(valid_indices) == 0:
+            return demo_initial_state['initial_obs'], "obs_fallback", "demo状态无有效数据，回退到观测"
+        
+        # 🔥 关键修复：同demo用同一状态，不同demo轮换状态
+        # 构建 demo 唯一键：task_name|demo_id（均来自collate后的batch）
+        task_name_str = str(demo_initial_state['task_name'][0])
+        demo_id_val = demo_initial_state.get('demo_id', [None])[0]
+        demo_uid = f"{task_name_str}|{demo_id_val}"
+        
+        if demo_uid not in self.demo_to_state_cache:
+            # 新demo：分配下一个状态索引
+            current_valid_idx = self.next_state_idx % len(valid_indices)
+            self.demo_to_state_cache[demo_uid] = current_valid_idx
+            self.next_state_idx += 1
+            print(f"  🎯 新demo {demo_uid}: 分配状态索引 {current_valid_idx}")
+        else:
+            # 已知demo：复用之前分配的状态索引
+            current_valid_idx = self.demo_to_state_cache[demo_uid]
+            print(f"  🎯 复用demo {demo_uid}: 状态索引 {current_valid_idx}")
+        
+        selected_state_idx = valid_indices[current_valid_idx]
+        selected_state = states[selected_state_idx]
+        
+        # 生成状态哈希用于追踪
+        state_hash = f"demo_{demo_uid}_state_{selected_state_idx.item()}"
+        state_desc = f"Demo {demo_uid} 状态 {current_valid_idx+1}/{len(valid_indices)} (索引: {selected_state_idx.item()})"
+        
+        print(f"  🎯 轮换选择: {state_desc}")
+        
+        return selected_state.numpy(), state_hash, state_desc
 
 
 # 全局状态采样器实例
@@ -517,10 +491,8 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
             # 🔥 使用状态采样器进行有序轮换
             selected_state, state_hash, state_desc = global_demo_sampler.get_next_init_state(demo_initial_state)
             if selected_state is not None:
-                # 🔥 RIPT对齐：将首帧向量扩展为K次rollouts的相同初始状态
-                all_init_states = [selected_state.copy() for _ in range(num_rollouts)]
+                all_init_states = [selected_state]
                 print(f"  ✅ {state_desc}")
-                print(f"  🎯 扩展为 {num_rollouts} 个相同初始状态，形状={selected_state.shape}")
             else:
                 all_init_states = None
                 print(f"  ⚠️ 状态采样失败，将使用环境默认初始化")
@@ -565,14 +537,12 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                 **episode_data
             }
             
-            # 🔥 RIPT对齐：优先使用从采样器获取的state_hash（确保RLOO分桶一致性）
-            if state_hash is not None:
-                episode['init_hash'] = state_hash
-            elif 'init_hash' not in episode and stats_tracker:
-                # 回退：从episode_data中提取初始状态信息
+            # 🔥 添加init_hash信息（如果可用）
+            if 'init_hash' not in episode and stats_tracker:
+                # 尝试从episode_data中提取初始状态信息
                 if 'init_state' in episode_data:
-                    computed_hash = stats_tracker._compute_init_hash(task_id, episode_data['init_state'])
-                    episode['computed_init_hash'] = computed_hash
+                    init_hash = stats_tracker._compute_init_hash(task_id, episode_data['init_state'])
+                    episode['computed_init_hash'] = init_hash
             
             collected_rollouts.append(episode)
             rollout_count += 1
@@ -810,17 +780,11 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
             advantages=advantages,
             device=device,
             batch_size=batch_size_cfg,
-            shuffle_samples=shuffle_cfg
+            shuffle_samples=shuffle_cfg,
+            optimizer=optimizer,
+            scaler=None,
+            gradient_accumulation_steps=1
         )
-
-        # 梯度更新
-        optimizer.zero_grad()
-        loss.backward()
-
-        # 梯度裁剪
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 1.0)
-
-        optimizer.step()
 
         loss_value = loss.item()
         print(f"✓ 策略更新完成，损失: {loss_value:.6f}")
@@ -889,9 +853,16 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     """
     print("🚀 开始RIPT-VLA风格的训练循环")
     
-    # 🔥 初始化全局状态采样器（使用配置）
-    global global_demo_sampler
-    global_demo_sampler = DemoStateSampler(config)
+    # 统一设置随机种子（保证可复现）
+    try:
+        import random
+        seed = int(config.get('training', {}).get('seed', 42))
+        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        print(f"✅ 随机种子已设置: {seed}")
+    except Exception as _e:
+        print(f"⚠️ 随机种子设置失败: {_e}")
     
     # 🔥 设置数值优化和显存管理
     print("🔧 设置数值优化...")
@@ -990,7 +961,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             demo_dataloader = DataLoader(
                 dataset,
                 batch_size=demo_batch_size,
-                shuffle=False,  # 🔥 RIPT对齐：按子demo顺序轮换，不随机打乱
+                shuffle=True,
                 collate_fn=collate_fn_ript_aligned,  # 🔥 关键：使用RIPT对齐的collate
                 num_workers=0
             )
@@ -1014,6 +985,8 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     print(f"  demo_batch_size: {demo_batch_size} (每步收集的组数)")
     print(f"  rloo_batch_size: {rloo_batch_size} (每组内样本数)")
     print(f"  有效批次大小: {demo_batch_size * rloo_batch_size}")
+    dynamic_sampling_enabled = config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
+    print(f"  动态采样: {'启用' if dynamic_sampling_enabled else '禁用'} (features.dynamic_sampling.enabled)")
     
     print(f"\n开始训练循环:")
     print(f"  训练步数: {num_train_steps}")
@@ -1043,35 +1016,31 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         all_collected_episodes = []
         successful_groups = 0
         
-        # 🔥 RIPT对齐：在训练步开始时获取一次demo，整个步骤都使用这个demo
-        step_demo_batch = None
-        if demo_data_iter is not None:
-            try:
-                step_demo_batch = next(demo_data_iter)
-                demo_uid = f"{step_demo_batch['task_name'][0]}|{step_demo_batch.get('demo_id', [None])[0]}"
-                print(f"📋 训练步 {step} 使用demo: {demo_uid}")
-            except StopIteration:
-                # 🔥 RIPT对齐：重新开始demo迭代
-                demo_data_iter = iter(demo_dataloader)
-                step_demo_batch = next(demo_data_iter)
-                demo_uid = f"{step_demo_batch['task_name'][0]}|{step_demo_batch.get('demo_id', [None])[0]}"
-                print(f"📋 训练步 {step} 重新开始demo迭代: {demo_uid}")
-            except Exception as e:
-                print(f"⚠️ Demo获取失败: {e}")
-                step_demo_batch = None
-        
         for group_idx in range(demo_batch_size):
             print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
-            print(f"  📋 使用相同demo: {demo_uid if step_demo_batch else '无demo'}")
-            
-            # 🔥 所有组都使用相同的step_demo_batch
-            demo_batch = step_demo_batch
+
+            # 🔥 获取demo初始状态（RIPT对齐轮换模式）
+            demo_batch = None
+            if demo_data_iter is not None:
+                try:
+                    demo_batch = next(demo_data_iter)
+                    print(f"  📋 使用LIBERO demo: 任务{demo_batch['task_id'][0].item()}")
+                except StopIteration:
+                    # 🔥 RIPT对齐：重新开始demo迭代（确保数据多样性）
+                    demo_data_iter = iter(demo_dataloader)
+                    demo_batch = next(demo_data_iter)
+                    print(f"  📋 重新开始demo迭代: 任务{demo_batch['task_id'][0].item()}")
+                    print(f"  🔄 状态采样器继续轮换（不重置），确保状态多样性")
+                except Exception as e:
+                    print(f"  ⚠️ Demo获取失败: {e}")
+                    demo_batch = None
 
             # 收集一组rollouts（传递demo初始状态和统计跟踪器）
+            current_task_name = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
             group_episodes = collect_rollouts_ript_vla_style(
-                env_runner, task_names[0] if not demo_batch else demo_batch['task_name'][0],
+                env_runner, current_task_name,
                 rloo_batch_size,
-                enable_dynamic_sampling=config['algo'].get('enable_dynamic_sampling', False),
+                enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
                 stats_tracker=stats_tracker,
                 demo_initial_state=demo_batch  # 🔥 新增：传递demo初始状态
             )
@@ -1094,8 +1063,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     else:
                         print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
                               f"成功率 {np.mean(successes):.2%} (动态采样已禁用)")
-                    
-                    # 🔥 episode计数器由内部管理，无需手动更新
+
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
         
@@ -1149,12 +1117,16 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         # 6. CFG评估（每10步进行一次，仅在CFG启用时）
         if (step + 1) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
             try:
-                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=2)
+                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
                 print(f"🎯 推荐CFG强度: {best_cfg}")
                 # 可选：动态调整收集时使用的CFG强度
-                env_runner.config.collection_cfg_scale = best_cfg
+                # 🔥 修复：写入正确的algo路径
+                if hasattr(env_runner.config, 'algo'):
+                    env_runner.config.algo.collection_cfg_scale = best_cfg
+                if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+                    env_runner.config['algo']['collection_cfg_scale'] = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
         elif (step + 1) % 10 == 0:

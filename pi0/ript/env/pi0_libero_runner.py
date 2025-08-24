@@ -1115,7 +1115,7 @@ class LIBEROEnvRunner:
         while count < eval_loop_num:
             # 选择当前轮次的初始状态
             start_idx = count * env_num
-            # 🔥 修复：始终生成 env_num 个索引，环形取模，避免空索引
+            # 始终生成 env_num 个索引，环形取模，避免空索引
             if isinstance(all_init_states, list):
                 total = len(all_init_states)
                 if total == 0:
