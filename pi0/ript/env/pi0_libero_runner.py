@@ -617,8 +617,9 @@ class LIBEROEnvRunner:
         env, env_id, env_num = created_env
         
         if all_init_states is None:
-            # 如果没有提供初始状态，生成默认状态
-            all_init_states = np.zeros((self.rollouts_per_env, 8), dtype=np.float32)
+            # 与 2_pi0_on_libero.py 对齐：不设置环境初始状态，只做普通 reset
+            all_init_states = [None for _ in range(self.rollouts_per_env)]
+            print(f"ℹ️ 未提供初始状态，将进行普通reset（不调用set_init_state）")
         
         try:
             # 检查是否为真正的并行环境
@@ -687,8 +688,9 @@ class LIBEROEnvRunner:
                         actual_obs = obs[0]
                     else:
                         actual_obs = obs
-                    actual_init_state = self._extract_state_from_obs(actual_obs)
-                    target_init_state = actual_init_state
+                    # 🔥 保持92维状态：不使用8维截断，而是生成92维零状态
+                    print(f"⚠️ set_init_state失败，使用92维零状态回退")
+                    target_init_state = np.zeros(92, dtype=np.float64)
             else:
                 # 如果没有指定初始状态，使用默认reset
                 obs = env.reset()
@@ -696,7 +698,9 @@ class LIBEROEnvRunner:
                     actual_obs = obs[0]
                 else:
                     actual_obs = obs
-                target_init_state = self._extract_state_from_obs(actual_obs)
+                # 🔥 保持92维状态：使用92维零状态而不是8维截断
+                print(f"⚠️ 未指定初始状态，使用92维零状态")
+                target_init_state = np.zeros(92, dtype=np.float64)
             
             # 如果是VectorEnv，取第一个环境的观测
             if is_vector_env and isinstance(obs, list):
@@ -707,7 +711,7 @@ class LIBEROEnvRunner:
             
             # 热机步骤
             dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-            for _ in range(10):
+            for _ in range(20):
                 if is_vector_env:
                     # VectorEnv期望动作列表
                     step_results = env.step([dummy_action])
@@ -1207,7 +1211,41 @@ class LIBEROEnvRunner:
         if use_parallel_init and init_states is not None:
             try:
                 # 🔥 修复：确保状态格式正确
-                processed_states = self._process_init_states_for_parallel(init_states, env_num)
+                # 🔥 直接处理状态，确保维度正确
+                if isinstance(init_states, list) and len(init_states) > 0:
+                    # 确保有足够的状态给每个环境
+                    if len(init_states) < env_num:
+                        # 重复状态以填满所有环境
+                        processed_states = []
+                        for i in range(env_num):
+                            state_idx = i % len(init_states)
+                            processed_states.append(init_states[state_idx])
+                    else:
+                        processed_states = init_states[:env_num]
+                elif isinstance(init_states, np.ndarray):
+                    # 如果是numpy数组，确保形状正确
+                    if init_states.ndim == 1:
+                        # 单个状态，复制给所有环境
+                        processed_states = [init_states] * env_num
+                    elif init_states.ndim == 2:
+                        # 多个状态
+                        if len(init_states) < env_num:
+                            # 重复状态
+                            processed_states = []
+                            for i in range(env_num):
+                                state_idx = i % len(init_states)
+                                processed_states.append(init_states[state_idx])
+                        else:
+                            processed_states = init_states[:env_num]
+                    else:
+                        # 3D或更高维，取第一个状态并复制
+                        first_state = init_states[0, 0] if init_states.ndim == 3 else init_states[0]
+                        processed_states = [first_state] * env_num
+                else:
+                    processed_states = None
+                
+                if self.rank == 0 and processed_states is not None:
+                    print(f"🔧 处理后的并行状态: 形状={np.array(processed_states).shape}, 类型={np.array(processed_states).dtype}")
 
                 # 🔥 修复：确保状态数据能正确序列化到子进程
                 if processed_states is not None and len(processed_states) > 0:
@@ -1248,7 +1286,7 @@ class LIBEROEnvRunner:
         
         # 对每个环境进行热身
         dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-        for warmup_step in range(10):
+        for warmup_step in range(20):
             # 🔑 确保actions数组长度与环境数量完全匹配
             actions = [dummy_action.copy() for _ in range(env_num)]
             if self.rank == 0 and warmup_step == 0:
@@ -1356,32 +1394,42 @@ class LIBEROEnvRunner:
                         # 备用：如果还是没有action_buffer，使用dummy动作
                         actions_to_execute.append(dummy_action)
             
-            # 🔧 动作裁剪：确保动作在环境的合法范围内
-            if hasattr(env, 'action_space'):
-                action_space = env.action_space
-                if hasattr(action_space, 'low') and hasattr(action_space, 'high'):
-                    # 单环境动作空间
-                    action_low = action_space.low
-                    action_high = action_space.high
-                    actions_to_execute = [np.clip(action, action_low, action_high) for action in actions_to_execute]
-                elif hasattr(action_space, 'spaces'):
-                    # 向量环境，每个子环境有独立的动作空间
-                    clipped_actions = []
-                    for i, action in enumerate(actions_to_execute):
-                        if i < len(action_space.spaces):
-                            sub_space = action_space.spaces[i]
-                            clipped_action = np.clip(action, sub_space.low, sub_space.high)
-                        else:
-                            # 使用默认范围[-1, 1]
-                            clipped_action = np.clip(action, -1, 1)
-                        clipped_actions.append(clipped_action)
-                    actions_to_execute = clipped_actions
+            # 🔧 动作裁剪（并行路径可配置禁用）
+            disable_clip = False
+            try:
+                if self.config and hasattr(self.config, 'features'):
+                    disable_clip = bool(getattr(self.config.features, 'disable_action_clipping', False))
+                elif isinstance(self.config, dict):
+                    disable_clip = bool(self.config.get('features', {}).get('disable_action_clipping', False))
+            except Exception:
+                disable_clip = False
+
+            if not disable_clip:
+                if hasattr(env, 'action_space'):
+                    action_space = env.action_space
+                    if hasattr(action_space, 'low') and hasattr(action_space, 'high'):
+                        # 单环境动作空间
+                        action_low = action_space.low
+                        action_high = action_space.high
+                        actions_to_execute = [np.clip(action, action_low, action_high) for action in actions_to_execute]
+                    elif hasattr(action_space, 'spaces'):
+                        # 向量环境，每个子环境有独立的动作空间
+                        clipped_actions = []
+                        for i, action in enumerate(actions_to_execute):
+                            if i < len(action_space.spaces):
+                                sub_space = action_space.spaces[i]
+                                clipped_action = np.clip(action, sub_space.low, sub_space.high)
+                            else:
+                                # 使用默认范围[-1, 1]
+                                clipped_action = np.clip(action, -1, 1)
+                            clipped_actions.append(clipped_action)
+                        actions_to_execute = clipped_actions
+                    else:
+                        # 使用默认范围[-1, 1]进行裁剪
+                        actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
                 else:
-                    # 使用默认范围[-1, 1]进行裁剪
+                    # 没有action_space信息，使用默认范围[-1, 1]
                     actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
-            else:
-                # 没有action_space信息，使用默认范围[-1, 1]
-                actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
             
             # 并行执行动作
             step_out = env.step(actions_to_execute)
@@ -1451,7 +1499,12 @@ class LIBEROEnvRunner:
                     
                     # 生成视频文件名
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    task_str = env_name.replace(" ", "_")[:30] if isinstance(env_name, str) else f"parallel_env_{i}"
+                    # 优先使用真实任务描述（从子进程env上获取并在reset时缓存到 _vector_env_prompts）
+                    if hasattr(self, '_vector_env_prompts') and i < len(self._vector_env_prompts):
+                        task_label = self._vector_env_prompts[i]
+                    else:
+                        task_label = env_name
+                    task_str = (task_label or "").replace(" ", "_")[:60] if isinstance(task_label, str) else f"parallel_env_{i}"
                     success_str = "success" if episode['success'] else "failure"
                     video_path = video_dir / f"{timestamp}_{task_str}_env{i}_{success_str}.mp4"
                     

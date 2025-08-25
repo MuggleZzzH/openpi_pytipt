@@ -43,12 +43,15 @@ action_std = np.array(norm_stats["norm_stats"]["actions"]["std"][:7], dtype=np.f
 # ** Change `env_name` and `task_id` to test different environments and tasks **
 cprint("Creating Libero environment...", "green")
 env = gym.make(
-    "libero-goal-v0",  # from ["libero-goal-v0", "libero-object-v0", "libero-spatial-v0", "libero-10-v0", "libero-90-v0"],
-    task_id=9,  # task id from 0 to 9
+    "libero-spatial-v0",  # from ["libero-goal-v0", "libero-object-v0", "libero-spatial-v0", "libero-10-v0", "libero-90-v0"],
+    task_id=0,  # task id from 0 to 9
     image_size=224,  # image size (height, width)
     camera_names=["agentview", "robot0_eye_in_hand"],  # camera names
     seed=0,  # random seed
 )
+
+# 打印任务信息
+cprint(f"任务描述: {env.task_description}", "yellow")
 
 # reset environment
 o = env.reset()
@@ -140,7 +143,16 @@ while not d:
             break
 
 # save video
-writer = imageio.get_writer("pi0_libero_demo2.mp4", fps=30)
+# 生成文件名：使用任务ID和完整任务描述（去掉无意义词）
+task_words = env.task_description.split()
+# 去掉无意义的词
+meaningful_words = [word for word in task_words if word.lower() not in ['the', 'and', 'to', 'on', 'in', 'at', 'of', 'with']]
+task_name_clean = "_".join(meaningful_words)
+video_filename = f"pi0_task_{task_name_clean}.mp4"
+
+writer = imageio.get_writer(video_filename, fps=30)
 for frame in frames:
     writer.append_data(frame)
 writer.close()
+
+cprint(f"视频已保存: {video_filename}", "green")

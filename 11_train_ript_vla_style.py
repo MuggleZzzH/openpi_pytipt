@@ -933,7 +933,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
 
     cfg_adapter = PI0_CFG_Adapter(
         policy=policy,
-        norm_stats_path=f"{config['policy_path']}/norm_stats.json",
+        norm_stats_path=(config.get('norm_stats_path') if isinstance(config, dict) else getattr(config, 'norm_stats_path', None)) or f"{config['policy_path']}/norm_stats.json",
         use_so100_processing=use_so100_processing,  # 🔥 Phase 3: 新增SO100支持
         windowing_mode=windowing_mode,
         window_stride=window_stride,

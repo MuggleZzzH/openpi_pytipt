@@ -259,14 +259,30 @@ def create_libero_env_independent(benchmark_name: str, env_name: str = None, tas
 
     env_id = benchmark_to_env_id[benchmark_name]
 
-    # 自动推断task_id (与串行实现一致)
+    # 自动推断task_id
+    # 优先使用任务名映射（与串行runner一致），否则回退到基准默认值
     if task_id is None:
-        if benchmark_name == "libero_goal":
-            task_id = 1
-        elif benchmark_name == "libero_spatial":
-            task_id = 0
-        else:
-            task_id = 0
+        try:
+            from libero.libero.benchmark import get_benchmark
+            bm = get_benchmark(benchmark_name.lower())()
+            task_names = bm.get_task_names()
+            if isinstance(env_name, str) and env_name in task_names:
+                task_id = task_names.index(env_name)
+            else:
+                # 回退旧逻辑
+                if benchmark_name == "libero_goal":
+                    task_id = 1
+                elif benchmark_name == "libero_spatial":
+                    task_id = 0
+                else:
+                    task_id = 0
+        except Exception:
+            if benchmark_name == "libero_goal":
+                task_id = 1
+            elif benchmark_name == "libero_spatial":
+                task_id = 0
+            else:
+                task_id = 0
 
     # 使用与串行路径相同的 gym.make 配置，确保观测是 dict
     env = gym.make(

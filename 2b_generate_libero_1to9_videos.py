@@ -24,7 +24,7 @@ PATH_TO_PI_MODEL = "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch"
 PATH_TO_JAX_PI_MODEL = "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset"
 
 # 创建视频保存目录
-video_dir = Path("libero_task_videos")
+video_dir = Path("libero_spatial_videos")
 video_dir.mkdir(exist_ok=True)
 
 # 加载模型
@@ -51,7 +51,7 @@ for task_id in range(1, 10):  # 1到9
     
     # 创建环境
     env = gym.make(
-        "libero-goal-v0",
+        "libero-spatial-v0",
         task_id=task_id,
         image_size=224,
         camera_names=["agentview", "robot0_eye_in_hand"],
@@ -114,8 +114,14 @@ for task_id in range(1, 10):  # 1到9
 
     env.close()
 
-    # 保存视频
-    video_path = video_dir / f"task_{task_id:02d}.mp4"
+    # 保存视频 - 使用任务ID和完整任务描述命名
+    task_words = env.task_description.split()
+    # 去掉无意义的词
+    meaningful_words = [word for word in task_words if word.lower() not in ['the', 'and', 'to', 'on', 'in', 'at', 'of', 'with']]
+    task_name_clean = "_".join(meaningful_words)
+    video_filename = f"pi0_task{task_id:02d}_{task_name_clean}.mp4"
+    video_path = video_dir / video_filename
+    
     writer = imageio.get_writer(str(video_path), fps=30)
     for frame in frames:
         writer.append_data(frame)
