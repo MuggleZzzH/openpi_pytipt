@@ -74,8 +74,10 @@ rollout:
   rollouts_per_env: 2          # 每个任务评估多少个 rollouts
   num_parallel_envs: 2          # 评估时并行环境数（单卡安全值 1~2）
   max_episode_length: ${task.max_episode_length}  # 默认沿用任务上限
-  n_video: 0                    # 评估中是否保存视频（0 关闭）
-  n_video_final: 1              # 最终评估是否保存视频（0 关闭）
+  
+  # 🎬 评估阶段视频保存配置
+  n_video: 0                    # 常规评估时每个任务保存多少个视频（0=不保存）
+  n_video_final: 1              # 最终评估时每个任务保存多少个视频（用于最终展示）
 
 # === 策略配置 ===
 policy:
@@ -126,7 +128,9 @@ features:
   enable_smart_sampling: false
   use_parallel_init_state: true  # 🔥 重新启用并行状态设置（已修复格式问题）
 
-  save_video: true
+  # 🎬 训练阶段视频保存配置（数据收集时）
+  save_video: true                   # 训练时视频保存总开关
+  n_video_training: 1                # 训练时每次rollout保存多少个视频（当save_video=true时生效）
   enable_file_counter: false
   adaptive_cfg: false
   early_stop_percentage: 1.0
@@ -192,3 +196,16 @@ unified_pool_shuffle: true     # 是否在样本池层面打散样本顺序
 # 3. gradient_accumulation_steps: 控制梯度累积
 # 4. collection_cfg_scale: 控制CFG引导强度
 # 5. load_state: true - 关键，加载MuJoCo状态数据
+
+# 🎬 视频保存配置详解：
+# 【训练阶段视频】(features.save_video + features.n_video_training):
+#   - 用途: 记录训练过程中的rollout数据收集
+#   - 时机: 每次调用collect_rollouts_ript_vla_style时
+#   - 频率: 根据训练频率，可能很频繁
+#   - 建议: 设置较少视频数或关闭，避免存储爆炸
+#   
+# 【评估阶段视频】(rollout.n_video + rollout.n_video_final):
+#   - 用途: 记录模型评估性能和最终展示
+#   - 时机: 定期评估 + 最终评估
+#   - 频率: 相对较少，按评估频率
+#   - 建议: 可以保存更多视频用于分析和展示

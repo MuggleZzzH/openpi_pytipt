@@ -476,7 +476,7 @@ class DemoStateSampler:
 # global_demo_sampler = DemoStateSampler()
 
 
-def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None, demo_initial_state=None):
+def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_dynamic_sampling: bool = False, stats_tracker: Optional[RolloutStatsTracker] = None, demo_initial_state=None, n_video: int = 0):
     """
     RIPT-VLA风格的rollout收集（增强版：支持per-init跳过和demo初始状态）
 
@@ -552,9 +552,12 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
                 return []
         
         # 直接调用环境runner的方法
+        # 🔥 将n_video数量参数转换为布尔值传递给环境运行器
+        save_video_flag = n_video > 0
         rollout_generator = env_runner.run_policy_in_env(
             env_name=task_name,
-            all_init_states=all_init_states
+            all_init_states=all_init_states,
+            debug_save_video=save_video_flag  # 🔥 传递视频保存布尔标志
         )
         
         # 收集所有rollouts
@@ -827,7 +830,7 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
         traceback.print_exc()
         return 0.0
 
-def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=10):
+def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=10, is_final_eval=False):
     """
     🎯 RIPT式全任务评估：与原版RIPT评估逻辑完全对齐
     
@@ -855,6 +858,12 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
         print("⚠️ 没有指定评估任务，跳过评估")
         return {}
     
+    # 🔥 获取视频保存配置
+    rollout_config = config.get('rollout', {})
+    n_video_regular = rollout_config.get('n_video', 0)  # 常规评估视频数
+    n_video_final = rollout_config.get('n_video_final', 1)  # 最终评估视频数
+    n_video = n_video_final if is_final_eval else n_video_regular
+    
     # 设置评估模式：固定随机种子确保可复现
     eval_seed = 42
     torch.manual_seed(eval_seed)
@@ -868,6 +877,7 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
     print(f"  任务数量: {len(task_names)}")
     print(f"  每任务rollout数: {rollouts_per_task}")
     print(f"  评估随机种子: {eval_seed}")
+    print(f"  视频保存: {'🎬最终评估' if is_final_eval else '📹常规评估'} - {n_video} 个视频/任务")
     
     # 遍历所有任务
     for task_idx, task_name in enumerate(task_names):
@@ -911,7 +921,8 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
                     env_runner, task_name, 1,
                     enable_dynamic_sampling=False,  # 🔥 评估时禁用
                     stats_tracker=None,             # 🔥 评估时禁用状态跟踪
-                    demo_initial_state=demo_initial_state
+                    demo_initial_state=demo_initial_state,
+                    n_video=n_video if rollout_idx < n_video else 0  # 🔥 视频保存：前n个rollout保存视频
                 )
                 
                 if episodes and len(episodes) > 0:
@@ -1017,7 +1028,7 @@ def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
             try:
                 # 使用现有的rollout收集函数
                 episodes = collect_rollouts_ript_vla_style(
-                    env_runner, task_name, 1, enable_dynamic_sampling=False
+                    env_runner, task_name, 1, enable_dynamic_sampling=False, n_video=0  # 🔥 CFG评估不保存视频
                 )
                 if episodes and len(episodes) > 0:
                     if episodes[0].get('success', False):
@@ -1337,13 +1348,18 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     
                     tname = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
 
+                # 🔥 获取训练时的视频保存配置
+                training_save_video = config.get('features', {}).get('save_video', False)
+                training_n_video = config.get('features', {}).get('n_video_training', 1) if training_save_video else 0
+                
                 # 收集一组rollouts（传递任务名和demo初始状态）
                 group_episodes = collect_rollouts_ript_vla_style(
                     env_runner, tname,  # 🔥 使用轮询选择的任务名
                     rloo_batch_size,
                     enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
                     stats_tracker=stats_tracker,
-                    demo_initial_state=demo_batch  # 🔥 传递对应任务的demo初始状态
+                    demo_initial_state=demo_batch,  # 🔥 传递对应任务的demo初始状态
+                    n_video=training_n_video  # 🔥 训练时视频保存：使用features配置
                 )
             
             if group_episodes:
@@ -1431,15 +1447,46 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         elif task_to_iter and len(task_names) == 1:
             print(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
         
-        # 6. RIPT式全任务评估（主要评估，每10步进行一次）
-        if (steps_done) % 10 == 0:
+        # 6. RIPT式全任务评估（使用rollout配置参数）
+        rollout_config = config.get('rollout', {})
+        eval_enabled = rollout_config.get('enabled', False)
+        eval_steps = rollout_config.get('steps', 10)
+        rollouts_per_env = rollout_config.get('rollouts_per_env', 5)
+        
+        # 🔍 调试信息：打印评估配置
+        print(f"🔧 评估配置检查:")
+        print(f"   rollout配置: {rollout_config}")
+        print(f"   eval_enabled: {eval_enabled}")
+        print(f"   eval_steps: {eval_steps}")
+        print(f"   rollouts_per_env: {rollouts_per_env}")
+        print(f"   当前步数: {steps_done}")
+        
+        # 🎬 视频保存配置检查
+        training_save_video = config.get('features', {}).get('save_video', False)
+        training_n_video = config.get('features', {}).get('n_video_training', 1) if training_save_video else 0
+        eval_n_video = rollout_config.get('n_video', 0)
+        eval_n_video_final = rollout_config.get('n_video_final', 1)
+        
+        print(f"🎬 视频保存配置:")
+        print(f"   训练时视频: {'✅启用' if training_save_video else '❌禁用'} - {training_n_video} 个/rollout")
+        print(f"   评估时视频: {eval_n_video} 个/rollout (常规), {eval_n_video_final} 个/rollout (最终)")
+        
+        should_eval = eval_enabled and ((steps_done == 1) or (eval_steps > 0 and steps_done % eval_steps == 0))
+        print(f"   should_eval: {should_eval} (计算: {eval_enabled} and (({steps_done} == 1) or ({eval_steps} > 0 and {steps_done} % {eval_steps} == 0)))")
+        
+        if should_eval:
             try:
                 print(f"\n🎯 开始第 {steps_done} 步的全任务评估...")
+                print(f"   配置: 每 {eval_steps} 步评估, {rollouts_per_env} rollouts/任务")
+                if steps_done == 1:
+                    print(f"   📍 初始基线评估")
+                    
                 eval_results = evaluate_ript_style_all_tasks(
                     policy, 
                     env_runner, 
                     config, 
-                    rollouts_per_task=5  # 每个任务5次rollout，平衡速度与准确性
+                    rollouts_per_task=rollouts_per_env,  # 使用配置参数
+                    is_final_eval=False  # 🔥 常规评估，不保存视频（或保存少量视频）
                 )
                 
                 if eval_results:
@@ -1450,6 +1497,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             except Exception as e:
                 print(f"⚠️ RIPT式评估失败: {e}")
                 traceback.print_exc()
+        elif eval_enabled and eval_steps > 0:
+            next_eval_step = ((steps_done // eval_steps) + 1) * eval_steps
+            print(f"📊 第 {steps_done} 步: 跳过评估 (下次评估: 第 {next_eval_step} 步)")
+        elif not eval_enabled:
+            print(f"📊 第 {steps_done} 步: 评估已禁用")
         
         # 6.1 CFG参数调优（可选，每20步进行一次，仅在CFG启用时）
         if (steps_done) % 20 == 0 and getattr(policy.model, 'cfg_enabled', True):
@@ -1534,6 +1586,36 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             'training_metrics': all_training_metrics,
         }, final_checkpoint_path)
         print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
+
+    # 🎬 最终评估（保存视频记录）
+    try:
+        print(f"\n🎬 开始最终评估（保存视频记录）...")
+        rollout_config = config.get('rollout', {})
+        final_eval_results = evaluate_ript_style_all_tasks(
+            policy, 
+            env_runner, 
+            config, 
+            rollouts_per_task=rollout_config.get('rollouts_per_env', 10),  # 最终评估可用更多rollout
+            is_final_eval=True  # 🔥 最终评估，保存视频
+        )
+        
+        if final_eval_results:
+            print(f"🏆 最终评估结果:")
+            print(f"   总体成功率: {final_eval_results.get('overall_success_rate', 0.0):.2%}")
+            for task_name, success_rate in final_eval_results.items():
+                if task_name != 'overall_success_rate':
+                    print(f"   {task_name}: {success_rate:.2%}")
+            
+            # 保存最终评估结果
+            final_eval_path = output_dir / "final_evaluation_results.json"
+            with open(final_eval_path, 'w') as f:
+                import json
+                json.dump(final_eval_results, f, indent=2)
+            print(f"📄 最终评估结果已保存: {final_eval_path}")
+        
+    except Exception as e:
+        print(f"⚠️ 最终评估失败: {e}")
+        traceback.print_exc()
 
     print(f"\n🎉 RIPT-VLA风格训练完成!")
     print(f"📊 最终结果已保存: {final_results_path}")
