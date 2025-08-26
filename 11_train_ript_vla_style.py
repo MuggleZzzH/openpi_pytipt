@@ -1076,73 +1076,84 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             max_allocated = torch.cuda.max_memory_allocated() / 1024**3
             print(f"📊 {step_name} - GPU显存: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, 峰值: {max_allocated:.2f}GB")
     
-    # 🔥 主训练循环 - 多任务轮询+按组收集模式
-    for step in range(num_train_steps):
+    # 🔥 主训练循环 - 多任务轮询+按组收集模式（仅在成功收集后计步）
+    steps_done = 0
+    max_collection_retries = int(config.get('training', {}).get('max_collection_retries', 100))
+    while steps_done < num_train_steps:
         step_start_time = time.time()
         torch.cuda.reset_peak_memory_stats()  # 重置峰值监控
         
-        print(f"=== 训练步骤 {step + 1}/{num_train_steps} ===")
+        print(f"=== 训练步骤 {steps_done + 1}/{num_train_steps} ===")
         print_gpu_memory("步骤开始")
         
-        # 1. 按组收集rollouts（解耦demo_batch_size与rloo_batch_size）
+        # 1. 按组收集rollouts（带重试，解耦demo_batch_size与rloo_batch_size）
         all_collected_episodes = []
         successful_groups = 0
-        
-        for group_idx in range(demo_batch_size):
-            print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
+        collection_attempt = 0
+        while not all_collected_episodes:
+            collection_attempt += 1
+            if collection_attempt > 1:
+                print(f"🔁 收集重试 {collection_attempt}/{max_collection_retries}")
+            
+            # 每次尝试清空上一轮结果
+            all_collected_episodes = []
+            successful_groups = 0
 
-            # 🔥 智能任务选择：多任务轮询 vs 单任务直选
-            demo_batch = None
-            if task_to_iter:
-                if len(task_names) > 1:
-                    # 多任务环境：真正的轮询
-                    tname = task_names[(task_cursor + group_idx) % len(task_names)]
-                    print(f"  🎯 多任务轮询: 组{group_idx} -> 任务 {tname}")
-                else:
-                    # 单任务环境：直接使用唯一任务
-                    tname = task_names[0]
-                    print(f"  📍 单任务模式: 组{group_idx} -> 任务 {tname}")
+            for group_idx in range(demo_batch_size):
+                print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
+
+                # 🔥 智能任务选择：多任务轮询 vs 单任务直选
+                demo_batch = None
+                if task_to_iter:
+                    if len(task_names) > 1:
+                        # 多任务环境：真正的轮询
+                        tname = task_names[(task_cursor + group_idx) % len(task_names)]
+                        print(f"  🎯 多任务轮询: 组{group_idx} -> 任务 {tname}")
+                    else:
+                        # 单任务环境：直接使用唯一任务
+                        tname = task_names[0]
+                        print(f"  📍 单任务模式: 组{group_idx} -> 任务 {tname}")
                 
-                try:
-                    demo_batch = next(task_to_iter[tname])
-                    demo_id = demo_batch.get('demo_id', [None])[0]
-                    print(f"  📋 使用子demo: {demo_id} (任务: {tname})")
-                except StopIteration:
-                    # 重新初始化该任务的迭代器
-                    task_to_iter[tname] = iter(task_to_loader[tname])
-                    demo_batch = next(task_to_iter[tname])
-                    demo_id = demo_batch.get('demo_id', [None])[0]
-                    print(f"  📋 重新开始任务迭代: 子demo {demo_id} (任务: {tname})")
-                except Exception as e:
-                    print(f"  ⚠️ Demo获取失败: {e}")
-                    demo_batch = None
-                    tname = task_names[0] if len(task_names) == 1 else task_names[(task_cursor + group_idx) % len(task_names)]
-            else:
-                # 回退到原有逻辑（兼容性）
-                if demo_data_iter is not None:
                     try:
-                        demo_batch = next(demo_data_iter)
+                        demo_batch = next(task_to_iter[tname])
                         demo_id = demo_batch.get('demo_id', [None])[0]
-                        print(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                        print(f"  📋 使用子demo: {demo_id} (任务: {tname})")
                     except StopIteration:
-                        demo_data_iter = iter(demo_dataloader)
-                        demo_batch = next(demo_data_iter)
+                        # 重新初始化该任务的迭代器
+                        task_to_iter[tname] = iter(task_to_loader[tname])
+                        demo_batch = next(task_to_iter[tname])
                         demo_id = demo_batch.get('demo_id', [None])[0]
-                        print(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                        print(f"  📋 重新开始任务迭代: 子demo {demo_id} (任务: {tname})")
                     except Exception as e:
                         print(f"  ⚠️ Demo获取失败: {e}")
                         demo_batch = None
-                
-                tname = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
+                        tname = task_names[0] if len(task_names) == 1 else task_names[(task_cursor + group_idx) % len(task_names)]
+                else:
+                    # 回退到原有逻辑（兼容性）
+                    if demo_data_iter is not None:
+                        try:
+                            demo_batch = next(demo_data_iter)
+                            demo_id = demo_batch.get('demo_id', [None])[0]
+                            print(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                        except StopIteration:
+                            demo_data_iter = iter(demo_dataloader)
+                            demo_batch = next(demo_data_iter)
+                            demo_id = demo_batch.get('demo_id', [None])[0]
+                            print(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                        except Exception as e:
+                            print(f"  ⚠️ Demo获取失败: {e}")
+                            demo_batch = None
+                    
+                    tname = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
 
-            # 收集一组rollouts（传递任务名和demo初始状态）
-            group_episodes = collect_rollouts_ript_vla_style(
-                env_runner, tname,  # 🔥 使用轮询选择的任务名
-                rloo_batch_size,
-                enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
-                stats_tracker=stats_tracker,
-                demo_initial_state=demo_batch  # 🔥 传递对应任务的demo初始状态
-            )
+                # 收集一组rollouts（传递任务名和demo初始状态）
+                group_episodes = collect_rollouts_ript_vla_style(
+                    env_runner, tname,  # 🔥 使用轮询选择的任务名
+                    rloo_batch_size,
+                    enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
+                    stats_tracker=stats_tracker,
+                    demo_initial_state=demo_batch  # 🔥 传递对应任务的demo初始状态
+                )
             
             if group_episodes:
                 successes = [ep.get('success', False) for ep in group_episodes]
@@ -1165,17 +1176,23 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
 
             else:
                 print(f"❌ 组 {group_idx + 1} 收集失败")
-        
-        # 🔥 定期保存统计数据
-        if step % 5 == 0:  # 每5步保存一次
+            
+            # 单次尝试结束
+            
+        # 🔥 定期保存统计数据（按已完成步数节奏）
+        if steps_done % 5 == 0:
             stats_tracker.save_stats()
         
-        print(f"📊 组收集完成: {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
+        print(f"📊 组收集完成(尝试 {collection_attempt}): {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
         print_gpu_memory("收集完成")
         
         if not all_collected_episodes:
-            print("⚠️ 未收集到有效episodes，跳过此步")
-            continue
+            if collection_attempt < max_collection_retries:
+                print("⚠️ 未收集到有效episodes，继续重试收集")
+                continue  # 回到收集重试while
+            else:
+                print("⚠️ 达到最大收集重试次数，仍未收集到有效episodes，将继续重试以满足严格条件")
+                continue  # 持续重试，不增加steps_done
         
         # 2. 计算优势（正宗RLOO方法）
         advantages = compute_advantages_rloo(all_collected_episodes, rloo_batch_size=rloo_batch_size)
@@ -1187,13 +1204,16 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         )
         print_gpu_memory("策略更新完成")
         
+        # 步数仅在成功收集并完成更新后递增
+        steps_done += 1
+        
         # 4. 记录指标
         avg_reward = np.mean([ep['total_reward'] for ep in all_collected_episodes])
         success_rate = np.mean([ep['success'] for ep in all_collected_episodes])
         step_time = time.time() - step_start_time
         
         step_metrics = {
-            'step': step + 1,
+            'step': steps_done,
             'demo_groups': successful_groups,
             'total_episodes': len(all_collected_episodes),
             'avg_reward': avg_reward,
@@ -1204,7 +1224,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         all_training_metrics.append(step_metrics)
         
         # 5. 输出结果
-        print(f"✓ 步骤 {step + 1} 完成:")
+        print(f"✓ 步骤 {steps_done} 完成:")
         print(f"  成功组数: {successful_groups}/{demo_batch_size}")
         print(f"  总Episodes: {len(all_collected_episodes)}")
         print(f"  平均奖励: {avg_reward:.4f}")
@@ -1221,7 +1241,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             print(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
         
         # 6. CFG评估（每10步进行一次，仅在CFG启用时）
-        if (step + 1) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
+        if (steps_done) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
             try:
                 best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
@@ -1235,15 +1255,15 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     env_runner.config['algo']['collection_cfg_scale'] = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
-        elif (step + 1) % 10 == 0:
+        elif (steps_done) % 10 == 0:
             print("⚠️ CFG已禁用，跳过CFG强度评估")
         
         # 7. 保存检查点
-        if (step + 1) % config['training'].get('save_freq', 10) == 0:
+        if (steps_done) % config['training'].get('save_freq', 10) == 0:
             # 轻量权重（仅模型，便于部署与占用小）
-            weights_path = output_dir / f"weights_step_{step + 1}.pt"
+            weights_path = output_dir / f"weights_step_{steps_done}.pt"
             torch.save({
-                'step': step + 1,
+                'step': steps_done,
                 'policy_state_dict': policy.state_dict(),
                 'config': config,
                 'training_metrics': all_training_metrics,
@@ -1252,10 +1272,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
 
             # 可选：按较低频率保存含优化器的完整检查点，便于恢复训练
             save_opt_every = config.get('training', {}).get('save_optimizer_freq', None)
-            if save_opt_every and ((step + 1) % int(save_opt_every) == 0):
-                checkpoint_path = output_dir / f"checkpoint_step_{step + 1}.pt"
+            if save_opt_every and ((steps_done) % int(save_opt_every) == 0):
+                checkpoint_path = output_dir / f"checkpoint_step_{steps_done}.pt"
                 torch.save({
-                    'step': step + 1,
+                    'step': steps_done,
                     'policy_state_dict': policy.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'config': config,

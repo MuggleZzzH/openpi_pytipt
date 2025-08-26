@@ -20,7 +20,7 @@ task:
     # 🎯 多任务测试：选择4个不同的spatial任务进行轮换
     - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"
     - "pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
     # - "pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
     # 💡 要测试单任务模式，注释掉除第一个外的所有任务
     # 💡 要测试更多任务，取消注释下面的任务：
@@ -31,7 +31,7 @@ task:
     # - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
     # - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: null  # 🔥 进一步限制episode长度减少样本数
+  max_episode_length: 100  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                   # 关闭demo初始状态，匹配 2_pi0 的默认reset
@@ -52,8 +52,8 @@ dataset:
 
 # === 算法配置 ===
 algo:
-  demo_batch_size: 1
-  rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
+  demo_batch_size: 2
+  rloo_batch_size: 4  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
   gradient_accumulation_steps: 2  # 🔥 增加累积步数补偿小batch
   collection_cfg_scale: 1.0
