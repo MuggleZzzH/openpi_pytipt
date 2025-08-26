@@ -56,6 +56,20 @@ class LIBEROEnvRunner:
         self.rank = rank
         self.world_size = world_size
         
+        # 🔥 新增：初始化benchmark以获取真实基准状态池，与RIPT-VLA完全对齐
+        self.benchmark = None
+        if benchmark_name:
+            try:
+                from libero.libero.benchmark import get_benchmark
+                self.benchmark = get_benchmark(benchmark_name.lower())()
+                if self.rank == 0:
+                    print(f"✅ Benchmark初始化成功: {benchmark_name} -> {type(self.benchmark).__name__}")
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"⚠️ Benchmark初始化失败: {e}")
+                    print(f"   将使用合成初始状态池作为回退")
+                self.benchmark = None
+        
         # 🔥 使用RIPT-VLA官方的任务最大步数设置（基于训练数据统计）
         TASK_MAX_STEPS = {
             'libero_spatial': 220,  # longest training demo has 193 steps

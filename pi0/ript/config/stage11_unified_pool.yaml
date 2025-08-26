@@ -21,15 +21,15 @@ task:
     - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"
     - "pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
     - "pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
     # 💡 要测试单任务模式，注释掉除第一个外的所有任务
     # 💡 要测试更多任务，取消注释下面的任务：
-    # - "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
+    - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
   max_episode_length: 100  # 🔥 进一步限制episode长度减少样本数
 
@@ -145,6 +145,15 @@ features:
   # 动态采样配置
   dynamic_sampling:
     enabled: true
+    
+  # 🔥 新增: 采样策略配置，与RIPT-VLA对齐
+  sampling_strategy:
+    # 初始状态采样策略: random (随机时间步) | first (首帧) | round_robin (轮询时间步)
+    init_state_sampling: "random"
+    # 任务选择策略: random (随机任务) | round_robin (轮询任务)  
+    task_selection: "random"
+    # 随机采样的种子控制（用于可复现实验）
+    sampling_seed: 42
 
 # === 🎯 统一样本池配置说明 ===
 # 

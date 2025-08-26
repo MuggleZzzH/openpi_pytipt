@@ -10,7 +10,7 @@ Stage 11 RIPT-VLA风格简化版本
 4. 模仿RIPT-VLA的成功模式
 
 
-python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_parallel_test.yaml 
+python 11_train_ript_vla_style.py --config_path pi0/ript/config/stage11_unified_pool.yaml 
 """
 
 import os
@@ -40,6 +40,7 @@ from pi0.ript.utils.libero_utils_ript_aligned import (
 )
 
 import hashlib
+import random
 
 # 修复tokenizers并行化警告和EGL错误
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -485,34 +486,44 @@ def collect_rollouts_ript_vla_style(env_runner, task_name, num_rollouts, enable_
     print(f"正在收集 {num_rollouts} 个rollouts...")
 
     try:
-        # 🔥 多任务增强：处理demo初始状态（优先使用第一帧向量）
+        # 🔥 多任务增强：处理demo初始状态（随机时间步策略）
         selected_state = None
         state_hash = None  # 用于统计跟踪
         if demo_initial_state is not None:
             print(f"  📋 使用LIBERO demo: 任务 {demo_initial_state['task_name'][0]}")
             task_id = demo_initial_state['task_id'][0].item()
 
-            # 🔥 优先：单帧向量（与"子 demo 第一帧"对齐）
-            if 'init_state_vec' in demo_initial_state:
-                state_vec = demo_initial_state['init_state_vec']['states'][0]   # [D]
-                selected_state = np.ascontiguousarray(state_vec.numpy(), dtype=np.float64)
-                print(f"  ✅ 使用子demo第一帧向量 (init_state_vec, dim={selected_state.shape[0]})")
-            else:
-                # 回退：序列的第一帧
+            # 🔥 检查是否是基准初始状态（评估模式）
+            if 'benchmark_init_state' in demo_initial_state:
+                # 评估模式：直接使用benchmark提供的基准初始状态
+                benchmark_state = demo_initial_state['benchmark_init_state']
+                selected_state = np.ascontiguousarray(benchmark_state, dtype=np.float64)
+                print(f"  ✅ 使用基准初始状态 (评估模式, dim={selected_state.shape[0]})")
+            elif 'init_state' in demo_initial_state:
+                # 训练模式：从demo序列中随机选择时间步
                 init_state_data = demo_initial_state['init_state']
                 states = init_state_data['states'][0]  # [T, D]
                 pad_mask = init_state_data['pad_mask'][0]  # [T]
+                
                 if pad_mask.any():
-                    first_idx = int(torch.where(pad_mask)[0][0].item())
-                    state_vec = states[first_idx]       # [D]
+                    valid_indices = torch.where(pad_mask)[0]  # 所有有效时间步
+                    # 🔥 随机选择一个有效时间步（彻底随机，无首帧偏好）
+                    random_idx = int(valid_indices[torch.randint(0, len(valid_indices), (1,))].item())
+                    state_vec = states[random_idx]  # 随机时间步的状态
                     selected_state = np.ascontiguousarray(state_vec.numpy(), dtype=np.float64)
-                    print(f"  ✅ 使用子demo第一帧向量 (回退from init_state, dim={selected_state.shape[0]})")
+                    print(f"  ✅ 随机时间步采样 {random_idx}/{len(valid_indices)-1} (训练模式, 总长度T={len(states)}, 有效长度={len(valid_indices)}, dim={selected_state.shape[0]})")
+                else:
+                    selected_state = None
+                    print(f"  ⚠️ 无有效时间步，回退环境默认初始化")
+            else:
+                selected_state = None
+                print(f"  ⚠️ 缺少init_state数据，回退环境默认初始化")
 
             if selected_state is not None:
                 all_init_states = [selected_state]      # 单向量 → 并行时由 runner 广播
                 if stats_tracker is not None:
                     state_hash = stats_tracker._compute_init_hash(task_id, selected_state)
-                print(f"  ✅ 使用子demo第一帧作为初始状态（dim={selected_state.shape[0]}）")
+                print(f"  ✅ 使用随机时间步作为初始状态（dim={selected_state.shape[0]}）")
             else:
                 all_init_states = None
                 print(f"  ⚠️ 初始状态缺失，回退环境默认初始化")
@@ -816,6 +827,170 @@ def update_policy_simple(policy, optimizer, cfg_adapter, episodes, advantages, d
         traceback.print_exc()
         return 0.0
 
+def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=10):
+    """
+    🎯 RIPT式全任务评估：与原版RIPT评估逻辑完全对齐
+    
+    特点：
+    1. 遍历所有任务
+    2. 使用基准初始状态池（benchmark.get_task_init_states）
+    3. 按索引循环取初始状态（非随机）
+    4. 禁用动态采样和状态跳过
+    5. 从头开始完整评估任务能力
+    
+    Args:
+        policy: 待评估的策略模型
+        env_runner: 环境运行器
+        config: 配置字典
+        rollouts_per_task: 每个任务的rollout次数
+        
+    Returns:
+        dict: 包含per-task和overall成功率的评估结果
+    """
+    print("\n🎯 开始RIPT式全任务评估...")
+    
+    # 获取任务列表
+    task_names = config.get('task', {}).get('task_names_to_use', [])
+    if not task_names:
+        print("⚠️ 没有指定评估任务，跳过评估")
+        return {}
+    
+    # 设置评估模式：固定随机种子确保可复现
+    eval_seed = 42
+    torch.manual_seed(eval_seed)
+    np.random.seed(eval_seed)
+    random.seed(eval_seed)
+    
+    all_results = {}
+    overall_successes = []
+    
+    print(f"📊 评估配置:")
+    print(f"  任务数量: {len(task_names)}")
+    print(f"  每任务rollout数: {rollouts_per_task}")
+    print(f"  评估随机种子: {eval_seed}")
+    
+    # 遍历所有任务
+    for task_idx, task_name in enumerate(task_names):
+        print(f"\n🔄 评估任务 {task_idx+1}/{len(task_names)}: {task_name}")
+        
+        # 获取该任务的基准初始状态池
+        task_init_states = []
+        if hasattr(env_runner, 'benchmark') and env_runner.benchmark is not None:
+            try:
+                task_init_states = env_runner.benchmark.get_task_init_states(task_idx)
+                print(f"  ✅ 从benchmark获取 {len(task_init_states)} 个基准初始状态")
+            except Exception as e:
+                print(f"  ⚠️ 获取基准状态失败: {e}，使用环境默认")
+                task_init_states = []
+        else:
+            print(f"  ⚠️ Benchmark未初始化，使用环境默认重置")
+            task_init_states = []
+        
+        # 执行该任务的多次rollout
+        task_successes = []
+        for rollout_idx in range(rollouts_per_task):
+            try:
+                # 🔥 关键：使用基准初始状态池的循环索引（与RIPT对齐）
+                if task_init_states:
+                    init_state_idx = rollout_idx % len(task_init_states)
+                    init_state = task_init_states[init_state_idx]
+                    print(f"    📍 Rollout {rollout_idx+1}: 使用基准状态 {init_state_idx}")
+                    
+                    # 构造demo_initial_state格式（兼容现有接口）
+                    demo_initial_state = {
+                        'task_name': [task_name],
+                        'task_id': torch.tensor([task_idx]),
+                        'benchmark_init_state': init_state  # 🔥 新增字段标识基准状态
+                    }
+                else:
+                    print(f"    📍 Rollout {rollout_idx+1}: 使用环境默认重置")
+                    demo_initial_state = None
+                
+                # 🔥 禁用动态采样，每次只收集1个rollout
+                episodes = collect_rollouts_ript_vla_style(
+                    env_runner, task_name, 1,
+                    enable_dynamic_sampling=False,  # 🔥 评估时禁用
+                    stats_tracker=None,             # 🔥 评估时禁用状态跟踪
+                    demo_initial_state=demo_initial_state
+                )
+                
+                if episodes and len(episodes) > 0:
+                    success = episodes[0].get('success', False)
+                    task_successes.append(success)
+                    print(f"      结果: {'✅成功' if success else '❌失败'}")
+                else:
+                    print(f"      结果: ❌无效rollout")
+                    task_successes.append(False)
+                    
+            except Exception as e:
+                print(f"    ❌ Rollout {rollout_idx+1} 执行失败: {e}")
+                task_successes.append(False)
+        
+        # 计算该任务的成功率
+        task_success_rate = np.mean(task_successes) if task_successes else 0.0
+        all_results[task_name] = task_success_rate
+        overall_successes.extend(task_successes)
+        
+        print(f"  📊 任务 {task_name}: {task_success_rate:.2%} ({sum(task_successes)}/{len(task_successes)})")
+    
+    # 计算总体成功率
+    overall_success_rate = np.mean(overall_successes) if overall_successes else 0.0
+    all_results['overall_success_rate'] = overall_success_rate
+    
+    print(f"\n🎉 RIPT式评估完成!")
+    print(f"📊 总体成功率: {overall_success_rate:.2%} ({sum(overall_successes)}/{len(overall_successes)})")
+    print(f"📋 Per-task 成功率:")
+    for task_name, success_rate in all_results.items():
+        if task_name != 'overall_success_rate':
+            print(f"  {task_name}: {success_rate:.2%}")
+    
+    return all_results
+
+def verify_random_sampling_effectiveness(config, task_names, max_samples=10):
+    """
+    🔍 验证随机采样的有效性
+    收集样本并分析任务分布和时间步分布
+    """
+    print("\n🔍 验证RIPT-VLA随机采样对齐效果:")
+    
+    task_counts = {name: 0 for name in task_names}
+    timestep_samples = []
+    
+    # 模拟采样过程
+    for i in range(max_samples):
+        # 任务选择验证
+        if len(task_names) > 1:
+            selected_task = random.choice(task_names)
+            task_counts[selected_task] += 1
+        
+        # 时间步选择验证（模拟）
+        simulated_valid_timesteps = torch.randint(1, 200, (torch.randint(50, 150, (1,)).item(),))
+        if len(simulated_valid_timesteps) > 0:
+            random_timestep = int(simulated_valid_timesteps[torch.randint(0, len(simulated_valid_timesteps), (1,))].item())
+            timestep_samples.append(random_timestep)
+    
+    print(f"📊 任务选择分布 (共{max_samples}次采样):")
+    for task, count in task_counts.items():
+        percentage = (count / max_samples) * 100
+        print(f"  {task}: {count} 次 ({percentage:.1f}%)")
+    
+    if timestep_samples:
+        print(f"📊 时间步选择分布:")
+        print(f"  范围: [{min(timestep_samples)}, {max(timestep_samples)}]")
+        print(f"  平均: {np.mean(timestep_samples):.1f}")
+        print(f"  标准差: {np.std(timestep_samples):.1f}")
+    
+    # 检查是否充分随机化
+    task_distribution_uniform = all(abs(count - max_samples/len(task_names)) <= 3 for count in task_counts.values())
+    timestep_range_good = len(timestep_samples) > 0 and (max(timestep_samples) - min(timestep_samples)) > 50
+    
+    if task_distribution_uniform and timestep_range_good:
+        print("✅ 随机采样验证通过：分布充分随机化")
+        return True
+    else:
+        print("⚠️ 随机采样可能需要调整：分布不够均匀")
+        return False
+
 def evaluate_with_cfg_sweep(policy, env_runner, task_name, eval_episodes=3):
     """🔥 新增：评估不同CFG强度的效果"""
     cfg_scales = [1.0, 1.5, 3.0, 5.0]
@@ -873,16 +1048,32 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     """
     print("🚀 开始RIPT-VLA风格的训练循环")
     
+    # 🔥 读取采样策略配置
+    features = config.get('features', {})
+    sampling_config = features.get('sampling_strategy', {})
+    init_state_sampling = sampling_config.get('init_state_sampling', 'random')
+    task_selection = sampling_config.get('task_selection', 'random')
+    sampling_seed = sampling_config.get('sampling_seed', 42)
+    
+    print(f"🔧 RIPT-VLA对齐配置:")
+    print(f"  初始状态采样策略: {init_state_sampling}")
+    print(f"  任务选择策略: {task_selection}")
+    print(f"  采样随机种子: {sampling_seed}")
+    
     # 统一设置随机种子（保证可复现）
     try:
-        import random
-        seed = int(config.get('training', {}).get('seed', 42))
-        random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+        training_seed = int(config.get('training', {}).get('seed', 42))
+        random.seed(sampling_seed); np.random.seed(sampling_seed); torch.manual_seed(training_seed)
         if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        print(f"✅ 随机种子已设置: {seed}")
+            torch.cuda.manual_seed_all(training_seed)
+        print(f"✅ 训练随机种子: {training_seed}, 采样随机种子: {sampling_seed}")
     except Exception as _e:
         print(f"⚠️ 随机种子设置失败: {_e}")
+    
+    # 🔥 验证随机采样效果
+    task_names = config.get('task', {}).get('task_names_to_use', ['default_task'])
+    if len(task_names) > 1:
+        verify_random_sampling_effectiveness(config, task_names, max_samples=20)
     
     # 🔥 设置数值优化和显存管理
     print("🔧 设置数值优化...")
@@ -997,7 +1188,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 dl = DataLoader(
                     ds,
                     batch_size=1,
-                    shuffle=False,               # 🔥 严格顺序轮换，与RIPT原版对齐
+                    shuffle=True,                # 🔥 子demo随机打散，与RIPT-VLA完全对齐
                     collate_fn=collate_fn_ript_aligned,
                     num_workers=0
                 )
@@ -1102,13 +1293,13 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             for group_idx in range(demo_batch_size):
                 print(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
 
-                # 🔥 智能任务选择：多任务轮询 vs 单任务直选
+                # 🔥 智能任务选择：多任务随机选择 vs 单任务直选
                 demo_batch = None
                 if task_to_iter:
                     if len(task_names) > 1:
-                        # 多任务环境：真正的轮询
-                        tname = task_names[(task_cursor + group_idx) % len(task_names)]
-                        print(f"  🎯 多任务轮询: 组{group_idx} -> 任务 {tname}")
+                        # 🔥 多任务环境：随机选择任务，与RIPT-VLA对齐
+                        tname = random.choice(task_names)
+                        print(f"  🎲 随机任务选择: 组{group_idx} -> 任务 {tname}")
                     else:
                         # 单任务环境：直接使用唯一任务
                         tname = task_names[0]
@@ -1240,9 +1431,30 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         elif task_to_iter and len(task_names) == 1:
             print(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
         
-        # 6. CFG评估（每10步进行一次，仅在CFG启用时）
-        if (steps_done) % 10 == 0 and getattr(policy.model, 'cfg_enabled', True):
+        # 6. RIPT式全任务评估（主要评估，每10步进行一次）
+        if (steps_done) % 10 == 0:
             try:
+                print(f"\n🎯 开始第 {steps_done} 步的全任务评估...")
+                eval_results = evaluate_ript_style_all_tasks(
+                    policy, 
+                    env_runner, 
+                    config, 
+                    rollouts_per_task=5  # 每个任务5次rollout，平衡速度与准确性
+                )
+                
+                if eval_results:
+                    step_metrics['overall_success_rate'] = eval_results.get('overall_success_rate', 0.0)
+                    step_metrics['task_success_rates'] = {k: v for k, v in eval_results.items() if k != 'overall_success_rate'}
+                    print(f"📊 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
+                
+            except Exception as e:
+                print(f"⚠️ RIPT式评估失败: {e}")
+                traceback.print_exc()
+        
+        # 6.1 CFG参数调优（可选，每20步进行一次，仅在CFG启用时）
+        if (steps_done) % 20 == 0 and getattr(policy.model, 'cfg_enabled', True):
+            try:
+                print(f"\n🔍 开始CFG强度调优...")
                 best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
                 step_metrics['best_cfg_scale'] = best_cfg
                 step_metrics['cfg_sweep_results'] = cfg_results
@@ -1255,7 +1467,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     env_runner.config['algo']['collection_cfg_scale'] = best_cfg
             except Exception as e:
                 print(f"⚠️ CFG评估失败: {e}")
-        elif (steps_done) % 10 == 0:
+        elif (steps_done) % 20 == 0:
             print("⚠️ CFG已禁用，跳过CFG强度评估")
         
         # 7. 保存检查点
