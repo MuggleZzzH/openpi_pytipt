@@ -907,10 +907,14 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
                     print(f"    📍 Rollout {rollout_idx+1}: 使用基准状态 {init_state_idx}")
                     
                     # 构造demo_initial_state格式（兼容现有接口）
+                    # 确保初始状态是连续的numpy数组
+                    if isinstance(init_state, np.ndarray):
+                        init_state = np.ascontiguousarray(init_state, dtype=np.float64)
+                    
                     demo_initial_state = {
                         'task_name': [task_name],
                         'task_id': torch.tensor([task_idx]),
-                        'benchmark_init_state': init_state  # 🔥 新增字段标识基准状态
+                        'benchmark_init_state': init_state  # 确保是连续数组
                     }
                 else:
                     print(f"    📍 Rollout {rollout_idx+1}: 使用环境默认重置")
@@ -926,7 +930,14 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
                 )
                 
                 if episodes and len(episodes) > 0:
+                    # 修复：处理可能的NumPy数组success值
                     success = episodes[0].get('success', False)
+                    # 如果success是数组，使用.any()或.all()处理
+                    if hasattr(success, 'shape') and len(getattr(success, 'shape', [])) > 0:
+                        if hasattr(success, 'any'):
+                            success = success.any()  # 任一元素为真则为真
+                        else:
+                            success = bool(success)  # 兜底转换
                     task_successes.append(success)
                     print(f"      结果: {'✅成功' if success else '❌失败'}")
                 else:
@@ -937,19 +948,39 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
                 print(f"    ❌ Rollout {rollout_idx+1} 执行失败: {e}")
                 task_successes.append(False)
         
-        # 计算该任务的成功率
-        task_success_rate = np.mean(task_successes) if task_successes else 0.0
+        # 计算该任务的成功率 - 确保正确处理可能的NumPy数组
+        task_successes_processed = []
+        for success in task_successes:
+            # 处理可能的NumPy数组或其他复杂类型
+            if hasattr(success, 'shape') and len(getattr(success, 'shape', [])) > 0:
+                if hasattr(success, 'any'):
+                    success = success.any()
+                else:
+                    success = bool(success)
+            task_successes_processed.append(bool(success))
+            
+        task_success_rate = np.mean(task_successes_processed) if task_successes_processed else 0.0
         all_results[task_name] = task_success_rate
-        overall_successes.extend(task_successes)
+        overall_successes.extend(task_successes_processed)
         
-        print(f"  📊 任务 {task_name}: {task_success_rate:.2%} ({sum(task_successes)}/{len(task_successes)})")
+        print(f"  📊 任务 {task_name}: {task_success_rate:.2%} ({sum(task_successes_processed)}/{len(task_successes_processed)})")
     
-    # 计算总体成功率
-    overall_success_rate = np.mean(overall_successes) if overall_successes else 0.0
+    # 计算总体成功率 - 处理任意类型成功标记
+    overall_successes_processed = []
+    for success in overall_successes:
+        # 处理可能的NumPy数组或其他复杂类型
+        if hasattr(success, 'shape') and len(getattr(success, 'shape', [])) > 0:
+            if hasattr(success, 'any'):
+                success = success.any()
+            else:
+                success = bool(success)
+        overall_successes_processed.append(bool(success))
+        
+    overall_success_rate = np.mean(overall_successes_processed) if overall_successes_processed else 0.0
     all_results['overall_success_rate'] = overall_success_rate
     
     print(f"\n🎉 RIPT式评估完成!")
-    print(f"📊 总体成功率: {overall_success_rate:.2%} ({sum(overall_successes)}/{len(overall_successes)})")
+    print(f"📊 总体成功率: {overall_success_rate:.2%} ({sum(overall_successes_processed)}/{len(overall_successes_processed)})")
     print(f"📋 Per-task 成功率:")
     for task_name, success_rate in all_results.items():
         if task_name != 'overall_success_rate':

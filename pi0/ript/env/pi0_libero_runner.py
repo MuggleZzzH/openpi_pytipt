@@ -878,7 +878,15 @@ class LIBEROEnvRunner:
                     action_index += 1
                     
                     # 检查成功状态 - 优先使用info中的success，否则基于奖励判断（与4脚本保持一致）
-                    if info.get("success", False):
+                    # 修复：处理可能的NumPy数组success值
+                    success_value = info.get("success", False)
+                    if hasattr(success_value, 'shape') and len(getattr(success_value, 'shape', [])) > 0:
+                        if hasattr(success_value, 'any'):
+                            success_value = success_value.any()  # 任一元素为真则为真
+                        else:
+                            success_value = bool(success_value)  # 兜底转换
+                    
+                    if success_value:
                         success = True
                     # 如果info中没有success字段，使用与4_simple_train_ript.py相同的判断逻辑
                     elif total_reward > 0.5:
@@ -1483,7 +1491,15 @@ class LIBEROEnvRunner:
                         if self.rank == 0:
                             print(f"⚠️ 收集图像帧失败 (环境{i}): {e}")
                 
-                if infos[i].get("success", False) or episode['total_reward'] > 0.5:
+                # 修复：处理可能的NumPy数组success值
+                success_value = infos[i].get("success", False)
+                if hasattr(success_value, 'shape') and len(getattr(success_value, 'shape', [])) > 0:
+                    if hasattr(success_value, 'any'):
+                        success_value = success_value.any()  # 任一元素为真则为真
+                    else:
+                        success_value = bool(success_value)  # 兜底转换
+                
+                if success_value or episode['total_reward'] > 0.5:
                     episode['success'] = True
                 
                 # 完成条件：本步返回 done 或达到最大步数
