@@ -845,7 +845,7 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
         policy: 待评估的策略模型
         env_runner: 环境运行器
         config: 配置字典
-        rollouts_per_task: 每个任务要收集的总轨迹数量
+        rollouts_per_task: 每个任务的rollout次数
         
     Returns:
         dict: 包含per-task和overall成功率的评估结果
@@ -864,9 +864,6 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
     n_video_final = rollout_config.get('n_video_final', 1)  # 最终评估视频数
     n_video = n_video_final if is_final_eval else n_video_regular
     
-    # 获取并行环境数量
-    num_parallel_envs = int(rollout_config.get('num_parallel_envs', 2))
-    
     # 设置评估模式：固定随机种子确保可复现
     eval_seed = 42
     torch.manual_seed(eval_seed)
@@ -879,7 +876,6 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
     print(f"📊 评估配置:")
     print(f"  任务数量: {len(task_names)}")
     print(f"  每任务rollout数: {rollouts_per_task}")
-    print(f"  并行环境数: {num_parallel_envs}")
     print(f"  评估随机种子: {eval_seed}")
     print(f"  视频保存: {'🎬最终评估' if is_final_eval else '📹常规评估'} - {n_video} 个视频/任务")
     
@@ -928,80 +924,62 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
                 print(f"  ⚠️ 任务名无法映射到有效task_id，使用环境默认重置: {task_name}")
             task_init_states = []
         
-        # 执行该任务的多次rollout - 改进：批量收集轨迹
+        # 执行该任务的多次rollout
         task_successes = []
-        
-        # 计算需要执行的批次
-        num_batches = (rollouts_per_task + num_parallel_envs - 1) // num_parallel_envs
-        trajectories_collected = 0
-        
-        print(f"  📋 执行计划: {rollouts_per_task}条轨迹，分{num_batches}个批次收集（每批{num_parallel_envs}并行）")
-        
-        for batch_idx in range(num_batches):
-            # 计算本批次要收集的轨迹数量
-            batch_size = min(num_parallel_envs, rollouts_per_task - trajectories_collected)
-            if batch_size <= 0:
-                break
-                
-            print(f"    🔄 批次 {batch_idx+1}/{num_batches}: 收集{batch_size}条轨迹")
-            
-            # 🔥 关键：为本批次选择对应的初始状态
-            batch_init_states = []
-            if has_task_init_states := (len(task_init_states) > 0 if isinstance(task_init_states, list) else getattr(task_init_states, 'size', 0) > 0):
-                for i in range(batch_size):
-                    init_state_idx = (trajectories_collected + i) % len(task_init_states)
-                    init_state = task_init_states[init_state_idx]
-                    batch_init_states.append(init_state)
-                    print(f"      📍 轨迹 {trajectories_collected + i + 1}: 使用基准状态 {init_state_idx}")
-            
+        for rollout_idx in range(rollouts_per_task):
             try:
-                # 构造demo_initial_state格式（兼容现有接口）
-                if batch_init_states:
+                # 🔥 关键：使用基准初始状态池的循环索引（与RIPT对齐）
+                has_task_init_states = False
+                if isinstance(task_init_states, np.ndarray):
+                    has_task_init_states = (task_init_states.size > 0)
+                else:
+                    has_task_init_states = (len(task_init_states) > 0)
+                if has_task_init_states:
+                    init_state_idx = rollout_idx % len(task_init_states)
+                    init_state = task_init_states[init_state_idx]
+                    print(f"    📍 Rollout {rollout_idx+1}: 使用基准状态 {init_state_idx}")
+                    
+                    # 构造demo_initial_state格式（兼容现有接口）
                     # 确保初始状态是连续的numpy数组
-                    batch_init_states = np.ascontiguousarray(np.array(batch_init_states), dtype=np.float64)
+                    if isinstance(init_state, np.ndarray):
+                        init_state = np.ascontiguousarray(init_state, dtype=np.float64)
                     
                     demo_initial_state = {
-                        'task_name': [task_name] * batch_size,
-                        'task_id': torch.tensor([resolved_task_id if resolved_task_id is not None else 0] * batch_size),
-                        'benchmark_init_state': batch_init_states  # 批量状态
+                        'task_name': [task_name],
+                        'task_id': torch.tensor([resolved_task_id if resolved_task_id is not None else 0]),
+                        'benchmark_init_state': init_state  # 确保是连续数组
                     }
                 else:
-                    print(f"      📍 批次 {batch_idx+1}: 使用环境默认重置")
+                    print(f"    📍 Rollout {rollout_idx+1}: 使用环境默认重置")
                     demo_initial_state = None
                 
-                # 使用并行环境一次收集多条轨迹
-                # 关键修改：将num_rollouts设置为batch_size，每次真正收集batch_size条轨迹
+                # 🔥 禁用动态采样，每次只收集1个rollout
                 episodes = collect_rollouts_ript_vla_style(
-                    env_runner, task_name, batch_size,  # 每批收集batch_size条轨迹
-                    enable_dynamic_sampling=False,      # 🔥 评估时禁用
-                    stats_tracker=None,                 # 🔥 评估时禁用状态跟踪
+                    env_runner, task_name, 1,
+                    enable_dynamic_sampling=False,  # 🔥 评估时禁用
+                    stats_tracker=None,             # 🔥 评估时禁用状态跟踪
                     demo_initial_state=demo_initial_state,
-                    n_video=n_video if batch_idx == 0 else 0  # 🔥 视频保存：只在第一批次保存视频
+                    n_video=n_video if rollout_idx < n_video else 0  # 🔥 视频保存：前n个rollout保存视频
                 )
                 
-                # 处理收集到的轨迹
-                if episodes:
-                    for ep in episodes:
-                        # 修复：处理可能的NumPy数组success值
-                        success = ep.get('success', False)
-                        # 如果success是数组，使用.any()或.all()处理
-                        if hasattr(success, 'shape') and len(getattr(success, 'shape', [])) > 0:
-                            if hasattr(success, 'any'):
-                                success = success.any()  # 任一元素为真则为真
-                            else:
-                                success = bool(success)  # 兜底转换
-                        task_successes.append(success)
-                        trajectories_collected += 1
-                        print(f"      结果 #{trajectories_collected}: {'✅成功' if success else '❌失败'}")
-                        
-                        # 达到目标轨迹数量则停止
-                        if trajectories_collected >= rollouts_per_task:
-                            break
+                if episodes and len(episodes) > 0:
+                    # 修复：处理可能的NumPy数组success值
+                    success = episodes[0].get('success', False)
+                    # 如果success是数组，使用.any()或.all()处理
+                    if hasattr(success, 'shape') and len(getattr(success, 'shape', [])) > 0:
+                        if hasattr(success, 'any'):
+                            success = success.any()  # 任一元素为真则为真
+                        else:
+                            success = bool(success)  # 兜底转换
+                    task_successes.append(success)
+                    print(f"      结果: {'✅成功' if success else '❌失败'}")
                 else:
-                    print(f"      ❌ 批次 {batch_idx+1} 未收集到有效轨迹")
+                    print(f"      结果: ❌无效rollout")
+                    task_successes.append(False)
                     
             except Exception as e:
-                print(f"    ❌ 批次 {batch_idx+1} 执行失败: {e}")
+                print(f"    ❌ Rollout {rollout_idx+1} 执行失败: {e}")
+                task_successes.append(False)
         
         # 计算该任务的成功率 - 确保正确处理可能的NumPy数组
         task_successes_processed = []
@@ -1674,49 +1652,37 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
 
     # 🎬 最终评估（保存视频记录）
-    # 只有当最后一轮评估不是普通评估轮次，或者需要保存更多视频时才执行
-    rollout_config = config.get('rollout', {})
-    final_eval_needed = not eval_enabled or \
-                        (steps_done % eval_steps != 0) or \
-                        (rollout_config.get('n_video_final', 0) > rollout_config.get('n_video', 0))
-    
-    if final_eval_needed:
-        try:
-            print(f"\n🎬 开始最终评估（保存视频记录）...")
-            policy.model.eval()
-            n_video_final = int(rollout_config.get('n_video_final', 1))
-            final_eval_results = evaluate_ript_style_all_tasks(
-                policy, 
-                env_runner, 
-                config, 
-                rollouts_per_task=rollout_config.get('rollouts_per_env', 10),
-                is_final_eval=True  # 🔥 最终评估，保存视频
-            )
+    try:
+        print(f"\n🎬 开始最终评估（保存视频记录）...")
+        rollout_config = config.get('rollout', {})
+        final_eval_results = evaluate_ript_style_all_tasks(
+            policy, 
+            env_runner, 
+            config, 
+            rollouts_per_task=rollout_config.get('rollouts_per_env', 10),  # 最终评估可用更多rollout
+            is_final_eval=True  # 🔥 最终评估，保存视频
+        )
+        
+        if final_eval_results:
+            print(f"🏆 最终评估结果:")
+            print(f"   总体成功率: {final_eval_results.get('overall_success_rate', 0.0):.2%}")
+            for task_name, success_rate in final_eval_results.items():
+                if task_name != 'overall_success_rate':
+                    print(f"   {task_name}: {success_rate:.2%}")
             
-            if final_eval_results:
-                print(f"🏆 最终评估结果:")
-                print(f"   总体成功率: {final_eval_results.get('overall_success_rate', 0.0):.2%}")
-                for task_name, success_rate in final_eval_results.items():
-                    if task_name != 'overall_success_rate':
-                        print(f"   {task_name}: {success_rate:.2%}")
-                
-                # 保存最终评估结果
-                final_eval_path = output_dir / "final_evaluation_results.json"
-                with open(final_eval_path, 'w') as f:
-                    json.dump(final_eval_results, f, indent=2)
-                print(f"📄 最终评估结果已保存: {final_eval_path}")
-            
-        except Exception as e:
-            print(f"⚠️ 最终评估失败: {e}")
-            traceback.print_exc()
-    else:
-        print("\n📊 最后一轮已完成评估，跳过额外的最终评估")
-    
+            # 保存最终评估结果
+            final_eval_path = output_dir / "final_evaluation_results.json"
+            with open(final_eval_path, 'w') as f:
+                json.dump(final_eval_results, f, indent=2)
+            print(f"📄 最终评估结果已保存: {final_eval_path}")
+        
+    except Exception as e:
+        print(f"⚠️ 最终评估失败: {e}")
+        traceback.print_exc()
+
     print(f"\n🎉 RIPT-VLA风格训练完成!")
     print(f"📊 最终结果已保存: {final_results_path}")
     print(f"✨ 使用了简化的直接架构，减少了抽象层复杂度")
-
-    return policy
 
 def main():
     """主函数"""
