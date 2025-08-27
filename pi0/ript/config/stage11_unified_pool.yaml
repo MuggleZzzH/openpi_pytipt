@@ -52,7 +52,7 @@ dataset:
 
 # === 算法配置 ===
 algo:
-  demo_batch_size: 2
+  demo_batch_size: 1
   rloo_batch_size: 2  # 🔥 减少episodes数量避免OOM
   lr: 1e-5
   gradient_accumulation_steps: 2  # 🔥 增加累积步数补偿小batch
@@ -101,7 +101,7 @@ data_processing:
 
 # === 训练配置 ===
 training:
-  num_train_steps: 2  # 快速测试
+  num_train_steps: 1  # 快速测试
   seed: 42
   n_steps: 3
   rollout_steps: 1
@@ -148,7 +148,7 @@ features:
   
   # 动态采样配置
   dynamic_sampling:
-    enabled: true
+    enabled: false
     
   # 🔥 新增: 采样策略配置，与RIPT-VLA对齐
   sampling_strategy:

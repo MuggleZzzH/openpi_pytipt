@@ -1148,159 +1148,99 @@ class LIBEROEnvRunner:
         """
     
     def _run_parallel_episodes(self, env, env_name, all_init_states, env_num, save_video):
-        """运行真正的并行 episodes"""
+        """并行执行多个环境的episodes"""
+        
         if self.rank == 0:
             print(f"🚀 开始并行执行 {env_num} 个环境")
         
-        # 计算需要的轮次
-        eval_loop_num = (self.rollouts_per_env + env_num - 1) // env_num
-        count = 0
-        
-        while count < eval_loop_num:
-            # 选择当前轮次的初始状态
-            start_idx = count * env_num
-            # 始终生成 env_num 个索引，环形取模，避免空索引
-            if isinstance(all_init_states, list):
-                total = len(all_init_states)
-                if total == 0:
-                    current_init_states = None
-                    indices = []
-                else:
-                    indices = (np.arange(env_num) + start_idx) % total
-                    current_init_states = [all_init_states[i] for i in indices]
+        # 并行初始状态处理
+        if all_init_states and len(all_init_states) > 0:
+            # 计算每个环境的初始索引（使用循环索引确保不会超出范围）
+            if isinstance(all_init_states, list) and len(all_init_states) == 1:
+                # 单状态情形：所有环境使用同一状态（高效RLOO模式）
+                init_states = all_init_states[0]
+                if self.rank == 0:
+                    print(f"并行轮次 1/1, 使用同一状态初始化所有环境")
             else:
+                # 多状态情形：每个环境使用不同状态
                 total = len(all_init_states)
-                if total == 0:
-                    current_init_states = None
-                    indices = []
-                else:
+                start_idx = 0  # 起始索引，可用于后续扩展支持多批次
+                
+                # 确保索引永远不会越界 - 使用循环索引
+                if total > 0:
                     indices = (np.arange(env_num) + start_idx) % total
-                    current_init_states = all_init_states[indices]
-            
-            if self.rank == 0:
-                print(f"并行轮次 {count+1}/{eval_loop_num}, 状态索引: {indices}")
-            
-            # 并行执行 episodes
-            try:
-                results = self._run_single_parallel_batch(env, env_name, current_init_states, env_num, save_video)
-                
-                # 返回结果
-                for result in results:
-                    yield result
-                    
-            except Exception as e:
-                if self.rank == 0:
-                    print(f"并行批次执行失败: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            count += 1
-    
-    def _run_single_parallel_batch(self, env, env_name, init_states, env_num, save_video):
-        """执行单个并行批次 - 支持轻量级并行环境"""
-        # 检查环境类型
-        is_vector_env = hasattr(env, 'num_envs') or 'VectorEnv' in str(type(env))
-        
-        if not is_vector_env or env_num == 1:
-            # 使用批处理模拟并行（推荐策略）
-            return self._run_batch_simulated_parallel(env, env_name, init_states, save_video)
-        
-        # 真实并行环境处理
-        if self.rank == 0:
-            print(f"🚀 执行真实并行处理 ({env_num} 个环境)")
-        
-        # 重置所有环境
-        obs_any = env.reset()
-        # 默认不在并行模式使用 set_init_state（避免 MuJoCo qpos 维度不匹配导致子进程崩溃）
-        use_parallel_init = False
-        try:
-            if getattr(self, 'config', None) and hasattr(self.config, 'features'):
-                use_parallel_init = bool(getattr(self.config.features, 'use_parallel_init_state', False))
-                if self.rank == 0:
-                    print(f"🔧 并行状态设置配置: use_parallel_init_state = {use_parallel_init}")
-        except Exception as e:
-            use_parallel_init = False
-            if self.rank == 0:
-                print(f"⚠️ 读取并行状态配置失败: {e}")
-                print(f"   config存在: {getattr(self, 'config', None) is not None}")
-                if getattr(self, 'config', None):
-                    print(f"   features存在: {hasattr(self.config, 'features')}")
-                    if hasattr(self.config, 'features'):
-                        print(f"   features内容: {self.config.features}")
-
-        if self.rank == 0:
-            print(f"🔧 最终决定: use_parallel_init = {use_parallel_init}")
-        if use_parallel_init and init_states is not None:
-            try:
-                # 🔥 修复：确保状态格式正确
-                # 🔥 直接处理状态，确保维度正确
-                if isinstance(init_states, list) and len(init_states) > 0:
-                    # 确保有足够的状态给每个环境
-                    if len(init_states) < env_num:
-                        # 重复状态以填满所有环境
-                        processed_states = []
-                        for i in range(env_num):
-                            state_idx = i % len(init_states)
-                            processed_states.append(init_states[state_idx])
-                    else:
-                        processed_states = init_states[:env_num]
-                elif isinstance(init_states, np.ndarray):
-                    # 如果是numpy数组，确保形状正确
-                    if init_states.ndim == 1:
-                        # 单个状态，复制给所有环境
-                        processed_states = [init_states] * env_num
-                    elif init_states.ndim == 2:
-                        # 多个状态
-                        if len(init_states) < env_num:
-                            # 重复状态
-                            processed_states = []
-                            for i in range(env_num):
-                                state_idx = i % len(init_states)
-                                processed_states.append(init_states[state_idx])
-                        else:
-                            processed_states = init_states[:env_num]
-                    else:
-                        # 3D或更高维，取第一个状态并复制
-                        first_state = init_states[0, 0] if init_states.ndim == 3 else init_states[0]
-                        processed_states = [first_state] * env_num
-                else:
-                    processed_states = None
-                
-                if self.rank == 0 and processed_states is not None:
-                    print(f"🔧 处理后的并行状态: 形状={np.array(processed_states).shape}, 类型={np.array(processed_states).dtype}")
-
-                # 🔥 修复：确保状态数据能正确序列化到子进程
-                if processed_states is not None and len(processed_states) > 0:
-                    # 🔥 修复：使用原始RIPT的正确方式 - 通过reset方法传递初始状态
-                    # 确保状态数据格式正确（numpy数组格式，与原始RIPT保持一致）
-                    if isinstance(processed_states, list):
-                        # 转换为numpy数组，保持[env_num, state_dim]格式
-                        init_states_array = np.array(processed_states, dtype=np.float64)
-                    else:
-                        init_states_array = processed_states
-                    
-                    # 🔥 关键修复：使用reset方法而不是set_init_state方法
-                    obs_any = env.reset(init_states=init_states_array)
+                    init_states = [all_init_states[i] for i in indices]
                     if self.rank == 0:
-                        print(f"✅ 并行状态设置成功，状态数量: {len(init_states_array)}")
+                        print(f"并行轮次 1/1, 状态索引: {indices}")
                 else:
-                    # 没有初始状态时，使用普通reset
-                    obs_any = env.reset()
-            except Exception as e:
-                if self.rank == 0:
-                    print(f"⚠️ 并行状态设置失败: {e}")
-                    print(f"   状态类型: {type(init_states)}")
-                    if hasattr(init_states, 'shape'):
-                        print(f"   状态形状: {init_states.shape}")
-                    print(f"   状态数据类型: {init_states.dtype if hasattr(init_states, 'dtype') else 'N/A'}")
-                # 重新reset环境
-                obs_any = env.reset()
+                    # 空状态列表情况
+                    init_states = None
+                    if self.rank == 0:
+                        print(f"⚠️ 空初始状态列表，使用环境默认重置")
         else:
+            # 无初始状态情况
+            init_states = None
             if self.rank == 0:
-                if init_states is not None:
-                    print("ℹ️ 并行模式下跳过状态设置，使用随机初始化（避免MuJoCo状态格式不兼容）")
+                print(f"⚠️ 未提供初始状态，使用环境默认重置")
+        
+        # 处理并设置初始状态
+        try:
+            if init_states is not None:
+                if self.rank == 0:
+                    print(f"🚀 执行真实并行处理 ({env_num} 个环境)")
+                
+                # 为并行环境处理初始状态
+                init_states = self._process_init_states_for_parallel(init_states, env_num)
+                
+                # 选择合适的状态设置方法
+                if self.use_parallel_init_state:
+                    if self.rank == 0:
+                        print(f"🔧 并行状态设置配置: use_parallel_init_state = {self.use_parallel_init_state}")
+                        print(f"🔧 最终决定: use_parallel_init = {self.use_parallel_init_state}")
+                    
+                    # 处理并行状态
+                    if self.rank == 0 and init_states is not None:
+                        print(f"🔧 处理后的并行状态: 形状={np.array(init_states).shape}, 类型={np.array(init_states).dtype}")
+
+                    # 🔥 修复：确保状态数据能正确序列化到子进程
+                    if init_states is not None and len(init_states) > 0:
+                        # 🔥 修复：使用原始RIPT的正确方式 - 通过reset方法传递初始状态
+                        # 确保状态数据格式正确（numpy数组格式，与原始RIPT保持一致）
+                        if isinstance(init_states, list):
+                            # 转换为numpy数组，保持[env_num, state_dim]格式
+                            init_states_array = np.array(init_states, dtype=np.float64)
+                        else:
+                            init_states_array = processed_states
+                        
+                        # 🔥 关键修复：使用reset方法而不是set_init_state方法
+                        obs_any = env.reset(init_states=init_states_array)
+                        if self.rank == 0:
+                            print(f"✅ 并行状态设置成功，状态数量: {len(init_states_array)}")
+                    else:
+                        # 没有初始状态时，使用普通reset
+                        obs_any = env.reset()
                 else:
-                    print("ℹ️ 并行模式下使用随机初始化")
+                    if self.rank == 0:
+                        print("⚠️ 使用简化并行模式（每个环境单独重置）")
+                    obs_any = env.reset()
+            else:
+                if self.rank == 0:
+                    if init_states is not None:
+                        print("ℹ️ 并行模式下跳过状态设置，使用随机初始化（避免MuJoCo状态格式不兼容）")
+                    else:
+                        print("ℹ️ 并行模式下使用随机初始化")
+                obs_any = env.reset()
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️ 并行状态设置失败: {e}")
+                print(f"   状态类型: {type(init_states)}")
+                if hasattr(init_states, 'shape'):
+                    print(f"   状态形状: {init_states.shape}")
+                print(f"   状态数据类型: {init_states.dtype if hasattr(init_states, 'dtype') else 'N/A'}")
+            # 重新reset环境
+            obs_any = env.reset()
+        
+        # 确保观察结果格式一致
         obs_list = self._ensure_list_of_dict_obs(obs_any, env_num)
         
         if self.rank == 0:
@@ -1308,7 +1248,7 @@ class LIBEROEnvRunner:
         
         # 对每个环境进行热身
         dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-        for warmup_step in range(20):
+        for warmup_step in range(10):  # 减少热身步数，只做必要的热身
             # 🔑 确保actions数组长度与环境数量完全匹配
             actions = [dummy_action.copy() for _ in range(env_num)]
             if self.rank == 0 and warmup_step == 0:
@@ -1345,113 +1285,80 @@ class LIBEROEnvRunner:
                         print(f"⚠️ 收集初始图像失败 (环境{i}): {e}")
                     episodes_data[i]['rollout_images'] = None
         
+        # 执行每个环境的episode
         max_steps = self.max_steps
         all_done = False
         
-        # 并行执行steps - 关键优化：模型推理在主进程中进行
-        while not all_done:
-            # 🔥 批量处理所有环境的观测 (避免逐个推理)
-            need_inference_indices = []
-            observations_to_infer = []
+        while not all_done and max_steps > 0:
+            max_steps -= 1
             
-            # 第一步：识别需要推理的环境
-            for i, obs in enumerate(obs_list):
-                episode = episodes_data[i]
-                
-                if episode['dones'] and len(episode['dones']) > 0 and episode['dones'][-1]:
-                    # 环境已完成，跳过
-                    continue
-                
-                # 检查是否需要推理
-                if (episode['action_buffer'] is None or 
-                    episode['action_index'] >= episode['action_buffer'].shape[0]):
-                    need_inference_indices.append(i)
-                    observations_to_infer.append(obs)
+            # 获取所有环境的动作
+            active_obs = []
+            active_indices = []
+            for i, episode in enumerate(episodes_data):
+                if not episode['completed']:
+                    active_obs.append(episode['observations'][-1])
+                    active_indices.append(i)
             
-            # 第二步：批量推理 (关键优化: 一次推理多个观测)
-            if observations_to_infer:
-                prompts_for_obs = None
-                if hasattr(self, '_vector_env_prompts'):
-                    prompts_for_obs = [self._vector_env_prompts[i] if i < len(self._vector_env_prompts) else env_name for i in need_inference_indices]
-                batch_actions = self._batch_policy_inference(observations_to_infer, env_name, prompts_for_obs)
+            # 如果所有环境都完成，退出循环
+            if not active_obs:
+                break
                 
-                # 分配推理结果到对应的episode
-                for batch_idx, env_idx in enumerate(need_inference_indices):
-                    episode = episodes_data[env_idx]
-                    obs = obs_list[env_idx]
+            # 批量推理获取动作
+            with torch.no_grad():
+                try:
+                    # 批量处理所有活跃环境的观察
+                    # 形成批量输入，调用策略模型
+                    model_inputs = preprocess_obs_pi0(active_obs, device=self.device)
                     
-                    # 处理动作与状态偏移
-                    action_buffer = batch_actions[batch_idx]
+                    # 🔥 修复：支持CFG_scale参数
+                    if hasattr(self, 'cfg_scale') and self.cfg_scale is not None:
+                        if self.rank == 0 and len(active_obs) > 1:
+                            print(f"✅ 使用CFG Scale (批推理): {self.cfg_scale}")
+                        actions = self.policy.predict_actions(
+                            model_inputs, 
+                            cfg_scale=self.cfg_scale
+                        )
+                    else:
+                        actions = self.policy.predict_actions(model_inputs)
                     
-                    # 🔥 关键修复：窗口一致的残差基准
-                    # 获取推理时刻的状态偏移（整个50步动作序列使用同一个基准）
-                    import robosuite.utils.transform_utils as T
-                    unnorm_state = np.concatenate([
-                        obs["robot0_eef_pos"],
-                        T.quat2axisangle(obs["robot0_eef_quat"]),
-                        obs["robot0_gripper_qpos"],
-                    ], dtype=np.float32)
+                    # 转换为NumPy数组以便进行环境交互
+                    actions_np = actions.cpu().numpy()
                     
-                    # 对整个动作序列应用同一个状态偏移（前6维：位置+旋转）
-                    action_buffer[:, :6] += unnorm_state[None, :6]
+                    # 将动作分配给活跃环境
+                    all_actions = [None] * len(episodes_data)
+                    for idx, act_idx in enumerate(active_indices):
+                        all_actions[act_idx] = actions_np[idx]
                     
-                    episode['action_buffer'] = action_buffer
-                    episode['action_index'] = 0
+                    if self.rank == 0 and len(active_obs) > 1:
+                        print(f"🚀 批推理成功：{len(active_obs)} envs -> 1次GPU调用")
+                    
+                except Exception as e:
+                    # 推理失败，使用随机动作
+                    if self.rank == 0:
+                        print(f"⚠️ 批量推理失败: {e}")
+                        print(f"   使用随机动作代替")
+                    all_actions = [np.random.uniform(-1, 1, (7,)) for _ in range(len(episodes_data))]
             
-            # 第三步：为所有环境构建动作数组（确保顺序和数量匹配）
+            # 准备执行动作（仅针对未完成的环境）
             actions_to_execute = []
-            for i, obs in enumerate(obs_list):
-                episode = episodes_data[i]
-                
-                if episode['completed'] or (episode['dones'] and len(episode['dones']) > 0 and episode['dones'][-1]):
-                    # 环境已完成，使用dummy动作
-                    actions_to_execute.append(dummy_action)
-                else:
-                    # 获取当前动作（应该已经有action_buffer了）
-                    if episode['action_buffer'] is not None:
-                        current_action = episode['action_buffer'][episode['action_index'], :7]
-                        actions_to_execute.append(current_action)
-                        episode['action_index'] += 1
+            for i, episode in enumerate(episodes_data):
+                if not episode['completed']:
+                    action = all_actions[i]
+                    
+                    # 对动作进行必要的处理（裁剪等）
+                    if hasattr(env, 'action_space'):
+                        action_space = env.action_space
+                        if hasattr(action_space, 'low') and hasattr(action_space, 'high'):
+                            # 使用环境提供的动作空间范围进行裁剪
+                            low, high = action_space.low, action_space.high
+                            actions_to_execute.append(np.clip(action, low, high))
+                        else:
+                            # 使用默认范围[-1, 1]进行裁剪
+                            actions_to_execute.append(np.clip(action, -1, 1))
                     else:
-                        # 备用：如果还是没有action_buffer，使用dummy动作
-                        actions_to_execute.append(dummy_action)
-            
-            # 🔧 动作裁剪（并行路径可配置禁用）
-            disable_clip = False
-            try:
-                if self.config and hasattr(self.config, 'features'):
-                    disable_clip = bool(getattr(self.config.features, 'disable_action_clipping', False))
-                elif isinstance(self.config, dict):
-                    disable_clip = bool(self.config.get('features', {}).get('disable_action_clipping', False))
-            except Exception:
-                disable_clip = False
-
-            if not disable_clip:
-                if hasattr(env, 'action_space'):
-                    action_space = env.action_space
-                    if hasattr(action_space, 'low') and hasattr(action_space, 'high'):
-                        # 单环境动作空间
-                        action_low = action_space.low
-                        action_high = action_space.high
-                        actions_to_execute = [np.clip(action, action_low, action_high) for action in actions_to_execute]
-                    elif hasattr(action_space, 'spaces'):
-                        # 向量环境，每个子环境有独立的动作空间
-                        clipped_actions = []
-                        for i, action in enumerate(actions_to_execute):
-                            if i < len(action_space.spaces):
-                                sub_space = action_space.spaces[i]
-                                clipped_action = np.clip(action, sub_space.low, sub_space.high)
-                            else:
-                                # 使用默认范围[-1, 1]
-                                clipped_action = np.clip(action, -1, 1)
-                            clipped_actions.append(clipped_action)
-                        actions_to_execute = clipped_actions
-                    else:
-                        # 使用默认范围[-1, 1]进行裁剪
-                        actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
-                else:
-                    # 没有action_space信息，使用默认范围[-1, 1]
-                    actions_to_execute = [np.clip(action, -1, 1) for action in actions_to_execute]
+                        # 没有action_space信息，使用默认范围[-1, 1]
+                        actions_to_execute.append(np.clip(action, -1, 1))
             
             # 并行执行动作
             step_out = env.step(actions_to_execute)
@@ -1512,7 +1419,7 @@ class LIBEROEnvRunner:
                     all_done = False
                     break
         
-        # 🎬 保存视频并返回结果
+        # 🎬 保存视频并返回结果 - 关键修改：返回所有环境的结果，而不是只返回第一个
         results = []
         for i, episode in enumerate(episodes_data):
             # 保存视频（如果启用）
@@ -1548,24 +1455,21 @@ class LIBEROEnvRunner:
                         print(f"✅ 已保存视频 (环境{i}): {video_path}")
                 except Exception as e:
                     if self.rank == 0:
-                        print(f"⚠️ 保存视频失败 (环境{i}): {e}")
+                        print(f"⚠️ 视频保存失败 (环境{i}): {e}")
+                
+                # 清除大型图像数据以节省内存
+                episode['rollout_images'] = None
             
-            episode_data = {
-                "observations": episode['observations'],
-                "actions": episode['actions'],
-                "rewards": episode['rewards'],
-                "dones": episode['dones'],
-                "infos": episode['infos'],
-                "task": self._vector_env_prompts[i] if hasattr(self, '_vector_env_prompts') and i < len(self._vector_env_prompts) else env_name,
-            }
-            
-            # 添加视频路径信息
-            if video_path:
-                episode_data["video_path"] = str(video_path)
-            
-            results.append((episode['success'], episode['total_reward'], episode_data))
-        
-        return results
+            # 向上层返回标准化结果
+            yield (episode['success'], episode['total_reward'], {
+                'observations': episode['observations'],
+                'actions': episode['actions'],
+                'rewards': episode['rewards'],
+                'dones': episode['dones'],
+                'infos': episode['infos'],
+                'video_path': video_path,
+                'initial_state': init_states[i] if init_states is not None and i < len(init_states) else None
+            })
     
     def _batch_policy_inference(self, observations, env_name, prompts_for_obs=None):
         """批量模型推理 - 避免逐个推理提高效率"""
