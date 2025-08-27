@@ -27,9 +27,7 @@ import yaml
 import traceback
 import time
 import logging
-import warnings
 from tqdm import tqdm
-from tqdm.auto import tqdm as tqdm_auto
 from tqdm.contrib.logging import logging_redirect_tqdm
 
 # 🔥 早期设置multiprocessing，避免子进程重复设置
@@ -56,7 +54,10 @@ project_root = current_file.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-# 顶层打印移到main函数中，避免子进程重复输出
+# 🔥 顶层打印已移入main()，避免子进程重复输出
+# 仅在非子进程导入时可能显示（子进程通过PI0_SILENT_IMPORT控制）
+if os.environ.get("PI0_SILENT_IMPORT") != "1":
+    pass  # 保留静默，实际打印在main()中
 
 class RolloutStatsTracker:
     """
@@ -73,6 +74,7 @@ class RolloutStatsTracker:
         if stats_path and Path(stats_path).exists():
             self._load_stats()
         
+        # 🔥 改用logger，避免子进程重复输出
         logger = logging.getLogger(__name__)
         logger.debug(f"🔧 RolloutStatsTracker初始化:")
         logger.debug(f"  跳过阈值: {rollout_skip_threshold}")
@@ -221,41 +223,52 @@ class RolloutStatsTracker:
 try:
     from omegaconf import OmegaConf, DictConfig
     OMEGACONF_AVAILABLE = True
+    print("✓ OmegaConf配置管理已启用")
 except ImportError:
     OMEGACONF_AVAILABLE = False
+    print("⚠️ OmegaConf不可用，使用基础YAML加载")
 
-# 🔥 懒加载重依赖模块，避免子进程重复导入
-# 这些导入移到相应函数内部，只在主进程需要时加载
-PI0Policy = None
-BinarySuccessReward = None  
-PI0_CFG_Adapter = None
-LIBEROEnvRunner = None
-
-# 标志位
-RIPT_VLA_RUNNER_AVAILABLE = False
-ORIGINAL_RUNNER_AVAILABLE = True  # 假设可用，实际在函数内检查
-
-def lazy_import_core_modules():
-    """懒加载核心模块，只在主进程调用"""
-    global PI0Policy, BinarySuccessReward, PI0_CFG_Adapter, LIBEROEnvRunner, ORIGINAL_RUNNER_AVAILABLE
+# 导入核心模块
+try:
+    print("正在导入核心模块...")
     
+    # PI0策略
+    from pi0.modeling_pi0 import PI0Policy
+    print("✓ PI0策略模块")
+    
+    # RIPT组件 - 只导入必需的
+    from pi0.ript.reward_function import BinarySuccessReward
+    from pi0.ript.algos.rl_optimizers.pi0_cfg_interface import PI0_CFG_Adapter
+    print("✓ RIPT核心组件")
+
+    # 🔥 使用RIPT对齐的数据加载器（修复MuJoCo状态问题）
+    print("✓ 使用RIPT对齐数据加载器")
+    
+    # # 导入简化的环境runner
+    # try:
+    #     from pi0.ript.env.pi0_libero_runner_ript_vla import PI0LiberoRunner
+    #     RIPT_VLA_RUNNER_AVAILABLE = True
+    #     print("✓ RIPT-VLA Runner")
+    # except ImportError as e:
+    #     print(f"⚠️ RIPT-VLA runner导入失败: {e}")
+    #     RIPT_VLA_RUNNER_AVAILABLE = False
+    # 默认关闭RIPT-VLA Runner（若上方导入被注释或失败时保持为False）
+    RIPT_VLA_RUNNER_AVAILABLE = False
+        
+    # 备用导入原有runner
     try:
-        # PI0策略
-        from pi0.modeling_pi0 import PI0Policy
-        
-        # RIPT组件 - 只导入必需的
-        from pi0.ript.reward_function import BinarySuccessReward
-        from pi0.ript.algos.rl_optimizers.pi0_cfg_interface import PI0_CFG_Adapter
-        
-        # 备用导入原有runner
         from pi0.ript.env.pi0_libero_runner import LIBEROEnvRunner
         ORIGINAL_RUNNER_AVAILABLE = True
-        
-        return True
-        
+        print("✓ 原有LIBEROEnvRunner")
     except ImportError as e:
+        print("⚠️ 原有runner也不可用")
         ORIGINAL_RUNNER_AVAILABLE = False
-        return False
+    
+    print("✓ 所有模块导入完成")
+    
+except ImportError as e:
+    print(f"❌ 模块导入失败: {e}")
+    sys.exit(1)
 
 def load_config(config_path: str):
     """加载配置文件（优先使用OmegaConf，便于属性访问）"""
@@ -286,14 +299,7 @@ def load_config(config_path: str):
 
 def create_policy_and_optimizer(config: Dict[str, Any]):
     """创建策略和优化器（RIPT-VLA风格）"""
-    import logging
-    logger = logging.getLogger(__name__)
-    
-    # 🔥 懒加载核心模块
-    if not lazy_import_core_modules():
-        raise ImportError("❌ 核心模块导入失败")
-    
-    logger.debug("正在加载PI0策略...")
+    print("正在加载PI0策略...")
     
     policy_path = config['policy_path']
     policy = PI0Policy.from_pretrained(policy_path)
@@ -302,7 +308,7 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     policy_config = config.get('policy', {})
     cfg_enabled = policy_config.get('cfg_enabled', True)  # 默认启用以保持兼容性
 
-    logger.debug(f"🔧 配置CFG功能: {'启用' if cfg_enabled else '禁用'}")
+    print(f"🔧 配置CFG功能: {'启用' if cfg_enabled else '禁用'}")
     policy.model.cfg_enabled = cfg_enabled
     if hasattr(policy, 'config'):
         policy.config.cfg_enabled = cfg_enabled
@@ -847,13 +853,12 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
     Returns:
         dict: 包含per-task和overall成功率的评估结果
     """
-    logger = logging.getLogger(__name__)
-    logger.info("🎯 开始RIPT式全任务评估...")
+    print("\n🎯 开始RIPT式全任务评估...")
     
     # 获取任务列表
     task_names = config.get('task', {}).get('task_names_to_use', [])
     if not task_names:
-        logger.warning("⚠️ 没有指定评估任务，跳过评估")
+        print("⚠️ 没有指定评估任务，跳过评估")
         return {}
     
     # 🔥 获取视频保存配置
@@ -870,13 +875,16 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
     env_runner.rollouts_per_env = rollouts_per_task
     env_runner.num_parallel_envs = rollout_config.get('num_parallel_envs', original_num_parallel_envs)
     
-    logger.debug(f"📊 评估配置:")
-    logger.debug(f"  任务数量: {len(task_names)}")
-    logger.debug(f"  每任务rollout数: {rollouts_per_task}")
-    logger.debug(f"  评估并行数: {env_runner.num_parallel_envs}")
-    logger.debug(f"  视频保存: {'🎬最终评估' if is_final_eval else '📹常规评估'} - {n_video} 个视频/任务")
+    print(f"📊 评估配置:")
+    print(f"  任务数量: {len(task_names)}")
+    print(f"  每任务rollout数: {rollouts_per_task}")
+    print(f"  评估并行数: {env_runner.num_parallel_envs}")
+    print(f"  视频保存: {'🎬最终评估' if is_final_eval else '📹常规评估'} - {n_video} 个视频/任务")
     
     try:
+        # 设置logger
+        logger = logging.getLogger(__name__)
+        
         # 设置评估模式：固定随机种子确保可复现
         eval_seed = 42
         torch.manual_seed(eval_seed)
@@ -894,7 +902,7 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
         )
         
         if not results:
-            logger.warning("⚠️ runner.run 返回空结果")
+            print("⚠️ runner.run 返回空结果")
             return {}
         
         # 解析 runner.run 的返回结果，转换为兼容格式
@@ -909,10 +917,8 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
         for task_name, success_rate in rollout_success_rate.items():
             all_results[task_name] = success_rate
             
-        # 关键结果输出到控制台
-        logger.info(f"🎉 RIPT式评估完成! 总体成功率: {overall_success_rate:.2%}")
-        
-        # 详细per-task结果记录到文件
+        logger.info(f"🎉 RIPT式评估完成!")
+        logger.info(f"📊 总体成功率: {overall_success_rate:.2%}")
         logger.debug(f"📋 Per-task 成功率:")
         for task_name, success_rate in rollout_success_rate.items():
             logger.debug(f"  {task_name}: {success_rate:.2%}")
@@ -1052,6 +1058,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     # 🔥 验证随机采样效果
     task_names = config.get('task', {}).get('task_names_to_use', ['default_task'])
     if len(task_names) > 1:
+        logger.debug("验证随机采样效果...")
         verify_random_sampling_effectiveness(config, task_names, max_samples=20)
     
     # 🔥 设置数值优化和显存管理
@@ -1068,7 +1075,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     exp_name = config.get('exp_name', 'ript_vla_style_train')
     output_dir = output_dir / f"{exp_name}_{timestamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.debug(f"输出目录详情: {output_dir}")
+    print(f"输出目录: {output_dir}")
     
     # 创建策略和优化器
     policy, optimizer, device = create_policy_and_optimizer(config)
@@ -1250,15 +1257,15 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     steps_done = 0
     max_collection_retries = int(config.get('training', {}).get('max_collection_retries', 100))
     
-    # 创建训练进度条
-    with tqdm_auto(total=num_train_steps, desc="训练进度", unit="step") as pbar:
+    # 🎯 添加训练进度条
+    with tqdm(total=num_train_steps, desc="训练进度", unit="step", dynamic_ncols=True) as pbar:
         while steps_done < num_train_steps:
             step_start_time = time.time()
             torch.cuda.reset_peak_memory_stats()  # 重置峰值监控
             
             logger.debug(f"=== 训练步骤 {steps_done + 1}/{num_train_steps} ===")
-            logger.debug(f"GPU内存状态: 步骤开始")
-        
+            # print_gpu_memory("步骤开始")  # 移到debug级别
+            
             # 1. 按组收集rollouts（带重试，解耦demo_batch_size与rloo_batch_size）
             all_collected_episodes = []
             successful_groups = 0
@@ -1272,6 +1279,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 all_collected_episodes = []
                 successful_groups = 0
 
+                # 记录当前步骤选择的任务（用于进度条显示）
+                current_step_task = None
+                
                 for group_idx in range(demo_batch_size):
                     logger.debug(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
 
@@ -1281,10 +1291,13 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                         if len(task_names) > 1:
                             # 🔥 多任务环境：随机选择任务，与RIPT-VLA对齐
                             tname = random.choice(task_names)
-                            logger.info(f"组{group_idx} -> 任务 {tname}")  # 关键信息：任务选择结果
+                            if group_idx == 0:  # 记录第一组的任务用于进度条显示
+                                current_step_task = tname
+                            logger.debug(f"  🎲 随机任务选择: 组{group_idx} -> 任务 {tname}")
                         else:
                             # 单任务环境：直接使用唯一任务
                             tname = task_names[0]
+                            current_step_task = tname
                             logger.debug(f"  📍 单任务模式: 组{group_idx} -> 任务 {tname}")
                     
                         try:
@@ -1307,18 +1320,17 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                             try:
                                 demo_batch = next(demo_data_iter)
                                 demo_id = demo_batch.get('demo_id', [None])[0]
-                                logger.debug(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                                print(f"  📋 使用子demo: {demo_id} (任务{demo_batch['task_id'][0].item()})")
                             except StopIteration:
                                 demo_data_iter = iter(demo_dataloader)
                                 demo_batch = next(demo_data_iter)
                                 demo_id = demo_batch.get('demo_id', [None])[0]
-                                logger.debug(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
+                                print(f"  📋 重新开始demo迭代: 子demo {demo_id} (任务{demo_batch['task_id'][0].item()})")
                             except Exception as e:
-                                logger.warning(f"  ⚠️ Demo获取失败: {e}")
+                                print(f"  ⚠️ Demo获取失败: {e}")
                                 demo_batch = None
-                    
-                    # 🔥 修复变量名错误：step改为steps_done
-                    tname = (task_names[steps_done % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
+                        
+                        tname = (task_names[step % len(task_names)]) if not demo_batch else demo_batch['task_name'][0]
 
                     # 🔥 获取训练时的视频保存配置
                     training_save_video = config.get('features', {}).get('save_video', False)
@@ -1328,55 +1340,60 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     group_episodes = collect_rollouts_ript_vla_style(
                         env_runner, tname,  # 🔥 使用轮询选择的任务名
                         rloo_batch_size,
-                        enable_dynamic_sampling=False,  # 🔥 训练期禁用动态采样，避免无限重试
+                        enable_dynamic_sampling=config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False),
                         stats_tracker=stats_tracker,
                         demo_initial_state=demo_batch,  # 🔥 传递对应任务的demo初始状态
                         n_video=training_n_video  # 🔥 训练时视频保存：使用features配置
                     )
+                
+                if group_episodes:
+                    successes = [ep.get('success', False) for ep in group_episodes]
                     
-                    if group_episodes:
-                        successes = [ep.get('success', False) for ep in group_episodes]
+                    # 🔥 检查组级动态采样：只在启用时才丢弃全0或全1的组
+                    dynamic_sampling_enabled = config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
+                    
+                    if dynamic_sampling_enabled and len(successes) > 0 and (all(successes) or not any(successes)):
+                        print(f"⚠️ 组 {group_idx + 1} 被动态采样丢弃 (uniform successes: {all(successes)})")
+                    else:
                         all_collected_episodes.extend(group_episodes)
                         successful_groups += 1
-                        logger.debug(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，成功率 {np.mean(successes):.2%}")
-                    else:
-                        logger.debug(f"❌ 组 {group_idx + 1} 收集失败")
-            
+                        
+                        if dynamic_sampling_enabled:
+                            print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
+                                  f"成功率 {np.mean(successes):.2%}")
+                        else:
+                            print(f"✅ 组 {group_idx + 1} 收集成功：{len(group_episodes)} episodes，"
+                                  f"成功率 {np.mean(successes):.2%} (动态采样已禁用)")
+
+                else:
+                    print(f"❌ 组 {group_idx + 1} 收集失败")
+                
                 # 单次尝试结束
                 
-                # 🔥 for循环结束后，检查是否收集到有效数据
-                # 🔥 定期保存统计数据（按已完成步数节奏）
-                if steps_done % 5 == 0:
-                    stats_tracker.save_stats()
-                
-                logger.debug(f"📊 组收集完成(尝试 {collection_attempt}): {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
-                logger.debug("GPU内存状态: 收集完成")
-                
-                if not all_collected_episodes:
-                    if collection_attempt < max_collection_retries:
-                        logger.warning("⚠️ 未收集到有效episodes，继续重试收集")
-                        continue  # 回到收集重试while
-                    else:
-                        # 🔥 添加硬限制：防止无限重试
-                        logger.error(f"❌ 达到最大收集重试次数({max_collection_retries})，强制跳过此步骤")
-                        logger.error("   可能原因：环境配置问题、任务过难、或采样策略过严")
-                        all_collected_episodes = []  # 确保外层while退出
-                        break  # 跳出收集重试while，继续下一训练步
-        
-            # 🔥 检查是否收集到有效数据
+            # 🔥 定期保存统计数据（按已完成步数节奏）
+            if steps_done % 5 == 0:
+                stats_tracker.save_stats()
+            
+            print(f"📊 组收集完成(尝试 {collection_attempt}): {successful_groups}/{demo_batch_size} 组成功，总episodes: {len(all_collected_episodes)}")
+            print_gpu_memory("收集完成")
+            
             if not all_collected_episodes:
-                logger.warning(f"⚠️ 第 {steps_done + 1} 步收集失败，跳过此步骤")
-                continue  # 跳过此步骤，继续下一步
+                if collection_attempt < max_collection_retries:
+                    print("⚠️ 未收集到有效episodes，继续重试收集")
+                    continue  # 回到收集重试while
+                else:
+                    print("⚠️ 达到最大收集重试次数，仍未收集到有效episodes，将继续重试以满足严格条件")
+                    continue  # 持续重试，不增加steps_done
             
             # 2. 计算优势（正宗RLOO方法）
             advantages = compute_advantages_rloo(all_collected_episodes, rloo_batch_size=rloo_batch_size)
-            logger.debug("GPU内存状态: 优势计算完成")
+            print_gpu_memory("优势计算完成")
             
             # 3. 更新策略（带配置传递以支持梯度累积）
             loss = update_policy_ript_vla_style(
                 policy, optimizer, cfg_adapter, all_collected_episodes, advantages, device, config
             )
-            logger.debug("GPU内存状态: 策略更新完成")
+            print_gpu_memory("策略更新完成")
             
             # 步数仅在成功收集并完成更新后递增
             steps_done += 1
@@ -1397,19 +1414,17 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             }
             all_training_metrics.append(step_metrics)
             
-            # 获取当前任务信息用于进度条显示
-            current_task_info = "multi" if len(task_names) > 1 else task_names[0] if task_names else "unknown"
-            
-            # 更新进度条
-            pbar.update(1)
+            # 🎯 更新进度条 (控制台简洁显示)
+            task_display = current_step_task or "multi"
             pbar.set_postfix({
-                'task': current_task_info[:8] + '...' if len(current_task_info) > 10 else current_task_info,
+                'task': task_display[:10],  # 任务名缩短显示
                 'succ': f'{success_rate:.2%}',
                 'loss': f'{loss:.4f}',
                 'time': f'{step_time:.1f}s'
             })
+            pbar.update(1)
             
-            # 详细信息记录到文件
+            # 详细信息记录到文件日志
             logger.debug(f"✓ 步骤 {steps_done} 完成:")
             logger.debug(f"  成功组数: {successful_groups}/{demo_batch_size}")
             logger.debug(f"  总Episodes: {len(all_collected_episodes)}")
@@ -1417,116 +1432,115 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             logger.debug(f"  成功率: {success_rate:.2%}")
             logger.debug(f"  损失: {loss:.6f}")
             logger.debug(f"  耗时: {step_time:.2f}秒")
-            logger.debug("GPU内存状态: 步骤结束")
             
             # 🔥 智能任务指针推进（仅在多任务环境下有意义）
             if task_to_iter and len(task_names) > 1:
                 task_cursor = (task_cursor + demo_batch_size) % len(task_names)
                 logger.debug(f"🔄 多任务指针推进到: {task_cursor} (下步起始任务: {task_names[task_cursor]})")
             elif task_to_iter and len(task_names) == 1:
-                logger.debug(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
-        
-        # 6. RIPT式全任务评估（使用rollout配置参数）
-        rollout_config = config.get('rollout', {})
-        eval_enabled = rollout_config.get('enabled', False)
-        eval_steps = rollout_config.get('steps', 10)
-        rollouts_per_env = rollout_config.get('rollouts_per_env', 5)
-        
-        # 🔍 调试信息：打印评估配置
-        print(f"🔧 评估配置检查:")
-        print(f"   rollout配置: {rollout_config}")
-        print(f"   eval_enabled: {eval_enabled}")
-        print(f"   eval_steps: {eval_steps}")
-        print(f"   rollouts_per_env: {rollouts_per_env}")
-        print(f"   当前步数: {steps_done}")
-        
-        # 🎬 视频保存配置检查
-        training_save_video = config.get('features', {}).get('save_video', False)
-        training_n_video = config.get('features', {}).get('n_video_training', 1) if training_save_video else 0
-        eval_n_video = rollout_config.get('n_video', 0)
-        eval_n_video_final = rollout_config.get('n_video_final', 1)
-        
-        print(f"🎬 视频保存配置:")
-        print(f"   训练时视频: {'✅启用' if training_save_video else '❌禁用'} - {training_n_video} 个/rollout")
-        print(f"   评估时视频: {eval_n_video} 个/rollout (常规), {eval_n_video_final} 个/rollout (最终)")
-        
-        # 🔥 修复重复评估问题：排除最后一步，因为循环结束后会进行最终评估
-        is_last_step = (steps_done == num_train_steps)
-        should_eval = eval_enabled and ((steps_done == 1) or (eval_steps > 0 and steps_done % eval_steps == 0)) and not is_last_step
-        print(f"   should_eval: {should_eval} (计算: {eval_enabled} and (({steps_done} == 1) or ({eval_steps} > 0 and {steps_done} % {eval_steps} == 0)) and not {is_last_step})")
-        
-        if should_eval:
-            try:
-                print(f"\n🎯 开始第 {steps_done} 步的全任务评估...")
-                print(f"   配置: 每 {eval_steps} 步评估, {rollouts_per_env} rollouts/任务")
-                if steps_done == 1:
-                    print(f"   📍 初始基线评估")
+                    logger.debug(f"📍 单任务模式: 保持使用任务 {task_names[0]} (无需指针推进)")
+            
+            # 6. RIPT式全任务评估（使用rollout配置参数）
+            rollout_config = config.get('rollout', {})
+            eval_enabled = rollout_config.get('enabled', False)
+            eval_steps = rollout_config.get('steps', 10)
+            rollouts_per_env = rollout_config.get('rollouts_per_env', 5)
+            
+            # 🔍 调试信息：打印评估配置
+            print(f"🔧 评估配置检查:")
+            print(f"   rollout配置: {rollout_config}")
+            print(f"   eval_enabled: {eval_enabled}")
+            print(f"   eval_steps: {eval_steps}")
+            print(f"   rollouts_per_env: {rollouts_per_env}")
+            print(f"   当前步数: {steps_done}")
+            
+            # 🎬 视频保存配置检查
+            training_save_video = config.get('features', {}).get('save_video', False)
+            training_n_video = config.get('features', {}).get('n_video_training', 1) if training_save_video else 0
+            eval_n_video = rollout_config.get('n_video', 0)
+            eval_n_video_final = rollout_config.get('n_video_final', 1)
+            
+            print(f"🎬 视频保存配置:")
+            print(f"   训练时视频: {'✅启用' if training_save_video else '❌禁用'} - {training_n_video} 个/rollout")
+            print(f"   评估时视频: {eval_n_video} 个/rollout (常规), {eval_n_video_final} 个/rollout (最终)")
+            
+            # 🔥 修复重复评估问题：排除最后一步，因为循环结束后会进行最终评估
+            is_last_step = (steps_done == num_train_steps)
+            should_eval = eval_enabled and ((steps_done == 1) or (eval_steps > 0 and steps_done % eval_steps == 0)) and not is_last_step
+            print(f"   should_eval: {should_eval} (计算: {eval_enabled} and (({steps_done} == 1) or ({eval_steps} > 0 and {steps_done} % {eval_steps} == 0)) and not {is_last_step})")
+            
+            if should_eval:
+                try:
+                    logger.info(f"🎯 开始第 {steps_done} 步评估...")
+                    logger.debug(f"   配置: 每 {eval_steps} 步评估, {rollouts_per_env} rollouts/任务")
+                    if steps_done == 1:
+                        logger.info(f"   📍 初始基线评估")
+                        
+                    eval_results = evaluate_ript_style_all_tasks(
+                        policy, 
+                        env_runner, 
+                        config, 
+                        rollouts_per_task=rollouts_per_env,  # 使用配置参数
+                        is_final_eval=False  # 🔥 常规评估，不保存视频（或保存少量视频）
+                    )
                     
-                eval_results = evaluate_ript_style_all_tasks(
-                    policy, 
-                    env_runner, 
-                    config, 
-                    rollouts_per_task=rollouts_per_env,  # 使用配置参数
-                    is_final_eval=False  # 🔥 常规评估，不保存视频（或保存少量视频）
-                )
-                
-                if eval_results:
-                    step_metrics['overall_success_rate'] = eval_results.get('overall_success_rate', 0.0)
-                    step_metrics['task_success_rates'] = {k: v for k, v in eval_results.items() if k != 'overall_success_rate'}
-                    print(f"📊 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
-                
-            except Exception as e:
-                print(f"⚠️ RIPT式评估失败: {e}")
-                traceback.print_exc()
-        elif eval_enabled and eval_steps > 0:
-            next_eval_step = ((steps_done // eval_steps) + 1) * eval_steps
-            print(f"📊 第 {steps_done} 步: 跳过评估 (下次评估: 第 {next_eval_step} 步)")
-        elif not eval_enabled:
-            print(f"📊 第 {steps_done} 步: 评估已禁用")
-        
-        # 6.1 CFG参数调优（可选，每20步进行一次，仅在CFG启用时）
-        if (steps_done) % 20 == 0 and getattr(policy.model, 'cfg_enabled', True):
-            try:
-                print(f"\n🔍 开始CFG强度调优...")
-                best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
-                step_metrics['best_cfg_scale'] = best_cfg
-                step_metrics['cfg_sweep_results'] = cfg_results
-                print(f"🎯 推荐CFG强度: {best_cfg}")
-                # 可选：动态调整收集时使用的CFG强度
-                # 🔥 修复：写入正确的algo路径
-                if hasattr(env_runner.config, 'algo'):
-                    env_runner.config.algo.collection_cfg_scale = best_cfg
-                if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
-                    env_runner.config['algo']['collection_cfg_scale'] = best_cfg
-            except Exception as e:
-                print(f"⚠️ CFG评估失败: {e}")
-        elif (steps_done) % 20 == 0:
-            print("⚠️ CFG已禁用，跳过CFG强度评估")
-        
-        # 7. 保存检查点
-        if (steps_done) % config['training'].get('save_freq', 10) == 0:
-            # 轻量权重（仅模型，便于部署与占用小）
-            weights_path = output_dir / f"weights_step_{steps_done}.pt"
-            torch.save({
-                'step': steps_done,
-                'policy_state_dict': policy.state_dict(),
-                'config': config,
-                'training_metrics': all_training_metrics,
-            }, weights_path)
-            print(f"✓ 轻量权重已保存: {weights_path}")
-
-            # 可选：按较低频率保存含优化器的完整检查点，便于恢复训练
-            save_opt_every = config.get('training', {}).get('save_optimizer_freq', None)
-            if save_opt_every and ((steps_done) % int(save_opt_every) == 0):
-                checkpoint_path = output_dir / f"checkpoint_step_{steps_done}.pt"
+                    if eval_results:
+                        step_metrics['overall_success_rate'] = eval_results.get('overall_success_rate', 0.0)
+                        step_metrics['task_success_rates'] = {k: v for k, v in eval_results.items() if k != 'overall_success_rate'}
+                        logger.info(f"📊 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
+                    
+                except Exception as e:
+                    logger.error(f"⚠️ RIPT式评估失败: {e}")
+                    logger.exception("评估异常详情")
+            elif eval_enabled and eval_steps > 0:
+                next_eval_step = ((steps_done // eval_steps) + 1) * eval_steps
+                logger.debug(f"📊 第 {steps_done} 步: 跳过评估 (下次评估: 第 {next_eval_step} 步)")
+            elif not eval_enabled:
+                logger.debug(f"📊 第 {steps_done} 步: 评估已禁用")
+            
+            # 6.1 CFG参数调优（可选，每20步进行一次，仅在CFG启用时）
+            if (steps_done) % 20 == 0 and getattr(policy.model, 'cfg_enabled', True):
+                try:
+                    print(f"\n🔍 开始CFG强度调优...")
+                    best_cfg, cfg_results = evaluate_with_cfg_sweep(policy, env_runner, task_names[0], eval_episodes=2)
+                    step_metrics['best_cfg_scale'] = best_cfg
+                    step_metrics['cfg_sweep_results'] = cfg_results
+                    print(f"🎯 推荐CFG强度: {best_cfg}")
+                    # 可选：动态调整收集时使用的CFG强度
+                    # 🔥 修复：写入正确的algo路径
+                    if hasattr(env_runner.config, 'algo'):
+                        env_runner.config.algo.collection_cfg_scale = best_cfg
+                    if isinstance(env_runner.config, dict) and 'algo' in env_runner.config:
+                        env_runner.config['algo']['collection_cfg_scale'] = best_cfg
+                except Exception as e:
+                    print(f"⚠️ CFG评估失败: {e}")
+            elif (steps_done) % 20 == 0:
+                print("⚠️ CFG已禁用，跳过CFG强度评估")
+            
+            # 7. 保存检查点
+            if (steps_done) % config['training'].get('save_freq', 10) == 0:
+                # 轻量权重（仅模型，便于部署与占用小）
+                weights_path = output_dir / f"weights_step_{steps_done}.pt"
                 torch.save({
                     'step': steps_done,
                     'policy_state_dict': policy.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
                     'config': config,
                     'training_metrics': all_training_metrics,
-                }, checkpoint_path)
-                print(f"✓ 完整检查点已保存: {checkpoint_path}")
+                }, weights_path)
+                print(f"✓ 轻量权重已保存: {weights_path}")
+
+                # 可选：按较低频率保存含优化器的完整检查点，便于恢复训练
+                save_opt_every = config.get('training', {}).get('save_optimizer_freq', None)
+                if save_opt_every and ((steps_done) % int(save_opt_every) == 0):
+                    checkpoint_path = output_dir / f"checkpoint_step_{steps_done}.pt"
+                    torch.save({
+                        'step': steps_done,
+                        'policy_state_dict': policy.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'config': config,
+                        'training_metrics': all_training_metrics,
+                    }, checkpoint_path)
+                    print(f"✓ 完整检查点已保存: {checkpoint_path}")
     
     # 🔥 保存最终统计数据
     stats_tracker.save_stats()
@@ -1536,37 +1550,37 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     final_results_path = output_dir / "final_training_results.json"
     # 将 OmegaConf 转为原生 dict 以便 JSON 序列化
     if OMEGACONF_AVAILABLE and isinstance(config, DictConfig):
-        serializable_config = OmegaConf.to_container(config, resolve=True)
+            serializable_config = OmegaConf.to_container(config, resolve=True)
     else:
-        serializable_config = config
+            serializable_config = config
     with open(final_results_path, 'w') as f:
-        json.dump({
-            'config': serializable_config,
-            'training_metrics': all_training_metrics,
-            'total_steps': len(all_training_metrics)
-        }, f, indent=2)
+            json.dump({
+                'config': serializable_config,
+                'training_metrics': all_training_metrics,
+                'total_steps': len(all_training_metrics)
+            }, f, indent=2)
     
     # 最终轻量权重（仅模型）
     final_weights_path = output_dir / "final_weights.pt"
     torch.save({
-        'step': len(all_training_metrics),
-        'policy_state_dict': policy.state_dict(),
-        'config': config,
-        'training_metrics': all_training_metrics,
+            'step': len(all_training_metrics),
+            'policy_state_dict': policy.state_dict(),
+            'config': config,
+            'training_metrics': all_training_metrics,
     }, final_weights_path)
     print(f"✓ 最终轻量权重已保存: {final_weights_path}")
 
     # 可选：保存最终完整检查点（含优化器）便于恢复训练
     if config.get('training', {}).get('save_optimizer_final', False):
-        final_checkpoint_path = output_dir / "final_checkpoint.pt"
-        torch.save({
-            'step': len(all_training_metrics),
-            'policy_state_dict': policy.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'config': config,
-            'training_metrics': all_training_metrics,
-        }, final_checkpoint_path)
-        print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
+            final_checkpoint_path = output_dir / "final_checkpoint.pt"
+            torch.save({
+                'step': len(all_training_metrics),
+                'policy_state_dict': policy.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': config,
+                'training_metrics': all_training_metrics,
+            }, final_checkpoint_path)
+            print(f"✓ 最终完整检查点已保存: {final_checkpoint_path}")
 
     # 🎬 最终评估（保存视频记录）
     try:
@@ -1586,13 +1600,13 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             for task_name, success_rate in final_eval_results.items():
                 if task_name != 'overall_success_rate':
                     print(f"   {task_name}: {success_rate:.2%}")
-            
-            # 保存最终评估结果
-            final_eval_path = output_dir / "final_evaluation_results.json"
-            with open(final_eval_path, 'w') as f:
-                json.dump(final_eval_results, f, indent=2)
-            print(f"📄 最终评估结果已保存: {final_eval_path}")
         
+        # 保存最终评估结果
+        final_eval_path = output_dir / "final_evaluation_results.json"
+        with open(final_eval_path, 'w') as f:
+            json.dump(final_eval_results, f, indent=2)
+        print(f"📄 最终评估结果已保存: {final_eval_path}")
+            
     except Exception as e:
         print(f"⚠️ 最终评估失败: {e}")
         traceback.print_exc()
@@ -1601,56 +1615,63 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     print(f"📊 最终结果已保存: {final_results_path}")
     print(f"✨ 使用了简化的直接架构，减少了抽象层复杂度")
 
-def setup_logging(output_dir: Path, console_level=logging.INFO, file_level=logging.DEBUG):
+def setup_unified_logging(output_dir: Path, console_level=logging.INFO, file_level=logging.DEBUG):
     """
-    设置统一日志配置
-    - FileHandler: 详细日志写入 train.log
-    - StreamHandler: 关键信息显示到控制台
-    - 与tqdm兼容
+    🎯 统一日志配置：控制台简洁（关键信息），文件详尽（完整调试）
+    
+    Args:
+        output_dir: 输出目录，日志文件将保存为 output_dir/train.log
+        console_level: 控制台日志级别（默认INFO，只显示关键信息）
+        file_level: 文件日志级别（默认DEBUG，记录所有详细信息）
     """
-    # 创建输出目录
+    # 确保输出目录存在
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 获取根logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # 根logger设为最低级别
+    
+    # 清除已有handlers（避免重复配置）
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    
+    # 1) 文件handler：完整详细日志
     log_file = output_dir / "train.log"
-    
-    # 清除现有handlers
-    root_logger = logging.getLogger()
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-    
-    # 设置root logger级别
-    root_logger.setLevel(logging.DEBUG)
-    
-    # 文件handler - 完整详细日志
     file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
     file_handler.setLevel(file_level)
     file_formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%H:%M:%S'
+        fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
     )
     file_handler.setFormatter(file_formatter)
-    root_logger.addHandler(file_handler)
+    logger.addHandler(file_handler)
     
-    # 控制台handler - 关键信息
+    # 2) 控制台handler：关键信息简洁格式
     console_handler = logging.StreamHandler()
     console_handler.setLevel(console_level)
     console_formatter = logging.Formatter(
-        '%(levelname)s: %(message)s'
+        fmt='%(levelname)s: %(message)s'  # 简洁格式，不显示时间
     )
     console_handler.setFormatter(console_formatter)
-    root_logger.addHandler(console_handler)
+    logger.addHandler(console_handler)
     
-    # 过滤第三方模块警告
-    warnings.filterwarnings("ignore", module="robosuite")
-    warnings.filterwarnings("ignore", category=UserWarning, module="gym")
+    # 3) 抑制第三方模块的噪声
+    logging.getLogger('robosuite').setLevel(logging.ERROR)
+    logging.getLogger('mujoco').setLevel(logging.ERROR)
+    logging.getLogger('PIL').setLevel(logging.ERROR)
     
-    return logging.getLogger(__name__)
+    return logger
 
 def main():
     """主函数"""
-    # 避免子进程重复输出顶层信息
-    if os.environ.get("PI0_SILENT_IMPORT") == "1":
-        return
-        
+    # 显示启动横幅（仅主进程）
+    current_file = Path(__file__).resolve()
+    project_root = current_file.parent
+    print(f"=== Stage 11 RIPT-VLA风格简化训练 ===")
+    print(f"脚本位置: {current_file}")
+    print(f"项目根目录: {project_root}")
+    print()
+    
     parser = argparse.ArgumentParser(description="Stage 11 RIPT-VLA风格简化训练")
     parser.add_argument(
         "--config_path", 
@@ -1665,44 +1686,43 @@ def main():
         # 加载配置
         config = load_config(args.config_path)
         
-        # 创建输出目录并设置日志
-        output_dir = Path(config.get('output_dir', './experiments/stage11_default'))
-        logger = setup_logging(output_dir)
+        # 🎯 步骤1：建立统一日志系统
+        output_dir = Path(config.get('output_dir', './experiments/stage11_unified_pool'))
+        logger = setup_unified_logging(output_dir)
         
-        # 启动摘要（控制台显示）
-        current_file = Path(__file__).resolve()
-        project_root = current_file.parent
+        # 启动摘要（控制台可见的关键信息）
         task_names = config.get('task', {}).get('task_names_to_use', [])
         rollout_config = config.get('rollout', {})
+        logger.info(f"🚀 实验启动")
+        logger.info(f"   输出目录: {output_dir}")
+        logger.info(f"   任务数量: {len(task_names)}")
+        logger.info(f"   rollouts_per_env: {rollout_config.get('rollouts_per_env', 'N/A')}")
+        logger.info(f"   并行环境数: {rollout_config.get('num_parallel_envs', 'N/A')}")
         
-        logger.info("=== Stage 11 RIPT-VLA风格简化训练 ===")
-        logger.info(f"实验名: {config.get('exp_name', 'default')}")
-        logger.info(f"任务数: {len(task_names)} ({', '.join(task_names[:2])}{'...' if len(task_names) > 2 else ''})")
-        logger.info(f"评估配置: {rollout_config.get('rollouts_per_env', 2)}rollouts/任务, {rollout_config.get('num_parallel_envs', 2)}并行")
-        logger.info(f"输出目录: {output_dir}")
-        
-        # 模块导入状态摘要
-        config_status = "OmegaConf" if OMEGACONF_AVAILABLE else "基础YAML"
-        logger.info(f"配置管理: {config_status}, 数据对齐: RIPT-VLA, Runner: 原有版本")
-        
-        # 详细配置记录到文件
-        logger.debug(f"脚本位置: {current_file}")
-        logger.debug(f"项目根目录: {project_root}")
-        logger.debug("====== 完整配置 ======")
-        if OMEGACONF_AVAILABLE:
-            logger.debug(OmegaConf.to_yaml(config))
+        # 详细配置信息记录到文件日志
+        logger.debug("详细配置信息:")
+        if hasattr(config, '__dict__'):  # 处理可能的对象类型配置
+    config_str = str(config)
         else:
-            logger.debug(yaml.dump(config, default_flow_style=False, allow_unicode=True))
-        logger.debug("====================")
+    try:
+        import yaml
+        config_str = yaml.dump(config, default_flow_style=False, allow_unicode=True)
+    except:
+        config_str = str(config)
+        logger.debug(config_str)
         
         # 开始RIPT-VLA风格的训练
-        main_training_loop_ript_vla_style(config)
+        logger.info("🏁 开始训练...")
+        with logging_redirect_tqdm():  # 确保tqdm与logging兼容
+    main_training_loop_ript_vla_style(config)
+        
+        logger.info("✅ 训练完成！")
         
     except KeyboardInterrupt:
         print("\n⚠️ 程序被用户中断")
     except Exception as e:
         print(f"\n❌ 程序执行出错: {e}")
-        traceback.print_exc()
+        logging.exception("程序执行异常")  # 完整异常栈写入日志文件
         sys.exit(1)
 
 if __name__ == "__main__":

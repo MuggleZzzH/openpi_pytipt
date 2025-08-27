@@ -63,11 +63,15 @@ class LIBEROEnvRunner:
                 from libero.libero.benchmark import get_benchmark
                 self.benchmark = get_benchmark(benchmark_name.lower())()
                 if self.rank == 0:
-                    print(f"✅ Benchmark初始化成功: {benchmark_name} -> {type(self.benchmark).__name__}")
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"✅ Benchmark初始化成功: {benchmark_name} -> {type(self.benchmark).__name__}")
             except Exception as e:
                 if self.rank == 0:
-                    print(f"⚠️ Benchmark初始化失败: {e}")
-                    print(f"   将使用合成初始状态池作为回退")
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.debug(f"⚠️ Benchmark初始化失败: {e}")
+                    logger.debug(f"   将使用合成初始状态池作为回退")
                 self.benchmark = None
         
         # 🔥 使用RIPT-VLA官方的任务最大步数设置（基于训练数据统计）
@@ -84,11 +88,15 @@ class LIBEROEnvRunner:
         elif self.benchmark_name and self.benchmark_name.lower() in TASK_MAX_STEPS:
             self.max_steps = TASK_MAX_STEPS[self.benchmark_name.lower()]
             if self.rank == 0:
-                print(f"🎯 使用官方任务限制: {self.benchmark_name} → {self.max_steps}步")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"🎯 使用官方任务限制: {self.benchmark_name} → {self.max_steps}步")
         else:
             self.max_steps = 300  # 安全默认值（libero_goal的限制）
             if self.rank == 0:
-                print(f"⚠️ 未知benchmark {self.benchmark_name}，使用默认限制: {self.max_steps}步")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"⚠️ 未知benchmark {self.benchmark_name}，使用默认限制: {self.max_steps}步")
         
         # 🔥 新增：功能开关控制 (安全集成复杂功能)
         # 从配置文件的features部分读取开关设置
@@ -108,11 +116,13 @@ class LIBEROEnvRunner:
             self.enable_true_parallel_envs = getattr(config, 'enable_true_parallel_envs', False) if config else False
         
         if self.rank == 0:
-            print(f"🔧 LIBEROEnvRunner功能开关:")
-            print(f"   任务轮询: {'✅' if self.enable_task_polling else '❌'}")
-            print(f"   并行环境: {'✅' if self.enable_parallel_envs else '❌'}")
-            print(f"   真正多进程并行: {'✅' if self.enable_true_parallel_envs else '❌'}")
-            print(f"   智能采样: {'✅' if self.enable_smart_sampling else '❌'}")
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(f"🔧 LIBEROEnvRunner功能开关:")
+            logger.debug(f"   任务轮询: {'✅' if self.enable_task_polling else '❌'}")
+            logger.debug(f"   并行环境: {'✅' if self.enable_parallel_envs else '❌'}")
+            logger.debug(f"   真正多进程并行: {'✅' if self.enable_true_parallel_envs else '❌'}")
+            logger.debug(f"   智能采样: {'✅' if self.enable_smart_sampling else '❌'}")
         
         # 🔥 新增：任务轮询机制 (仅在开关启用时初始化)
         if self.enable_task_polling:
@@ -609,6 +619,167 @@ class LIBEROEnvRunner:
             
         except Exception as e:
             raise RuntimeError(f"创建环境失败: {e}") from e
+    def run(self, policy, n_video=0, do_tqdm=False, save_video_fn=None, run_env_names=None, render=False):
+        """
+        🎯 与原版RIPT对齐的评估接口：遍历所有任务，聚合结果
+        
+        Args:
+            policy: 待评估的策略模型
+            n_video: 每个任务保存的视频数量
+            do_tqdm: 是否显示进度条
+            save_video_fn: 视频保存回调函数
+            run_env_names: 要运行的任务名列表（None则运行所有配置的任务）
+            render: 是否渲染（用于视频保存）
+            
+        Returns:
+            dict: 包含overall和per-task成功率的评估结果
+        """
+        from tqdm import tqdm
+        import numpy as np
+        
+        # 确定要运行的任务列表
+        if run_env_names is None:
+            env_names = self.task_names  # 使用初始化时配置的任务列表
+        else:
+            env_names = run_env_names
+            
+        if not env_names:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("⚠️ 没有指定要评估的任务")
+            return {}
+        
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"🎯 开始评估 {len(env_names)} 个任务，每个任务 {self.rollouts_per_env} 个rollout")
+        
+        # 聚合所有任务的结果
+        successes, per_env_any_success, rewards = [], [], []
+        per_env_success_rates, per_env_rewards = {}, {}
+        videos = {}
+        
+        # 遍历所有任务
+        for env_name in tqdm(env_names, disable=not do_tqdm, desc="评估任务"):
+            logger.debug(f"🔄 运行任务: {env_name}")
+            any_success = False
+            env_succs, env_rews, env_video = [], [], []
+            
+            # 获取该任务的基准初始状态池
+            task_init_states = None
+            if hasattr(self, 'benchmark') and self.benchmark is not None:
+                try:
+                    # 从任务名映射到task_id
+                    if hasattr(self.benchmark, 'get_task_names'):
+                        task_names = self.benchmark.get_task_names()
+                        if env_name in task_names:
+                            task_id = task_names.index(env_name)
+                            task_init_states = self.benchmark.get_task_init_states(task_id)
+                            logger.debug(f"  ✅ 获取到 {len(task_init_states)} 个基准初始状态 (task_id={task_id})")
+                except Exception as e:
+                    logger.debug(f"  ⚠️ 获取基准状态失败: {e}")
+                    task_init_states = None
+            
+            # 运行该任务的rollouts，使用正确的eval_loop_num逻辑
+            eval_loop_num = (self.rollouts_per_env + self.num_parallel_envs - 1) // self.num_parallel_envs
+            logger.debug(f"  📊 评估轮数: {eval_loop_num} (总rollout={self.rollouts_per_env}, 并行={self.num_parallel_envs})")
+            
+            rollout_count = 0
+            for loop_idx in range(eval_loop_num):
+                # 计算这一轮要用的初始状态索引
+                start_idx = loop_idx * self.num_parallel_envs
+                end_idx = min(start_idx + self.num_parallel_envs, self.rollouts_per_env)
+                batch_size = end_idx - start_idx
+                
+                if batch_size <= 0:
+                    break
+                
+                # 准备这一轮的初始状态
+                batch_init_states = None
+                if task_init_states is not None:
+                    indices = np.arange(start_idx, end_idx) % len(task_init_states)
+                    batch_init_states = [task_init_states[i] for i in indices]
+                    logger.debug(f"    批次 {loop_idx+1}: 使用基准状态索引 {indices}")
+                
+                # 运行这一批rollout
+                try:
+                    rollouts = self.run_policy_in_env(
+                        env_name, 
+                        all_init_states=batch_init_states,
+                        debug_save_video=render and (rollout_count < n_video)
+                    )
+                    
+                    # 收集结果，确保不超过rollouts_per_env总数
+                    batch_count = 0
+                    for success, total_reward, episode in rollouts:
+                        if rollout_count >= self.rollouts_per_env:
+                            break  # 确保总数不超过rollouts_per_env
+                            
+                        any_success = any_success or success
+                        successes.append(success)
+                        env_succs.append(success)
+                        env_rews.append(total_reward)
+                        rewards.append(total_reward)
+                        
+                        # 视频保存
+                        if rollout_count < n_video and render and episode and 'render' in episode:
+                            if save_video_fn is not None:
+                                video_hwc = np.array(episode['render'])
+                                video_chw = video_hwc.transpose((0, 3, 1, 2))
+                                save_video_fn(video_chw, env_name, rollout_count)
+                            else:
+                                env_video.extend(episode['render'])
+                        
+                        rollout_count += 1
+                        batch_count += 1
+                        
+                    logger.debug(f"    批次 {loop_idx+1}: 完成 {batch_count} 个rollout")
+                    
+                except Exception as e:
+                    logger.debug(f"    ❌ 批次 {loop_idx+1} 执行失败: {e}")
+                    # 填充失败结果
+                    for _ in range(batch_size):
+                        if rollout_count >= self.rollouts_per_env:
+                            break
+                        successes.append(False)
+                        env_succs.append(False)
+                        env_rews.append(0.0)
+                        rewards.append(0.0)
+                        rollout_count += 1
+            
+            # 计算该任务的统计
+            per_env_success_rates[env_name] = np.mean(env_succs) if env_succs else 0.0
+            per_env_rewards[env_name] = np.mean(env_rews) if env_rews else 0.0
+            per_env_any_success.append(any_success)
+            
+            # 关键信息：每任务成功率（控制台可见）
+            logger.info(f"任务 {env_name}: {per_env_success_rates[env_name]:.2%} ({sum(env_succs)}/{len(env_succs)})")
+            
+            # 处理视频
+            if len(env_video) > 0:
+                try:
+                    import wandb
+                    video_hwc = np.array(env_video)
+                    video_chw = video_hwc.transpose((0, 3, 1, 2))
+                    videos[env_name] = wandb.Video(video_chw, fps=10)
+                except:
+                    pass  # 忽略wandb相关错误
+        
+        # 构建输出结构，与原版ript对齐
+        output = {}
+        output['rollout'] = {
+            'overall_success_rate': np.mean(successes) if successes else 0.0,
+            'overall_average_reward': np.mean(rewards) if rewards else 0.0,
+            'environments_solved': int(np.sum(per_env_any_success)),
+            'rollout_count': len(successes),
+        }
+        output['rollout_success_rate'] = per_env_success_rates.copy()
+        
+        if len(videos) > 0:
+            output['rollout_videos'] = videos
+            
+        # 关键信息：总体成功率（控制台可见）
+        logger.info(f"🎉 评估完成: 总体成功率 {output['rollout']['overall_success_rate']:.2%}")
+        return output
         
     def run_policy_in_env(self, env_name, all_init_states=None, debug_save_video=None, created_env=None):
         """在环境中运行策略，生成轨迹 - 支持并行和串行环境"""
@@ -617,13 +788,17 @@ class LIBEROEnvRunner:
         # 🔥 根据功能开关选择并行或串行模式
         if self.enable_parallel_envs and created_env is None:
             if self.rank == 0:
-                print(f"🚀 使用并行环境模式 (num_parallel_envs={self.num_parallel_envs})")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"🚀 使用并行环境模式 (num_parallel_envs={self.num_parallel_envs})")
             # 创建并行环境
             env, env_id, env_num = self.create_parallel_envs(env_name, all_init_states)
             created_env = (env, env_id, env_num)
         elif created_env is None:
             if self.rank == 0:
-                print(f"🔄 使用串行环境模式")
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.debug(f"🔄 使用串行环境模式")
             # 使用串行环境
             env, task_description = self.make_env(env_name)
             created_env = (env, env_name, 1)
@@ -987,9 +1162,12 @@ class LIBEROEnvRunner:
     
     def _create_true_parallel_envs(self, env_name: str, all_init_states=None):
         """🆕 创建真正的多进程并行环境 - 使用独立环境工厂解决序列化问题"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
         if not TRUE_PARALLEL_AVAILABLE:
             if self.rank == 0:
-                print(f"⚠️ 独立环境工厂不可用，回退到单环境模式")
+                logger.warning(f"⚠️ 独立环境工厂不可用，回退到单环境模式")
             return self._create_single_env(env_name)
         
         # 计算GPU内存需求
@@ -1005,17 +1183,17 @@ class LIBEROEnvRunner:
             available_memory = available_memory_gb - current_usage
         
         if self.rank == 0:
-            print(f"🚀 尝试创建真正的多进程并行环境:")
-            print(f"🧠 内存分析:")
-            print(f"   {self.num_parallel_envs}个并行环境理论需要: {required_memory_gb:.1f}GB")
-            print(f"   当前GPU总内存: {available_memory_gb:.1f}GB") 
-            print(f"   当前GPU已使用: {current_usage:.1f}GB")
-            print(f"   可用内存: {available_memory:.1f}GB")
+            logger.debug(f"🚀 尝试创建真正的多进程并行环境:")
+            logger.debug(f"🧠 内存分析:")
+            logger.debug(f"   {self.num_parallel_envs}个并行环境理论需要: {required_memory_gb:.1f}GB")
+            logger.debug(f"   当前GPU总内存: {available_memory_gb:.1f}GB") 
+            logger.debug(f"   当前GPU已使用: {current_usage:.1f}GB")
+            logger.debug(f"   可用内存: {available_memory:.1f}GB")
         
         # 内存安全检查
         if available_memory < required_memory_gb * 1.2:
             if self.rank == 0:
-                print(f"⚠️ GPU内存不足，回退到单环境模式")
+                logger.warning(f"⚠️ GPU内存不足，回退到单环境模式")
             return self._create_single_env(env_name)
         
         try:
@@ -1041,51 +1219,62 @@ class LIBEROEnvRunner:
                 env_factories.append(worker_env_factory)
             
             if self.rank == 0:
-                print(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")
+                logger.debug(f"🔧 创建 {self.num_parallel_envs} 个独立并行环境...")
                 if sync_enabled and fixed_init_state_id is not None:
                     if fixed_init_state_id == -1:
-                        print("🎲 启用智能随机模式，每次重置随机选择初始状态")
+                        logger.debug("🎲 启用智能随机模式，每次重置随机选择初始状态")
                     else:
-                        print(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
+                        logger.debug(f"🔒 启用同步模式，固定初始状态ID: {fixed_init_state_id}")
                 else:
-                    print("🎲 使用完全随机初始状态模式")
+                    logger.debug("🎲 使用完全随机初始状态模式")
 
             # 设置multiprocessing启动方法
             if multiprocessing.get_start_method(allow_none=True) != 'spawn':
                 multiprocessing.set_start_method('spawn', force=True)
 
-            # 创建SubprocVectorEnv
-            parallel_env = SubprocVectorEnv(env_factories)
+            # 🔥 设置静默环境变量避免子进程重复输出
+            prev_silent = os.environ.get("PI0_SILENT_IMPORT")
+            os.environ["PI0_SILENT_IMPORT"] = "1"
+            
+            try:
+                # 创建SubprocVectorEnv
+                parallel_env = SubprocVectorEnv(env_factories)
+            finally:
+                # 恢复原始环境变量设置
+                if prev_silent is None:
+                    os.environ.pop("PI0_SILENT_IMPORT", None)
+                else:
+                    os.environ["PI0_SILENT_IMPORT"] = prev_silent
             
             # 🔍 验证并行环境初始状态同步性
             try:
                 test_obs = parallel_env.reset()
                 if self.rank == 0:
                     if isinstance(test_obs, list):
-                        print(f"✅ SubprocVectorEnv已创建，reset返回list，长度: {len(test_obs)}")
+                        logger.info(f"✅ 创建并行环境: {len(test_obs)}个worker")
 
                         # 🔥 新增：验证初始状态同步性
                         verify_sync = sync_config.get('verify_sync', True)
                         if verify_sync:
                             sync_verified = self._verify_parallel_env_sync(test_obs)
                             if sync_verified:
-                                print("✅ 并行环境初始状态同步验证通过")
+                                logger.debug("✅ 并行环境初始状态同步验证通过")
                             else:
-                                print("⚠️ 并行环境初始状态可能不同步")
+                                logger.warning("⚠️ 并行环境初始状态可能不同步")
                                 if sync_enabled:
-                                    print("   建议检查SyncedInitStateWrapper是否正常工作")
+                                    logger.debug("   建议检查SyncedInitStateWrapper是否正常工作")
                         else:
-                            print("ℹ️ 跳过同步验证（verify_sync=false）")
+                            logger.debug("ℹ️ 跳过同步验证（verify_sync=false）")
                     else:
-                        print(f"✅ SubprocVectorEnv已创建，reset返回类型: {type(test_obs)}")
+                        logger.debug(f"✅ SubprocVectorEnv已创建，reset返回类型: {type(test_obs)}")
             except Exception as e:
                 if self.rank == 0:
-                    print(f"⚠️ SubprocVectorEnv.reset() 调用异常: {e}")
+                    logger.warning(f"⚠️ SubprocVectorEnv.reset() 调用异常: {e}")
             
             if self.rank == 0:
-                print(f"   🔄 {self.num_parallel_envs} 个独立子进程")
-                print(f"   🧠 每个子进程无模型，总内存节省 ~{(self.num_parallel_envs-1)*3.5:.1f}GB")
-                print(f"   ⚡ 真正的并行执行，性能提升 ~{self.num_parallel_envs}x")
+                logger.debug(f"   🔄 {self.num_parallel_envs} 个独立子进程")
+                logger.debug(f"   🧠 每个子进程无模型，总内存节省 ~{(self.num_parallel_envs-1)*3.5:.1f}GB")
+                logger.debug(f"   ⚡ 真正的并行执行，性能提升 ~{self.num_parallel_envs}x")
             
             # 🧠 获取每个子进程的任务描述（自然语言prompt），用于构造模型输入
             try:
