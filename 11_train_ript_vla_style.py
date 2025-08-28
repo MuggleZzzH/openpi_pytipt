@@ -37,6 +37,9 @@ import multiprocessing as mp
 if mp.get_start_method(allow_none=True) != "spawn":
     mp.set_start_method("spawn", force=True)
 
+# 动态采样硬编码总开关（便于快速切换）
+DYNAMIC_SAMPLING_ENABLED = True
+
 # 🔥 添加RIPT对齐的数据集工具
 from pi0.ript.utils.libero_utils_ript_aligned import (
     build_dataset_ript_aligned,
@@ -883,15 +886,20 @@ def evaluate_ript_style_all_tasks(policy, env_runner, config, rollouts_per_task=
         np.random.seed(eval_seed)
         random.seed(eval_seed)
         
-        # 🎯 使用 runner.run 进行聚合评估
-        results = env_runner.run(
-            policy=policy,
-            n_video=n_video,
-            do_tqdm=True,
-            save_video_fn=None,  # 可以根据需要传入自定义保存函数
-            run_env_names=task_names,
-            render=(n_video > 0)  # 只在需要视频时渲染
-        )
+        # 🎯 使用 runner.run 进行聚合评估（评估期间关闭预热）
+        _old_disable = getattr(env_runner, 'disable_warmup', False)
+        env_runner.disable_warmup = False
+        try:
+            results = env_runner.run(
+                policy=policy,
+                n_video=n_video,
+                do_tqdm=True,
+                save_video_fn=None,  # 可以根据需要传入自定义保存函数
+                run_env_names=task_names,
+                render=(n_video > 0)  # 只在需要视频时渲染
+            )
+        finally:
+            env_runner.disable_warmup = _old_disable
         
         if not results:
             logger.warning("⚠️ runner.run 返回空结果")
@@ -1039,6 +1047,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     logger.debug(f"  任务选择策略: {task_selection}")
     logger.debug(f"  采样随机种子: {sampling_seed}")
     
+    # 从配置读取动态采样开关（features.dynamic_sampling.enabled）
+    dynamic_sampling_enabled = bool(
+        config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
+    )
+    
     # 统一设置随机种子（保证可复现）
     try:
         training_seed = int(config.get('training', {}).get('seed', 42))
@@ -1112,6 +1125,29 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     
     # 创建环境runner
     env_runner = create_environment_runner(config, policy)
+    
+    # ✨ 只评估模式：跳过收集与训练，直接评估
+    eval_only = bool(
+        (config.get('eval_only', False) if isinstance(config, dict) else getattr(config, 'eval_only', False)) or 
+        config.get('features', {}).get('eval_only', False)
+    )
+    if eval_only:
+        print("🔎 只评估模式：跳过收集与训练，直接进行评估")
+        rollout_cfg = config.get('rollout', {})
+        rollouts_per_env = rollout_cfg.get('rollouts_per_env', 5)
+        _old_disable = getattr(env_runner, 'disable_warmup', False)
+        env_runner.disable_warmup = True
+        try:
+            _ = evaluate_ript_style_all_tasks(
+                policy,
+                env_runner,
+                config,
+                rollouts_per_task=rollouts_per_env,
+                is_final_eval=True
+            )
+        finally:
+            env_runner.disable_warmup = _old_disable
+        return
     
     # 🔥 创建rollout统计跟踪器
     stats_path = config['algo'].get('rollout_stats_path', './output/stage11_ript_vla/rollout_stats.json')
@@ -1227,7 +1263,6 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     print(f"  demo_batch_size: {demo_batch_size} (每步收集的组数)")
     print(f"  rloo_batch_size: {rloo_batch_size} (每组内样本数)")
     print(f"  有效批次大小: {demo_batch_size * rloo_batch_size}")
-    dynamic_sampling_enabled = config.get('features', {}).get('dynamic_sampling', {}).get('enabled', False)
     print(f"  动态采样: {'启用' if dynamic_sampling_enabled else '禁用'} (features.dynamic_sampling.enabled)")
     
     print(f"\n开始训练循环:")
@@ -1334,7 +1369,7 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     group_episodes = collect_rollouts_ript_vla_style(
                         env_runner, tname,  # 🔥 使用轮询选择的任务名
                         rloo_batch_size,
-                        enable_dynamic_sampling=False,  # 🔥 训练期禁用动态采样，避免无限重试
+                        enable_dynamic_sampling=dynamic_sampling_enabled,
                         stats_tracker=stats_tracker,
                         demo_initial_state=demo_batch,  # 🔥 传递对应任务的demo初始状态
                         n_video=training_n_video  # 🔥 训练时视频保存：使用features配置

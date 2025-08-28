@@ -31,7 +31,7 @@ task:
     # - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
     # - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
   num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: 100  # 🔥 进一步限制episode长度减少样本数
+  max_episode_length: null  # 🔥 进一步限制episode长度减少样本数
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                   # 关闭demo初始状态，匹配 2_pi0 的默认reset
@@ -82,7 +82,7 @@ rollout:
   
   # 🎬 评估阶段视频保存配置
   n_video: 0                    # 常规评估时每个任务保存多少个视频（0=不保存）
-  n_video_final: 1              # 最终评估时每个任务保存多少个视频（用于最终展示）
+  n_video_final: 0              # 最终评估时每个任务保存多少个视频（用于最终展示）
 
 # === 策略配置 ===
 policy:
@@ -128,13 +128,14 @@ logging:
 # === 特性开关 - 简化配置 ===
 features:
   use_ript_vla_runner: false
+  eval_only: false  # 只评估：为 true 时跳过收集与训练，直接评估
   enable_parallel_envs: true    
   enable_true_parallel_envs: true
   enable_smart_sampling: false
   use_parallel_init_state: true  # 🔥 重新启用并行状态设置（已修复格式问题）
 
   # 🎬 训练阶段视频保存配置（数据收集时）
-  save_video: true                   # 训练时视频保存总开关
+  save_video: false                   # 训练时视频保存总开关
   n_video_training: 1                # 训练时每次rollout保存多少个视频（当save_video=true时生效）
   enable_file_counter: false
   adaptive_cfg: false
@@ -189,12 +190,12 @@ features:
 # === 训练配置（与原版RIPT对齐）- 已合并到上面的training部分 ===
 
 # === 数据加载配置（与原版RIPT对齐）===
-train_dataloader:
-  batch_size: 6  # 🔥 与原版RIPT对齐
-  shuffle: true
-  num_workers: 6
-  persistent_workers: false
-  pin_memory: true
+# train_dataloader:
+#   batch_size: 6  # 🔥 与原版RIPT对齐
+#   shuffle: true
+#   num_workers: 6
+#   persistent_workers: false
+#   pin_memory: true
 
 # === 日志配置（与原版RIPT对齐）- 已合并到上面的logging部分 ===
 

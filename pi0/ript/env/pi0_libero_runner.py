@@ -56,6 +56,9 @@ class LIBEROEnvRunner:
         self.rank = rank
         self.world_size = world_size
         
+        # 🔥 新增：评估时可关闭预热
+        self.disable_warmup = False
+        
         # 🔥 新增：初始化benchmark以获取真实基准状态池，与RIPT-VLA完全对齐
         self.benchmark = None
         if benchmark_name:
@@ -78,9 +81,8 @@ class LIBEROEnvRunner:
         TASK_MAX_STEPS = {
             'libero_spatial': 220,  # longest training demo has 193 steps
             'libero_object': 280,   # longest training demo has 254 steps
-            'libero_goal': 300,     # longest training demo has 270 steps
-            'libero_10': 520,       # longest training demo has 505 steps
-            'libero_90': 400,       # longest training demo has 373 steps
+            'libero_goal': 240,     # longest training demo has 211 steps
+            'libero_long': 400,     # longest training demo has 372 steps
         }
         
         if max_episode_length is not None:
@@ -899,16 +901,17 @@ class LIBEROEnvRunner:
             init_hash = self._compute_state_hash(target_init_state)
             
             # 热机步骤
-            dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-            for _ in range(20):
-                if is_vector_env:
-                    # VectorEnv期望动作列表
-                    step_results = env.step([dummy_action])
-                    obs, _, _, _ = step_results
-                    if isinstance(obs, list):
-                        obs = obs[0]  # 取第一个环境的结果
-                else:
-                    obs, _, _, _ = env.step(dummy_action)
+            if not getattr(self, "disable_warmup", False):
+                dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
+                for _ in range(20):
+                    if is_vector_env:
+                        # VectorEnv期望动作列表
+                        step_results = env.step([dummy_action])
+                        obs, _, _, _ = step_results
+                        if isinstance(obs, list):
+                            obs = obs[0]  # 取第一个环境的结果
+                    else:
+                        obs, _, _, _ = env.step(dummy_action)
             
             step = 0
             done = False
@@ -1496,15 +1499,16 @@ class LIBEROEnvRunner:
             print(f"🔧 初始化 {len(obs_list)} 个并行环境")
         
         # 对每个环境进行热身
-        dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
-        for warmup_step in range(20):
-            # 🔑 确保actions数组长度与环境数量完全匹配
-            actions = [dummy_action.copy() for _ in range(env_num)]
-            if self.rank == 0 and warmup_step == 0:
-                print(f"🔧 热身动作: {len(actions)} 个动作 for {env_num} 个环境")
-            step_out = env.step(actions)
-            obs_any = step_out[0] if isinstance(step_out, (list, tuple)) and len(step_out) >= 1 else step_out
-            obs_list = self._ensure_list_of_dict_obs(obs_any, env_num)
+        if not getattr(self, "disable_warmup", False):
+            dummy_action = np.array([0, 0, 0, 0, 0, 0, -1])
+            for warmup_step in range(20):
+                # 🔑 确保actions数组长度与环境数量完全匹配
+                actions = [dummy_action.copy() for _ in range(env_num)]
+                if self.rank == 0 and warmup_step == 0:
+                    print(f"🔧 热身动作: {len(actions)} 个动作 for {env_num} 个环境")
+                step_out = env.step(actions)
+                obs_any = step_out[0] if isinstance(step_out, (list, tuple)) and len(step_out) >= 1 else step_out
+                obs_list = self._ensure_list_of_dict_obs(obs_any, env_num)
         
         # 初始化episode数据
         episodes_data = []
