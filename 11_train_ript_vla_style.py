@@ -32,6 +32,20 @@ from tqdm import tqdm
 from tqdm.auto import tqdm as tqdm_auto
 from tqdm.contrib.logging import logging_redirect_tqdm
 
+# 🔥 SwanLab 安全导入与开关
+try:
+    import swanlab
+    HAS_SWANLAB = True
+    print("✓ SwanLab 已导入，支持实验跟踪")
+except ImportError:
+    swanlab = None
+    HAS_SWANLAB = False
+    print("⚠️ SwanLab 未安装，跳过实验跟踪功能")
+except Exception as e:
+    swanlab = None
+    HAS_SWANLAB = False
+    print(f"⚠️ SwanLab 导入失败: {e}")
+
 # 🔥 早期设置multiprocessing，避免子进程重复设置
 import multiprocessing as mp
 if mp.get_start_method(allow_none=True) != "spawn":
@@ -39,6 +53,10 @@ if mp.get_start_method(allow_none=True) != "spawn":
 
 # 动态采样硬编码总开关（便于快速切换）
 DYNAMIC_SAMPLING_ENABLED = True
+
+# 🔥 SwanLab 全局状态管理
+SWANLAB_ENABLED = False  # 运行时从配置文件设置
+SWANLAB_RUN = None       # 存储 SwanLab run 实例
 
 # 🔥 添加RIPT对齐的数据集工具
 from pi0.ript.utils.libero_utils_ript_aligned import (
@@ -287,6 +305,72 @@ def load_config(config_path: str):
     print("✓ 配置文件加载成功")
     return config
 
+def apply_overrides(config, override_args):
+    """
+    应用命令行override参数到配置（类似hydra风格）
+    支持点记法：algo.lr=1e-4, task.num_parallel_envs=4
+    """
+    if not override_args:
+        return config
+    
+    print(f"🔧 应用{len(override_args)}个命令行override参数:")
+    
+    for arg in override_args:
+        if '=' not in arg:
+            print(f"  ⚠️ 跳过无效参数: {arg}")
+            continue
+        
+        key, value = arg.split('=', 1)
+        
+        # 解析值类型
+        parsed_value = parse_value(value)
+        
+        # 应用到配置
+        set_nested_value(config, key, parsed_value)
+        print(f"  ✓ {key} = {parsed_value}")
+    
+    return config
+
+def parse_value(value_str):
+    """解析命令行值的类型"""
+    # 布尔值
+    if value_str.lower() in ['true', 'false']:
+        return value_str.lower() == 'true'
+    
+    # 整数
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    
+    # 浮点数
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # 字符串（去掉引号）
+    if value_str.startswith('"') and value_str.endswith('"'):
+        return value_str[1:-1]
+    if value_str.startswith("'") and value_str.endswith("'"):
+        return value_str[1:-1]
+    
+    return value_str
+
+def set_nested_value(config, key, value):
+    """设置嵌套配置值（支持点记法）"""
+    keys = key.split('.')
+    current = config
+    
+    # 导航到最后一层的父级
+    for k in keys[:-1]:
+        if k not in current:
+            current[k] = {}
+        current = current[k]
+    
+    # 设置最终值
+    current[keys[-1]] = value
+
 def create_policy_and_optimizer(config: Dict[str, Any]):
     """创建策略和优化器（RIPT-VLA风格）"""
     import logging
@@ -299,7 +383,42 @@ def create_policy_and_optimizer(config: Dict[str, Any]):
     logger.debug("正在加载PI0策略...")
     
     policy_path = config['policy_path']
-    policy = PI0Policy.from_pretrained(policy_path)
+    
+    # 🔥 临时重定向stdout以抑制冗余的配置解析DEBUG输出
+    import sys
+    import io
+    from contextlib import redirect_stdout, redirect_stderr
+    
+    # 创建一个缓冲区来捕获不必要的输出
+    captured_output = io.StringIO()
+    
+    try:
+        # 在策略加载期间重定向输出
+        with redirect_stdout(captured_output), redirect_stderr(captured_output):
+            policy = PI0Policy.from_pretrained(policy_path)
+        
+        # 检查捕获的输出中是否有错误或警告
+        captured_text = captured_output.getvalue()
+        if captured_text:
+            # 只显示重要的消息（ERROR, WARNING），过滤掉DEBUG
+            important_lines = []
+            for line in captured_text.split('\n'):
+                if any(keyword in line.upper() for keyword in ['ERROR', 'WARNING', 'FAILED', 'EXCEPTION']):
+                    important_lines.append(line)
+            
+            if important_lines:
+                logger.warning("策略加载过程中的重要消息:")
+                for line in important_lines:
+                    logger.warning(f"  {line}")
+        
+    except Exception as e:
+        # 如果重定向导致问题，回退到正常加载
+        logger.warning(f"输出重定向失败，使用正常加载: {e}")
+        # 显示之前捕获的输出以便调试
+        captured_text = captured_output.getvalue()
+        if captured_text:
+            logger.debug(f"捕获的输出: {captured_text[:500]}...")  # 只显示前500字符
+        policy = PI0Policy.from_pretrained(policy_path)
     
     # 🔧 根据配置控制CFG功能
     policy_config = config.get('policy', {})
@@ -1138,13 +1257,53 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
         _old_disable = getattr(env_runner, 'disable_warmup', False)
         env_runner.disable_warmup = True
         try:
-            _ = evaluate_ript_style_all_tasks(
+            # 🔥 修复：获取评估结果并记录到 SwanLab
+            eval_results = evaluate_ript_style_all_tasks(
                 policy,
                 env_runner,
                 config,
                 rollouts_per_task=rollouts_per_env,
                 is_final_eval=True
             )
+            
+            # 🔥 新增：将评估结果记录到 SwanLab（eval_only模式）
+            if eval_results:
+                print(f"🏆 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
+                
+                # 记录到SwanLab（复用最终评估的逻辑）
+                try:
+                    if SWANLAB_ENABLED:
+                        logging_config = config.get('logging', {})
+                        topk = int(logging_config.get('swanlab_task_topk', 5))
+                        log_table = bool(logging_config.get('swanlab_log_task_table', True))
+                        
+                        # 使用step=0表示eval_only模式的评估
+                        overall = float(eval_results.get('overall_success_rate', 0.0))
+                        log_metrics_to_swanlab({'eval_only/overall_success_rate': overall}, step=0)
+                        
+                        task_rates = {k: float(v) for k, v in eval_results.items() if k != 'overall_success_rate'}
+                        if task_rates:
+                            top_items = sorted(task_rates.items(), key=lambda kv: kv[1], reverse=True)[:topk]
+                            log_metrics_to_swanlab({f'eval_only/task/{k}': v for k, v in top_items}, step=0)
+                            
+                            if log_table:
+                                try:
+                                    lines = ["| Task | Success |", "|---|---|"]
+                                    for tn, sr in sorted(task_rates.items(), key=lambda kv: kv[0]):
+                                        lines.append(f"| {tn} | {sr:.2%} |")
+                                    table_md = "\n".join(lines)
+                                    try:
+                                        from swanlab import Text
+                                        log_metrics_to_swanlab({'eval_only/task_table': Text(table_md)}, step=0)
+                                    except Exception:
+                                        log_metrics_to_swanlab({'eval_only/task_table': table_md}, step=0)
+                                except Exception:
+                                    pass
+                        
+                        print("✅ 评估结果已记录到 SwanLab")
+                except Exception as _err:
+                    logging.getLogger(__name__).debug(f"SwanLab eval_only logging skipped: {_err}")
+            
         finally:
             env_runner.disable_warmup = _old_disable
         return
@@ -1162,6 +1321,9 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
     rloo_batch_size = config['algo']['rloo_batch_size']
     num_train_steps = config['training']['num_train_steps']
     task_names = config['task'].get('task_names_to_use', ['LIBERO_SPATIAL_0'])
+
+    # 新增：SwanLab 记录频率（YAML training.swanlab_log_interval，无则默认每步记录）
+    swanlab_log_interval = int(config.get('training', {}).get('swanlab_log_interval', 1))
 
     # 🔥 创建多任务RIPT对齐的LIBERO demo数据加载器
     use_libero_demos = config.get('use_libero_demos', True)
@@ -1438,17 +1600,75 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             }
             all_training_metrics.append(step_metrics)
             
+            # 新增：可选补充训练损失（如果当步可得）
+            if 'loss_value' in locals():
+                step_metrics['train/loss'] = float(loss_value)
+            elif 'total_loss' in locals():
+                step_metrics['train/loss'] = float(total_loss)
+            elif 'loss' in step_metrics:
+                step_metrics['train/loss'] = float(step_metrics['loss'])
+
+            # 新增：GPU 显存指标（有 CUDA 时记录）
+            if torch.cuda.is_available():
+                try:
+                    step_metrics.update({
+                        'gpu/alloc_gb': float(torch.cuda.memory_allocated() / 1024**3),
+                        'gpu/reserved_gb': float(torch.cuda.memory_reserved() / 1024**3),
+                        'gpu/peak_gb': float(torch.cuda.max_memory_allocated() / 1024**3),
+                    })
+                except Exception:
+                    pass
+
+            # 新增：RLOO 优势统计（若在当前作用域可获取；不可则跳过）
+            try:
+                if 'advantages' in locals() and hasattr(advantages, 'mean'):
+                    step_metrics.update({
+                        'rloo/adv_mean': float(advantages.mean().item()),
+                        'rloo/adv_std': float(advantages.std().item()),
+                        'rloo/pos_ratio': float((advantages > 0).float().mean().item()),
+                    })
+            except Exception:
+                pass
+
+            # 新增：按频率记录到 SwanLab
+            if (steps_done % swanlab_log_interval) == 0:
+                log_metrics_to_swanlab(step_metrics, step=steps_done)
+            
             # 获取当前任务信息用于进度条显示
             current_task_info = "multi" if len(task_names) > 1 else task_names[0] if task_names else "unknown"
             
+            # 新增（可选）：将关键指标显示到主进度条 postfix，保持控制台极简
+            try:
+                if config.get('features', {}).get('progress', {}).get('show_postfix', True):
+                    postfix = {}
+                    if 'train/loss' in step_metrics:
+                        postfix['loss'] = f"{step_metrics['train/loss']:.4f}"
+                    if 'success_rate' in step_metrics:
+                        postfix['succ'] = f"{step_metrics['success_rate']:.2%}"
+                    if 'step_time' in step_metrics:
+                        postfix['time'] = f"{step_metrics['step_time']:.1f}s"
+                    if current_task_info and len(task_names) <= 3:  # 只在任务不太多时显示
+                        postfix['task'] = current_task_info[:8] + '...' if len(current_task_info) > 10 else current_task_info
+                    pbar.set_postfix(postfix)
+                else:
+                    # 原有的postfix设置（作为fallback）
+                    pbar.set_postfix({
+                        'task': current_task_info[:8] + '...' if len(current_task_info) > 10 else current_task_info,
+                        'succ': f'{success_rate:.2%}',
+                        'loss': f'{loss:.4f}',
+                        'time': f'{step_time:.1f}s'
+                    })
+            except Exception:
+                # 异常情况下使用原有postfix
+                pbar.set_postfix({
+                    'task': current_task_info[:8] + '...' if len(current_task_info) > 10 else current_task_info,
+                    'succ': f'{success_rate:.2%}',
+                    'loss': f'{loss:.4f}',
+                    'time': f'{step_time:.1f}s'
+                })
+            
             # 更新进度条
             pbar.update(1)
-            pbar.set_postfix({
-                'task': current_task_info[:8] + '...' if len(current_task_info) > 10 else current_task_info,
-                'succ': f'{success_rate:.2%}',
-                'loss': f'{loss:.4f}',
-                'time': f'{step_time:.1f}s'
-            })
             
             # 详细信息记录到文件
             logger.debug(f"✓ 步骤 {steps_done} 完成:")
@@ -1515,6 +1735,43 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     step_metrics['overall_success_rate'] = eval_results.get('overall_success_rate', 0.0)
                     step_metrics['task_success_rates'] = {k: v for k, v in eval_results.items() if k != 'overall_success_rate'}
                     print(f"📊 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
+                    
+                    # 新增：记录评估到 SwanLab（限制任务级粒度）
+                    try:
+                        if SWANLAB_ENABLED:
+                            logging_config = config.get('logging', {})
+                            topk = int(logging_config.get('swanlab_task_topk', 5))
+                            log_table = bool(logging_config.get('swanlab_log_task_table', True))
+
+                            # 1) 总体成功率
+                            eval_overall = float(eval_results.get('overall_success_rate', 0.0))
+                            log_metrics_to_swanlab({'eval/overall_success_rate': eval_overall}, step=steps_done)
+
+                            # 2) 任务级 Top-K（避免产生过多曲线）
+                            task_rates = {k: float(v) for k, v in eval_results.items() if k != 'overall_success_rate'}
+                            if task_rates:
+                                top_items = sorted(task_rates.items(), key=lambda kv: kv[1], reverse=True)[:topk]
+                                log_metrics_to_swanlab({f'eval/task/{k}': v for k, v in top_items}, step=steps_done)
+
+                                # 3) 可选：用文本表记录"所有任务成功率"（一次性写入，不生成大量指标）
+                                if log_table:
+                                    try:
+                                        # 生成一个 markdown 表格，便于在 SwanLab "文本视图"查看
+                                        lines = ["| Task | Success |", "|---|---|"]
+                                        for tn, sr in sorted(task_rates.items(), key=lambda kv: kv[0]):
+                                            lines.append(f"| {tn} | {sr:.2%} |")
+                                        table_md = "\n".join(lines)
+
+                                        # 如果 swanlab.Text 可用，使用它；否则记录为普通字符串
+                                        try:
+                                            from swanlab import Text
+                                            log_metrics_to_swanlab({'eval/task_table': Text(table_md)}, step=steps_done)
+                                        except Exception:
+                                            log_metrics_to_swanlab({'eval/task_table': table_md}, step=steps_done)
+                                    except Exception:
+                                        pass
+                    except Exception as _err:
+                        logging.getLogger(__name__).debug(f"SwanLab eval logging skipped: {_err}")
                 
             except Exception as e:
                 print(f"⚠️ RIPT式评估失败: {e}")
@@ -1633,6 +1890,112 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
             with open(final_eval_path, 'w') as f:
                 json.dump(final_eval_results, f, indent=2)
             print(f"📄 最终评估结果已保存: {final_eval_path}")
+            
+            # 新增：最终评估也写入 SwanLab（Top-K + 文本表）
+            try:
+                if SWANLAB_ENABLED:
+                    logging_config = config.get('logging', {})
+                    topk = int(logging_config.get('swanlab_task_topk', 5))
+                    log_table = bool(logging_config.get('swanlab_log_task_table', True))
+
+                    overall = float(final_eval_results.get('overall_success_rate', 0.0))
+                    log_metrics_to_swanlab({'final/overall_success_rate': overall}, step=num_train_steps)
+
+                    task_rates = {k: float(v) for k, v in final_eval_results.items() if k != 'overall_success_rate'}
+                    if task_rates:
+                        top_items = sorted(task_rates.items(), key=lambda kv: kv[1], reverse=True)[:topk]
+                        log_metrics_to_swanlab({f'final/task/{k}': v for k, v in top_items}, step=num_train_steps)
+
+                        if log_table:
+                            try:
+                                lines = ["| Task | Success |", "|---|---|"]
+                                for tn, sr in sorted(task_rates.items(), key=lambda kv: kv[0]):
+                                    lines.append(f"| {tn} | {sr:.2%} |")
+                                table_md = "\n".join(lines)
+                                try:
+                                    from swanlab import Text
+                                    log_metrics_to_swanlab({'final/task_table': Text(table_md)}, step=num_train_steps)
+                                except Exception:
+                                    log_metrics_to_swanlab({'final/task_table': table_md}, step=num_train_steps)
+                            except Exception:
+                                pass
+            except Exception as _err:
+                logging.getLogger(__name__).debug(f"SwanLab final-eval logging skipped: {_err}")
+            
+            # 新增：可选的最终评估媒体上传（GIF / 关键帧图像）
+            try:
+                if SWANLAB_ENABLED and bool(config.get('logging', {}).get('swanlab_log_video_eval', False)):
+                    max_per_task = int(config.get('logging', {}).get('swanlab_video_max_per_task', 1))
+
+                    # 约定：你现有评估可能会把视频保存在 output_dir 的某个子目录（示例为 videos/final_eval）
+                    # 若路径不同，请替换为你真实的视频输出目录
+                    videos_root = output_dir / "videos" / "final_eval"
+                    if videos_root.exists():
+                        # 按任务组织：videos_root/<task_name>/*.mp4
+                        # 若你的视频不按任务分目录，也可直接在 videos_root.glob("*.mp4") 取前 N 个
+                        for task_dir in sorted(videos_root.iterdir()):
+                            if not task_dir.is_dir():
+                                continue
+                            uploaded = 0
+                            for mp4_file in sorted(task_dir.glob("*.mp4")):
+                                if uploaded >= max_per_task:
+                                    break
+                                try:
+                                    # 优先尝试转换为 GIF（更适合在线预览）
+                                    try:
+                                        import imageio.v2 as imageio
+                                        gif_path = mp4_file.with_suffix(".gif")
+                                        # 读取 mp4 -> GIF（采样降低体积）
+                                        reader = imageio.get_reader(mp4_file)
+                                        frames = []
+                                        for idx, frame in enumerate(reader):
+                                            if idx % 3 == 0:  # 每3帧取1帧，减小体积
+                                                frames.append(frame)
+                                            if len(frames) >= 150:  # 最多取150帧（约5s@30fps）
+                                                break
+                                        reader.close()
+                                        if frames:
+                                            imageio.mimsave(gif_path, frames, fps=10)
+                                            from swanlab import Video
+                                            log_metrics_to_swanlab({f'final/media/{task_dir.name}': Video(str(gif_path))}, step=num_train_steps)
+                                            uploaded += 1
+                                            continue
+                                    except Exception:
+                                        pass
+
+                                    # 如果无法生成 GIF，则退化为抽取 3 张关键帧图片上传（更稳妥）
+                                    try:
+                                        from PIL import Image
+                                        import cv2
+                                        cap = cv2.VideoCapture(str(mp4_file))
+                                        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+                                        picks = [int(total * r) for r in (0.1, 0.5, 0.9)] if total > 0 else [0, 5, 10]
+                                        imgs = []
+                                        for p in picks:
+                                            cap.set(cv2.CAP_PROP_POS_FRAMES, p)
+                                            ok, frame = cap.read()
+                                            if ok:
+                                                # BGR->RGB
+                                                frame = frame[:, :, ::-1]
+                                                imgs.append(Image.fromarray(frame))
+                                        cap.release()
+                                        if imgs:
+                                            # swanlab 支持多图一起记录：建议拼成 3 图一组
+                                            try:
+                                                from swanlab import Image as SLImage
+                                                log_metrics_to_swanlab(
+                                                    {f'final/media/{task_dir.name}_frames': [SLImage(img) for img in imgs]},
+                                                    step=num_train_steps
+                                                )
+                                                uploaded += 1
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
+                                except Exception as ie:
+                                    logging.getLogger(__name__).debug(f"Skip media {mp4_file}: {ie}")
+            except Exception as _err:
+                logging.getLogger(__name__).debug(f"SwanLab final media logging skipped: {_err}")
         
     except Exception as e:
         print(f"⚠️ 最终评估失败: {e}")
@@ -1684,7 +2047,136 @@ def setup_logging(output_dir: Path, console_level=logging.INFO, file_level=loggi
     warnings.filterwarnings("ignore", module="robosuite")
     warnings.filterwarnings("ignore", category=UserWarning, module="gym")
     
-    return logging.getLogger(__name__)
+    # 🔥 新增：过滤SwanLab和网络请求的DEBUG日志（避免刷屏）
+    logging.getLogger("urllib3").setLevel(logging.WARNING)  # HTTP请求日志
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.WARNING)  # 连接池日志
+    logging.getLogger("requests").setLevel(logging.WARNING)  # requests库日志
+    logging.getLogger("swanlab").setLevel(logging.INFO)  # SwanLab内部日志
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # 现代HTTP库日志
+    logging.getLogger("httpcore").setLevel(logging.WARNING)  # httpcore日志
+    
+    # 🔥 新增：过滤LeRobot/PI0配置解析的冗余DEBUG日志
+    logging.getLogger("lerobot").setLevel(logging.INFO)  # LeRobot库日志
+    logging.getLogger("lerobot.common.policies").setLevel(logging.INFO)  # 策略日志
+    logging.getLogger("lerobot.common.policies.pi0").setLevel(logging.INFO)  # PI0特定日志
+    logging.getLogger("simple_parsing").setLevel(logging.WARNING)  # 配置解析库日志
+    logging.getLogger("transformers").setLevel(logging.WARNING)  # Transformers库日志
+    logging.getLogger("tokenizers").setLevel(logging.WARNING)  # Tokenizers库日志
+    
+    # 🔥 设置根logger的控制台handler为INFO级别（更严格的过滤）
+    if console_level == logging.DEBUG:
+        console_handler.setLevel(logging.INFO)  # 即使用户要求DEBUG，控制台也只显示INFO及以上
+    
+    # 🔥 最终措施：如果这些DEBUG日志不是来自logging系统，可能需要在创建策略时临时重定向输出
+    
+    # 确保我们自己的logger可以输出详细信息到文件，但控制台保持简洁
+    our_logger = logging.getLogger(__name__)
+    our_logger.setLevel(logging.DEBUG)  # 保持我们自己的详细日志
+    
+    return our_logger
+
+def init_swanlab_if_enabled(config: dict, output_dir: Path) -> bool:
+    """
+    根据配置初始化 SwanLab
+    返回是否成功初始化
+    """
+    global SWANLAB_ENABLED, SWANLAB_RUN
+    
+    # 检查前置条件
+    if not HAS_SWANLAB:
+        return False
+        
+    logging_config = config.get('logging', {})
+    use_swanlab = logging_config.get('use_swanlab', False)
+    
+    if not use_swanlab:
+        return False
+    
+    # 检查多进程环境，仅主进程初始化
+    if os.environ.get("PI0_SILENT_IMPORT") == "1":
+        return False
+    
+    try:
+        # 从配置读取 SwanLab 参数
+        project = logging_config.get('swanlab_project', 'openpi-ript-vla')
+        run_name = logging_config.get('swanlab_run_name', config.get('exp_name', 'unnamed-run'))
+        mode = logging_config.get('swanlab_mode', 'online')
+        host = logging_config.get('swanlab_host', None)
+        run_id = logging_config.get('swanlab_id', None)
+        tags = logging_config.get('swanlab_tags', [])
+        
+        # 构建 SwanLab 配置
+        swanlab_config = {
+            'learning_rate': config.get('algo', {}).get('lr', 1e-5),
+            'rloo_batch_size': config.get('algo', {}).get('rloo_batch_size', 2),
+            'demo_batch_size': config.get('algo', {}).get('demo_batch_size', 1),
+            'num_train_steps': config.get('training', {}).get('num_train_steps', 1),
+            'cfg_enabled': config.get('policy', {}).get('cfg_enabled', False),
+            'benchmark_name': config.get('task', {}).get('benchmark_name', 'libero_spatial'),
+            'task_count': len(config.get('task', {}).get('task_names_to_use', [])),
+            'use_so100_processing': config.get('data_processing', {}).get('use_so100_processing', False),
+        }
+        
+        # 初始化 SwanLab
+        init_kwargs = {
+            'project': project,
+            'name': run_name,
+            'config': swanlab_config,
+            'tags': tags,
+        }
+        
+        if mode == 'offline':
+            init_kwargs['mode'] = 'offline'
+        if host:
+            init_kwargs['host'] = host
+        if run_id:
+            init_kwargs['id'] = run_id
+            
+        SWANLAB_RUN = swanlab.init(**init_kwargs)
+        SWANLAB_ENABLED = True
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"✅ SwanLab 已初始化: 项目={project}, 运行={run_name}, 模式={mode}")
+        
+        return True
+        
+    except Exception as e:
+        logger = logging.getLogger(__name__)
+        logger.warning(f"⚠️ SwanLab 初始化失败: {e}")
+        SWANLAB_ENABLED = False
+        return False
+
+def log_metrics_to_swanlab(metrics: dict, step: int = None):
+    """
+    安全记录标量指标到 SwanLab。
+    - 未启用/未安装：静默 no-op
+    - 记录失败：降级为 DEBUG 日志
+    """
+    if not (HAS_SWANLAB and SWANLAB_ENABLED):
+        return
+    try:
+        if step is not None:
+            swanlab.log(metrics, step=step)
+        else:
+            swanlab.log(metrics)
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"SwanLab 记录失败: {e}")
+
+def finish_swanlab():
+    """
+    安全结束 SwanLab 会话（支持重复调用）。
+    """
+    global SWANLAB_ENABLED, SWANLAB_RUN
+    if not (HAS_SWANLAB and SWANLAB_ENABLED):
+        return
+    try:
+        swanlab.finish()
+        logging.getLogger(__name__).info("✅ SwanLab 记录已结束")
+    except Exception as e:
+        logging.getLogger(__name__).debug(f"SwanLab 结束失败: {e}")
+    finally:
+        SWANLAB_ENABLED = False
+        SWANLAB_RUN = None
 
 def main():
     """主函数"""
@@ -1700,15 +2192,22 @@ def main():
         help="配置文件路径"
     )
     
-    args = parser.parse_args()
+    # 🔥 支持命令行override参数（类似hydra风格）
+    args, override_args = parser.parse_known_args()
     
     try:
         # 加载配置
         config = load_config(args.config_path)
         
+        # 🔥 应用命令行override参数
+        config = apply_overrides(config, override_args)
+        
         # 创建输出目录并设置日志
         output_dir = Path(config.get('output_dir', './experiments/stage11_default'))
         logger = setup_logging(output_dir)
+        
+        # 新增：初始化 SwanLab（仅主进程，按 YAML logging.use_swanlab 开关）
+        _ = init_swanlab_if_enabled(config, output_dir)
         
         # 启动摘要（控制台显示）
         current_file = Path(__file__).resolve()
@@ -1736,8 +2235,13 @@ def main():
             logger.debug(yaml.dump(config, default_flow_style=False, allow_unicode=True))
         logger.debug("====================")
         
-        # 开始RIPT-VLA风格的训练
-        main_training_loop_ript_vla_style(config)
+        # 新增：训练过程包裹，确保 SwanLab 正确结束
+        try:
+            # 可选：与 tqdm 兼容的日志重定向，避免刷屏
+            with logging_redirect_tqdm():
+                main_training_loop_ript_vla_style(config)
+        finally:
+            finish_swanlab()
         
     except KeyboardInterrupt:
         print("\n⚠️ 程序被用户中断")

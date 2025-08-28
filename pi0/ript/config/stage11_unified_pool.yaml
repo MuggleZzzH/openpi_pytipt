@@ -6,6 +6,9 @@ defaults:
   - paths  # 🔥 引入paths配置
   - _self_
 
+# 🔥 统一种子配置 - 所有随机性的根源
+global_seed: 42
+
 exp_name: stage11_unified_pool_test
 
 # === 基本路径配置（使用paths.yaml中的配置）===
@@ -99,31 +102,49 @@ data_processing:
   # 启用SO100处理 + 统一样本池
   use_so100_processing: true
   
-  # Legacy配置（SO100模式下忽略）
-  windowing_mode: last
-  window_stride: 10
-  max_windows_per_episode: 1
+  # # Legacy配置（SO100模式下忽略）
+  # windowing_mode: last
+  # window_stride: 10
+  # max_windows_per_episode: 1
 
 # === 训练配置 ===
 training:
   num_train_steps: 1  # 快速测试
-  seed: 42
+  seed: ${global_seed}
   n_steps: 3
   rollout_steps: 1
   log_interval: 1
   save_interval: 1
   load_obs: true
   save_freq: 1
+  
+  # 🔥 新增：控制台与 SwanLab 记录频率
+  console_log_interval: 5             # 控制台摘要频率（每 N 步）
+  swanlab_log_interval: 1             # SwanLab 记录频率（每 N 步）
+  max_collection_retries: 100
 
-# === 日志配置 ===
-logging:
-  use_wandb: false
-  log_freq: 1
-  group: null
-  mode: online
-  project: "openpi-ript-vla"
-  resume: true
-  save_code: true
+# # === 日志配置 ===
+# logging:
+#   use_wandb: false
+#   log_freq: 1
+#   group: null
+#   mode: online
+#   project: "openpi-ript-vla"
+#   resume: true
+#   save_code: true
+  
+  # 🔥 新增 SwanLab 配置
+  use_swanlab: true                    # SwanLab 总开关
+  swanlab_project: "openpi-ript-vla"   # SwanLab 项目名
+  swanlab_run_name: "${exp_name}"      # 运行名，引用顶层 exp_name
+  swanlab_mode: "online"               # "online" | "offline"
+  swanlab_host: null                   # 自托管时填入，如 "http://localhost:8000"
+  swanlab_id: null                     # 断点续训 run ID（可选）
+  swanlab_tags: ["stage11", "ript-vla", "so100", "libero"]  # 实验标签
+  swanlab_log_video_eval: false        # 是否在评估时记录视频
+  swanlab_video_max_per_task: 1        # 每任务最多记录视频数
+  swanlab_task_topk: 5                 # 任务级指标最多记录前 K 条（按成功率降序）
+  swanlab_log_task_table: true         # 是否用文本表记录所有任务成功率（可视化但不产生大量曲线）
 
 # === 特性开关 - 简化配置 ===
 features:
@@ -147,9 +168,15 @@ features:
   # 🎯 进度条显示配置
   progress:
     dataset_init: true              # 数据集初始化进度条
-    sample_collection: true         # 样本收集进度条
+    sample_collection: false        # 🔥 修改：关闭样本收集进度条（降噪）
     action_steps: true              # 动作执行进度条
     ascii: false                    # 是否使用ASCII字符进度条（兼容某些终端）
+    
+    # 🔥 新增：更细粒度控制
+    main_bar: true                  # 训练主进度条开关
+    gpu_memory: false               # GPU显存信息是否显示到控制台
+    refresh_interval: 0.5           # 进度条刷新间隔（秒）
+    show_postfix: true              # 是否显示 postfix 关键指标
 
   # 🔥 RIPT对齐：并行环境初始状态同步控制
   parallel_env_sync:
@@ -170,7 +197,7 @@ features:
     # 任务选择策略: random (随机任务) | round_robin (轮询任务)  
     task_selection: "random"
     # 随机采样的种子控制（用于可复现实验）
-    sampling_seed: 42
+    sampling_seed: ${global_seed}
 
 # === 🎯 统一样本池配置说明 ===
 # 
