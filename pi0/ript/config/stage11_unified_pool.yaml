@@ -61,6 +61,11 @@ algo:
   rollout_skip_threshold: 3
   enable_rollout_stats_tracking: false
   use_val_init: false
+  
+  # 🎯 算法级进度条配置
+  progress:
+    show_sample_pool_bar: true      # SO100样本池生成进度条
+    show_microbatch_bar: true       # 微批训练进度条
 
 # === 评估配置 ===
 rollout:
@@ -137,6 +142,13 @@ features:
 
   # 控制是否禁用动作裁剪（并行路径）
   disable_action_clipping: false
+
+  # 🎯 进度条显示配置
+  progress:
+    dataset_init: true              # 数据集初始化进度条
+    sample_collection: true         # 样本收集进度条
+    action_steps: true              # 动作执行进度条
+    ascii: false                    # 是否使用ASCII字符进度条（兼容某些终端）
 
   # 🔥 RIPT对齐：并行环境初始状态同步控制
   parallel_env_sync:

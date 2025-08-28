@@ -1141,18 +1141,21 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     from libero.libero.benchmark import get_benchmark
                     bm = get_benchmark(benchmark_name.lower())()
                     task_names = bm.get_task_names()
-                    print(f"🎯 自动获取任务列表: {len(task_names)} 个任务")
+                    logger.debug(f"🎯 自动获取任务列表: {len(task_names)} 个任务")
                 except Exception as e:
                     # 回退：保留原来的一个任务
                     task_names = ['pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate']
-                    print(f"⚠️ 自动获取任务失败，使用默认任务: {e}")
+                    logger.warning(f"⚠️ 自动获取任务失败，使用默认任务: {e}")
 
             # 🔥 构建每任务一个DataLoader/迭代器的字典结构
             from torch.utils.data import DataLoader
             task_to_loader = {}
             task_to_iter = {}
 
-            for tname in task_names:
+            # 读取进度条配置
+            show_dataset_progress = config.get('features', {}).get('progress', {}).get('dataset_init', True)
+            
+            for tname in tqdm_auto(task_names, desc="构建数据集", leave=False, disable=not show_dataset_progress):
                 # 为每个任务创建单独的数据集
                 ds = build_dataset_ript_aligned(
                     data_prefix=libero_data_prefix,
@@ -1174,20 +1177,20 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 task_to_loader[tname] = dl
                 task_to_iter[tname] = iter(dl)
 
-            print(f"✅ 按任务构建DataLoader: {len(task_names)} 个任务")
-            print(f"  数据路径: {libero_data_prefix}")
-            print(f"  基准: {benchmark_name}")
-            print(f"  任务列表: {task_names}")
-            print(f"  🔥 包含MuJoCo状态: True")
+            logger.info(f"✅ 按任务构建DataLoader: {len(task_names)} 个任务")
+            logger.debug(f"  数据路径: {libero_data_prefix}")
+            logger.debug(f"  基准: {benchmark_name}")
+            logger.debug(f"  任务列表: {task_names}")
+            logger.debug(f"  🔥 包含MuJoCo状态: True")
             
             # 🔥 多任务模式提示
             if len(task_names) > 1:
-                print(f"  🎯 多任务模式: 启用任务轮询，每组轮换不同任务")
-                print(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
+                logger.debug(f"  🎯 多任务模式: 启用任务轮询，每组轮换不同任务")
+                logger.debug(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
             else:
-                print(f"  📍 单任务模式: 所有组使用同一任务，仅demo轮换")
-                print(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
-                print(f"  💡 提示: 要测试多任务轮换，请在配置中添加更多task_names_to_use")
+                logger.debug(f"  📍 单任务模式: 所有组使用同一任务，仅demo轮换")
+                logger.debug(f"  📋 子demo轮换: 严格按顺序轮换（demo_0 → demo_1 → demo_2 ...）")
+                logger.debug(f"  💡 提示: 要测试多任务轮换，请在配置中添加更多task_names_to_use")
 
             # 兼容性：保留原有变量（但会在后续逻辑中被task_to_*替代）
             demo_dataloader = None
@@ -1205,11 +1208,11 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     'task_names': task_names,
                     'task_to_loader': task_to_loader,   # eval 如需也可复用
                 }
-            print(f"✅ 多任务运行时配置已设置，支持未来eval功能")
+            logger.debug(f"✅ 多任务运行时配置已设置，支持未来eval功能")
             
         except Exception as e:
-            print(f"⚠️ 多任务demo加载器创建失败: {e}")
-            print("  将使用传统的环境重置方式")
+            logger.warning(f"⚠️ 多任务demo加载器创建失败: {e}")
+            logger.debug("  将使用传统的环境重置方式")
             task_to_loader = {}
             task_to_iter = {}
             demo_dataloader = None
@@ -1272,7 +1275,10 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 all_collected_episodes = []
                 successful_groups = 0
 
-                for group_idx in range(demo_batch_size):
+                # 读取进度条配置
+                show_collection_progress = config.get('features', {}).get('progress', {}).get('sample_collection', True)
+                
+                for group_idx in tqdm_auto(range(demo_batch_size), desc="收集样本组", leave=False, disable=not show_collection_progress):
                     logger.debug(f"🔄 收集第 {group_idx + 1}/{demo_batch_size} 组...")
 
                     # 🔥 智能任务选择：多任务随机选择 vs 单任务直选
