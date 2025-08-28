@@ -477,6 +477,52 @@ def create_environment_runner(config: Dict[str, Any], policy):
     
     print(f"🔍 Runner选择: use_ript_vla_runner = {use_ript_vla}")
     
+    # 🎯 动态任务选择逻辑（与RIPT原版对齐）
+    def select_tasks_dynamically(config):
+        """根据配置动态选择任务"""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        task_config = config['task']
+        benchmark_name = task_config['benchmark_name']
+        selection_mode = task_config.get('task_selection_mode', 'auto_all')
+        manual_tasks = task_config.get('task_names_to_use', [])
+        
+        # 如果手动指定了任务且不为空，优先使用
+        if manual_tasks:
+            logger.info(f"📝 使用手动指定的任务: {len(manual_tasks)} 个")
+            return manual_tasks
+        
+        # 否则使用动态选择
+        try:
+            from libero.libero.benchmark import get_benchmark
+            bm = get_benchmark(benchmark_name.lower())()
+            all_task_names = bm.get_task_names()
+            
+            if selection_mode == 'auto_all':
+                selected_tasks = all_task_names
+                logger.info(f"🎯 自动获取所有任务: {len(selected_tasks)} 个 ({benchmark_name})")
+            elif selection_mode == 'auto_subset':
+                count = task_config.get('auto_task_count', 3)
+                selected_tasks = all_task_names[:count]
+                logger.info(f"🎯 自动获取前{count}个任务: {selected_tasks}")
+            else:  # manual但任务列表为空，回退到所有任务
+                selected_tasks = all_task_names
+                logger.warning(f"⚠️ 手动模式但任务列表为空，回退到所有任务: {len(selected_tasks)} 个")
+                
+            return selected_tasks
+            
+        except Exception as e:
+            # 回退方案：使用硬编码的任务
+            logger.warning(f"⚠️ 动态任务选择失败: {e}")
+            fallback_tasks = ['pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate']
+            logger.info(f"🔄 使用回退任务: {fallback_tasks}")
+            return fallback_tasks
+    
+    # 获取动态选择的任务列表
+    selected_task_names = select_tasks_dynamically(config)
+    config['task']['task_names_to_use'] = selected_task_names  # 更新配置
+    
     if use_ript_vla and RIPT_VLA_RUNNER_AVAILABLE:
         print("🚀 使用RIPT-VLA风格环境runner")
         
@@ -486,7 +532,7 @@ def create_environment_runner(config: Dict[str, Any], policy):
             rollouts_per_env=config['algo']['rloo_batch_size'],
             num_parallel_envs=config['task']['num_parallel_envs'],
             max_episode_length=config['task']['max_episode_length'],
-            task_names_to_use=config['task'].get('task_names_to_use', []),
+            task_names_to_use=selected_task_names,  # 使用动态选择的任务
             rank=0
         )
         
@@ -504,7 +550,7 @@ def create_environment_runner(config: Dict[str, Any], policy):
             rollouts_per_env=config['algo']['rloo_batch_size'],
             num_parallel_envs=config['task']['num_parallel_envs'],
             max_episode_length=config['task']['max_episode_length'],
-            task_names_to_use=config['task'].get('task_names_to_use', []),
+            task_names_to_use=selected_task_names,  # 使用动态选择的任务
             norm_stats_path=norm_stats_path,
             config=config,
             rank=0,
@@ -1735,23 +1781,28 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                     step_metrics['overall_success_rate'] = eval_results.get('overall_success_rate', 0.0)
                     step_metrics['task_success_rates'] = {k: v for k, v in eval_results.items() if k != 'overall_success_rate'}
                     print(f"📊 评估完成 - 总体成功率: {eval_results.get('overall_success_rate', 0.0):.2%}")
-                    
-                    # 新增：记录评估到 SwanLab（限制任务级粒度）
+
+                    # 新增：记录评估到 SwanLab（总体单独图 + 所有任务同一图）
                     try:
                         if SWANLAB_ENABLED:
                             logging_config = config.get('logging', {})
-                            topk = int(logging_config.get('swanlab_task_topk', 5))
                             log_table = bool(logging_config.get('swanlab_log_task_table', True))
 
-                            # 1) 总体成功率
+                            # 1) 总体成功率 - 单独一个图表
                             eval_overall = float(eval_results.get('overall_success_rate', 0.0))
                             log_metrics_to_swanlab({'eval/overall_success_rate': eval_overall}, step=steps_done)
 
-                            # 2) 任务级 Top-K（避免产生过多曲线）
+                            # 2) 所有任务成功率 - 同一个图表中的多条线
                             task_rates = {k: float(v) for k, v in eval_results.items() if k != 'overall_success_rate'}
                             if task_rates:
-                                top_items = sorted(task_rates.items(), key=lambda kv: kv[1], reverse=True)[:topk]
-                                log_metrics_to_swanlab({f'eval/task/{k}': v for k, v in top_items}, step=steps_done)
+                                # 🎯 所有任务都记录到同一个命名空间，SwanLab会自动在同一图中显示多条线
+                                all_task_metrics = {}
+                                for task_name, success_rate in task_rates.items():
+                                    # 简化任务名以便图例显示
+                                    short_name = task_name.replace('pick_up_the_black_bowl_', '').replace('_and_place_it_on_the_plate', '')
+                                    all_task_metrics[f'eval/tasks/{short_name}'] = success_rate
+
+                                log_metrics_to_swanlab(all_task_metrics, step=steps_done)
 
                                 # 3) 可选：用文本表记录"所有任务成功率"（一次性写入，不生成大量指标）
                                 if log_table:
@@ -1891,20 +1942,27 @@ def main_training_loop_ript_vla_style(config: Dict[str, Any]):
                 json.dump(final_eval_results, f, indent=2)
             print(f"📄 最终评估结果已保存: {final_eval_path}")
             
-            # 新增：最终评估也写入 SwanLab（Top-K + 文本表）
+            # 新增：最终评估也写入 SwanLab（总体单独图 + 所有任务同一图）
             try:
                 if SWANLAB_ENABLED:
                     logging_config = config.get('logging', {})
-                    topk = int(logging_config.get('swanlab_task_topk', 5))
                     log_table = bool(logging_config.get('swanlab_log_task_table', True))
 
+                    # 1) 最终总体成功率 - 单独一个图表
                     overall = float(final_eval_results.get('overall_success_rate', 0.0))
                     log_metrics_to_swanlab({'final/overall_success_rate': overall}, step=num_train_steps)
 
+                    # 2) 所有任务最终成功率 - 同一个图表中的多条线
                     task_rates = {k: float(v) for k, v in final_eval_results.items() if k != 'overall_success_rate'}
                     if task_rates:
-                        top_items = sorted(task_rates.items(), key=lambda kv: kv[1], reverse=True)[:topk]
-                        log_metrics_to_swanlab({f'final/task/{k}': v for k, v in top_items}, step=num_train_steps)
+                        # 🎯 所有任务都记录到同一个命名空间，SwanLab会自动在同一图中显示多条线
+                        final_task_metrics = {}
+                        for task_name, success_rate in task_rates.items():
+                            # 简化任务名以便图例显示
+                            short_name = task_name.replace('pick_up_the_black_bowl_', '').replace('_and_place_it_on_the_plate', '')
+                            final_task_metrics[f'final/tasks/{short_name}'] = success_rate
+                        
+                        log_metrics_to_swanlab(final_task_metrics, step=num_train_steps)
 
                         if log_table:
                             try:
@@ -2245,10 +2303,18 @@ def main():
         
     except KeyboardInterrupt:
         print("\n⚠️ 程序被用户中断")
+        # 🔥 关键：确保中断时也能同步 SwanLab
+        finish_swanlab()
+        print("✅ SwanLab 数据已同步")
     except Exception as e:
         print(f"\n❌ 程序执行出错: {e}")
         traceback.print_exc()
+        # 🔥 异常时也要同步 SwanLab
+        finish_swanlab()
         sys.exit(1)
+    finally:
+        # 🔥 最后的保险：确保 SwanLab 正确结束
+        finish_swanlab()
 
 if __name__ == "__main__":
     main()

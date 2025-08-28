@@ -1,0 +1,21 @@
+# LIBERO Goal 基准配置示例
+# 继承基础配置，只修改特定部分
+
+defaults:
+  - stage11_unified_pool  # 继承主配置
+  - _self_
+
+# 覆盖任务配置
+task:
+  benchmark_name: "libero_goal"            # 🎯 更改为goal基准
+  task_selection_mode: "auto_all"          # 自动获取所有goal任务
+  num_parallel_envs: 2
+
+# 覆盖SwanLab配置（分层命名）
+logging:
+  swanlab_project: "ript-eval"
+  swanlab_run_name: "goal_${exp_name}"     # 🏷️ goal前缀
+  swanlab_tags: ["libero_goal", "stage11", "ript-vla"]
+
+# 实验名称
+exp_name: "goal_eval_test"

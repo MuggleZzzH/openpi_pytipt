@@ -17,24 +17,25 @@ norm_stats_path: "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json"
 output_dir: "/zhaohan/ZJH/openpi_pytorch/experiments/stage11_unified_pool"  # 🔥 直接使用绝对路径
 data_prefix: "/zhaohan/ZJH/openpi_pytorch/datasets"  # 🔥 直接使用绝对路径
 # === 任务配置 ===
+# === 任务配置 - 支持多种模式 ===
 task:
-  benchmark_name: "libero_spatial"         # 🔥 修复：使用小写格式
-  task_names_to_use:
-    # 🎯 多任务测试：选择4个不同的spatial任务进行轮换
-    - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"
-    - "pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_stove_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate"
-    # # 💡 要测试单任务模式，注释掉除第一个外的所有任务
-    # # 💡 要测试更多任务，取消注释下面的任务：
-    # - "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_ramekin_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_on_the_wooden_cabinet_and_place_it_on_the_plate"
-    # - "pick_up_the_black_bowl_in_the_top_drawer_of_the_wooden_cabinet_and_place_it_on_the_plate"
-  num_parallel_envs: 2  # 🔥 单环境避免内存问题
-  max_episode_length: null  # 🔥 进一步限制episode长度减少样本数
+  benchmark_name: "libero_spatial"         # 基准测试类型
+  
+  # 🎯 任务选择模式（三选一）:
+  # 模式1: 自动获取所有任务（推荐）
+  task_selection_mode: "auto_all"          # auto_all | auto_subset | manual
+  
+  # 模式2: 自动获取部分任务（当auto_subset时使用）
+  auto_task_count: 3                       # 从基准中自动选择前N个任务
+  
+  # 模式3: 手动指定任务（当manual时使用，留空表示使用自动模式）
+  task_names_to_use: []
+    # 💡 手动模式示例（取消注释下面的任务）：
+    # - "pick_up_the_black_bowl_from_table_center_and_place_it_on_the_plate"
+    # - "pick_up_the_black_bowl_next_to_the_plate_and_place_it_on_the_plate"
+  
+  num_parallel_envs: 2                     # 并行环境数
+  max_episode_length: null                 # 最大episode长度
 
 # 🔥 LIBERO数据集配置（与原版RIPT对齐）
 use_libero_demos: true                   # 关闭demo初始状态，匹配 2_pi0 的默认reset
@@ -123,27 +124,27 @@ training:
   swanlab_log_interval: 1             # SwanLab 记录频率（每 N 步）
   max_collection_retries: 100
 
-# # === 日志配置 ===
-# logging:
-#   use_wandb: false
-#   log_freq: 1
-#   group: null
-#   mode: online
-#   project: "openpi-ript-vla"
-#   resume: true
-#   save_code: true
+# === 日志配置 ===
+logging:
+  use_wandb: false
+  log_freq: 1
+  group: null
+  mode: online
+  project: "openpi-ript-vla"
+  resume: true
+  save_code: true
   
-  # 🔥 新增 SwanLab 配置
+  # 🔥 SwanLab 分层实验命名配置
   use_swanlab: true                    # SwanLab 总开关
-  swanlab_project: "openpi-ript-vla"   # SwanLab 项目名
-  swanlab_run_name: "${exp_name}"      # 运行名，引用顶层 exp_name
+  swanlab_project: "ript-eval"         # 🎯 大类项目名（eval/train/debug等）
+  swanlab_run_name: "${task.benchmark_name}_${exp_name}"  # 🎯 小类运行名：spatial_exp_name
   swanlab_mode: "online"               # "online" | "offline"
   swanlab_host: null                   # 自托管时填入，如 "http://localhost:8000"
   swanlab_id: null                     # 断点续训 run ID（可选）
-  swanlab_tags: ["stage11", "ript-vla", "so100", "libero"]  # 实验标签
+  swanlab_tags: ["${task.benchmark_name}", "stage11", "ript-vla", "unified-pool"]  # 🎯 动态标签
   swanlab_log_video_eval: false        # 是否在评估时记录视频
   swanlab_video_max_per_task: 1        # 每任务最多记录视频数
-  swanlab_task_topk: 5                 # 任务级指标最多记录前 K 条（按成功率降序）
+  swanlab_task_topk: 10                 # 任务级指标最多记录前 K 条（按成功率降序）
   swanlab_log_task_table: true         # 是否用文本表记录所有任务成功率（可视化但不产生大量曲线）
 
 # === 特性开关 - 简化配置 ===
