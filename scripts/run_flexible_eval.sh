@@ -70,3 +70,5 @@ python 11_train_ript_vla_style.py \
 echo "----------------------------------------"
 echo "✅ 评估完成"
 echo "📊 结果查看: SwanLab > ${SWANLAB_PROJECT} > ${SWANLAB_RUN_NAME}"
+
+

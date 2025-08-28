@@ -35,3 +35,5 @@ python 11_train_ript_vla_style.py \
   features.dynamic_sampling.enabled=false \
   algo.rloo_batch_size=4 \
   unified_pool_batch_size=16
+
+

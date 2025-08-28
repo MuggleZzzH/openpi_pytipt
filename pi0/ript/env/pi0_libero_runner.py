@@ -1173,32 +1173,15 @@ class LIBEROEnvRunner:
                 logger.warning(f"⚠️ 独立环境工厂不可用，回退到单环境模式")
             return self._create_single_env(env_name)
         
-        # 计算GPU内存需求
-        model_size_gb = 3.5  # PI0模型大小
-        required_memory_gb = self.num_parallel_envs * model_size_gb
+
         
-        # 检查GPU内存
-        available_memory_gb = 0
-        current_usage = 0
-        if torch.cuda.is_available():
-            available_memory_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-            current_usage = torch.cuda.memory_allocated(0) / (1024**3)
-            available_memory = available_memory_gb - current_usage
+        # 🔥 重要：子进程不加载模型，模型只在主进程中！
+        
+
         
         if self.rank == 0:
             logger.debug(f"🚀 尝试创建真正的多进程并行环境:")
-            logger.debug(f"🧠 内存分析:")
-            logger.debug(f"   {self.num_parallel_envs}个并行环境理论需要: {required_memory_gb:.1f}GB")
-            logger.debug(f"   当前GPU总内存: {available_memory_gb:.1f}GB") 
-            logger.debug(f"   当前GPU已使用: {current_usage:.1f}GB")
-            logger.debug(f"   可用内存: {available_memory:.1f}GB")
-        
-        # 内存安全检查
-        if available_memory < required_memory_gb * 1.2:
-            if self.rank == 0:
-                logger.warning(f"⚠️ GPU内存不足，回退到单环境模式")
-            return self._create_single_env(env_name)
-        
+
         try:
             # 🔑 关键：使用独立环境工厂，避免序列化self对象
             # 🔥 关键修复：使用固定初始状态ID确保并行环境同步

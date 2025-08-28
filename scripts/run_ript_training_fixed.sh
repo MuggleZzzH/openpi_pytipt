@@ -4,7 +4,7 @@
 # 用法: ./run_ript_training_fixed.sh [可修改下面的参数]
 
 # 🎯 分层实验配置
-PROJECT_CATEGORY="ript-eval"          # 大类：eval/train/debug等
+PROJECT_CATEGORY="ript-training"          # 大类：eval/train/debug等
 BENCHMARK_TYPE="libero_spatial"       # 基准测试：spatial/goal/object等  
 EXPERIMENT_BASE="stage11_unified_pool_test"
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"

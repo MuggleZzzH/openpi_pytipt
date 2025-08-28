@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ==============================================================================
-# Bash 脚本: LIBERO Goal 评估实验 (本地环境版本)
+# Bash 脚本: LIBERO Object 评估实验 (本地环境版本)
 #
 # 功能:
 #   - 仿照 libero_spatial.sh 案例，实现健壮的脚本执行
 #   - 双重输出: 使用 'tee' 命令将所有输出同时打印到终端并写入日志文件。
-#   - 日志管理: 自动在 'eval_logs/libero_goal' 目录下创建带时间戳的日志文件。
+#   - 日志管理: 自动在 'eval_logs/libero_object' 目录下创建带时间戳的日志文件。
 #   - 健壮性设计: 任何命令失败时立即退出 (set -eo pipefail)。
 #   - 动态路径: 自动定位项目根目录，确保脚本可在任何位置执行。
 #   - 环境激活: 自动激活指定的 Conda 环境 (mix)。
@@ -16,7 +16,7 @@
 set -eo pipefail
 
 # --- 步骤 1: 设置日志文件 ---
-LOG_DIR="eval_logs/libero_goal"
+LOG_DIR="eval_logs/libero_object"
 mkdir -p "$LOG_DIR"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="${LOG_DIR}/eval_run_${TIMESTAMP}.log"
@@ -59,8 +59,8 @@ LOG_FILE="${LOG_DIR}/eval_run_${TIMESTAMP}.log"
     # --- 步骤 5: 设置实验参数 ---
     echo "--- 步骤 5: 设置实验参数 ---"
     PROJECT_CATEGORY="ript-eval"           # 大类：评估实验
-    BENCHMARK_TYPE="libero_goal"           # 小类：goal基准
-    EXPERIMENT_BASE="eval_goal"            # 实验基础名
+    BENCHMARK_TYPE="libero_object"         # 小类：object基准
+    EXPERIMENT_BASE="eval_object"          # 实验基础名
     EXPERIMENT_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
     EXPERIMENT_NAME="${EXPERIMENT_BASE}_${EXPERIMENT_TIMESTAMP}"
 
@@ -68,7 +68,7 @@ LOG_FILE="${LOG_DIR}/eval_run_${TIMESTAMP}.log"
     SWANLAB_PROJECT="${PROJECT_CATEGORY}"  
     SWANLAB_RUN_NAME="${BENCHMARK_TYPE}_${EXPERIMENT_NAME}"
 
-    echo "🎯 LIBERO Goal 评估实验"
+    echo "🎯 LIBERO Object 评估实验"
     echo "📊 SwanLab项目: ${SWANLAB_PROJECT}"
     echo "🏷️  SwanLab运行: ${SWANLAB_RUN_NAME}"
     echo "----------------------------------------"
@@ -98,4 +98,5 @@ LOG_FILE="${LOG_DIR}/eval_run_${TIMESTAMP}.log"
     echo "========================================================"
 
 } 2>&1 | tee "$LOG_FILE"
+
 
