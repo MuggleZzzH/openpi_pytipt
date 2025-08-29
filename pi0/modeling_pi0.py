@@ -68,7 +68,7 @@ class PI0Policy(PreTrainedPolicy):
             "lang_masks": float32 [*b, l],
         }
         either provide `prompt` or (`lang_tokens`, `lang_masks`).
-        cfg_scale: CFG guidance scale for conditional generation
+        cfg_scale: CFG guidance scale (ignored in this version for compatibility)
         """
         self.eval()
 
@@ -81,7 +81,7 @@ class PI0Policy(PreTrainedPolicy):
         return actions
 
     def forward(
-        self, batch: dict[str, Tensor], noise=None, time=None, is_positive=None
+        self, batch: dict[str, Tensor], noise=None, time=None
     ) -> tuple[Tensor, dict[str, Tensor]]:
         """Do a full training forward pass to compute the loss
 
@@ -95,7 +95,6 @@ class PI0Policy(PreTrainedPolicy):
             "lang_masks": float32 [*b, l],
             "action": float32 [*b, ha, da]
         }
-        is_positive: int32 [*b] optional CFG conditioning (1=positive, 0=unconditional)
         """
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
@@ -103,11 +102,10 @@ class PI0Policy(PreTrainedPolicy):
         actions, action_dim = self.prepare_action(batch)
         noise = batch.get("noise", None)
         time = batch.get("time", None)
-        is_positive = batch.get("is_positive", is_positive)
 
         loss_dict = {}
         losses = self.model.forward(
-            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time, is_positive
+            images, img_masks, lang_tokens, lang_masks, state, actions, noise, time
         )
 
         actions_is_pad = batch.get("action_is_pad", None)
@@ -143,13 +141,6 @@ class PI0Policy(PreTrainedPolicy):
         present_img_keys = [key for key in IMAGE_KEYS if key in observation["image"]]
         missing_img_keys = [key for key in IMAGE_KEYS if key not in present_img_keys]
 
-        # 兜底：如果没有任何相机键，创建占位符供missing_img_keys使用
-        dummy_img = None
-        if len(present_img_keys) == 0:
-            # 用配置的目标尺寸构造占位符
-            C, H, W = 3, self.config.resize_imgs_with_padding[0], self.config.resize_imgs_with_padding[1]
-            dummy_img = torch.full((bsize, C, H, W), -1.0, dtype=dtype, device=observation["state"].device)
-
         for key in present_img_keys:
             # resize, pad, and normalize
             img = observation["image"][key]
@@ -162,8 +153,7 @@ class PI0Policy(PreTrainedPolicy):
             if torch.is_floating_point(img) and img.max() <= 1.0 + 1e-3:
                 img = img * 255.0
 
-            # 图像处理使用fp32确保视觉编码稳定性（特别是混精训练时）
-            img = img.to(torch.float32) / 127.5 - 1.0
+            img = img.to(dtype) / 127.5 - 1.0
             img = resize_with_pad(
                 img, *self.config.resize_imgs_with_padding, pad_value=-1.0
             )
@@ -171,11 +161,10 @@ class PI0Policy(PreTrainedPolicy):
             img_masks.append(torch.ones((bsize,), dtype=torch.bool, device=img.device))
 
         for key in missing_img_keys:
-            # 使用最后处理的图像或占位符创建缺失相机的填充
-            reference_img = dummy_img if len(present_img_keys) == 0 else img
-            missing_img = torch.full_like(reference_img, fill_value=-1.0)
-            images.append(missing_img)
-            img_masks.append(torch.zeros((bsize,), dtype=torch.bool, device=missing_img.device))
+            # zero padding
+            img = torch.full_like(img, fill_value=-1.0)
+            images.append(img)
+            img_masks.append(torch.zeros((bsize,), dtype=torch.bool, device=img.device))
 
         images = torch.stack(images, dim=1)  # (*b, n, c, h, w)
         img_masks = torch.stack(img_masks, dim=1)  # (*b, n)
@@ -199,17 +188,8 @@ class PI0Policy(PreTrainedPolicy):
                     img_arr = images[0, cam_idx].cpu().numpy()  # (C,H,W)
                     print(f"[DEBUG] processed_cam{cam_idx}: shape={img_arr.shape}, "
                           f"range=[{img_arr.min():.3f}, {img_arr.max():.3f}]")
-                    
-                    # 🔧 修复：正确处理图像数据范围
-                    # images已经在prepare_images中归一化到[-1, 1]，所以需要反归一化到[0, 255]
-                    if img_arr.min() >= -1.1 and img_arr.max() <= 1.1:
-                        # 图像已归一化到[-1, 1]，反归一化到[0, 255]
-                        img_arr = ((img_arr + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
-                    else:
-                        # 图像仍在原始范围，直接转换
-                        img_arr = img_arr.clip(0, 255).astype(np.uint8)
-                    
-                    img_arr = np.transpose(img_arr, (1, 2, 0))  # CHW -> HWC
+                    img_arr = ((img_arr + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+                    img_arr = np.transpose(img_arr, (1, 2, 0))  # -> HWC
                     imageio.imwrite(os.path.join(save_dir, f"processed_cam{cam_idx}.png"), img_arr)
                 
                 # 只提示一次
@@ -282,7 +262,6 @@ class PI0Policy(PreTrainedPolicy):
             tokenized_prompt = self.language_tokenizer.__call__(
                 prompt,
                 padding="max_length",
-                # truncation=True,  # 避免长描述造成意外差异
                 padding_side="right",
                 max_length=self.config.tokenizer_max_length,
                 return_tensors="pt",
@@ -349,13 +328,6 @@ class PI0FlowMatching(nn.Module):
             self.config.proj_width, self.config.max_action_dim
         )
 
-        # Backward-compat for old checkpoints (trained w/o CFG)
-        # If your config doesn't set this, it defaults to False for original checkpoint compatibility
-        self.cfg_enabled = bool(getattr(self.config, "cfg_enabled", False))
-        
-        # CFG conditioning embedding layer (only used when cfg_enabled=True)
-        self.cfg_emb = nn.Embedding(2, self.config.proj_width)  # 0=unconditional, 1=conditional
-
         self.action_time_mlp_in = nn.Linear(
             self.config.proj_width * 2, self.config.proj_width
         )
@@ -416,14 +388,13 @@ class PI0FlowMatching(nn.Module):
         )
         return embs, pad_masks, att_masks
 
-    def embed_suffix(self, state, noisy_actions, timestep, is_positive=None):
+    def embed_suffix(self, state, noisy_actions, timestep):
         """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing.
 
         Args:
             state (torch.Tensor):         float32 (*b, s) robot state
             noisy_actions (torch.Tensor): float32 (*b, n, m) noisy actions
             timestep (torch.Tensor):      float32 (*b,) timestep in [0, 1] range
-            is_positive (torch.Tensor):   int32 (*b,) conditional indicator (1=positive, 0=unconditional)
         """
         bsize = state.shape[0]
         device = state.device
@@ -431,12 +402,6 @@ class PI0FlowMatching(nn.Module):
 
         # embed state
         state_emb = self.state_proj(state)
-        
-        # CFG: only add embedding if CFG is enabled AND is_positive is provided
-        if (is_positive is not None) and getattr(self, "cfg_enabled", False):
-            cfg_emb = self.cfg_emb(is_positive).to(dtype=dtype)
-            # Add CFG embedding to state embedding
-            state_emb = state_emb + cfg_emb
 
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
@@ -484,7 +449,6 @@ class PI0FlowMatching(nn.Module):
         actions,
         noise=None,
         time=None,
-        is_positive=None,
     ) -> Tensor:
         bsize = state.shape[0]
         dtype = state.dtype
@@ -510,7 +474,7 @@ class PI0FlowMatching(nn.Module):
             images, img_masks, lang_tokens, lang_masks
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, time, is_positive
+            state, x_t, time
         )
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -533,26 +497,16 @@ class PI0FlowMatching(nn.Module):
         return losses
 
     def sample_actions(
-        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, cfg_scale=1.0
+        self, images, img_masks, lang_tokens, lang_masks, state, noise=None, cfg_scale: float = 1.0
     ) -> Tensor:
-        """Do a full inference forward and compute the action with CFG support
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
         
-        cfg_scale: CFG guidance scale. 1.0 = no guidance, >1.0 = stronger guidance
+        Args:
+            cfg_scale: CFG guidance scale (ignored in this version for compatibility)
         """
         bsize = state.shape[0]
         device = state.device
         dtype = state.dtype
-        
-        # 🔥 新增：打印CFG推理参数
-        if hasattr(self, '_cfg_debug_counter'):
-            self._cfg_debug_counter += 1
-        else:
-            self._cfg_debug_counter = 1
-        
-        # 每10次推理打印一次，避免过多输出
-        if self._cfg_debug_counter % 10 == 1 or cfg_scale != getattr(self, '_last_cfg_scale', 1.0):
-            print(f"🚀 CFG推理 #{self._cfg_debug_counter}: batch_size={bsize}, cfg_scale={cfg_scale:.2f}, device={device}")
-            self._last_cfg_scale = cfg_scale
 
         if noise is None:
             actions_shape = (
@@ -583,36 +537,10 @@ class PI0FlowMatching(nn.Module):
         time = torch.tensor(1.0, dtype=dtype, device=device)
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
-            
-            # 🔥 旧权重兼容性检查：只有cfg_enabled=True的模型才支持CFG推理
-            if not getattr(self, "cfg_enabled", False) or cfg_scale == 1.0:
-                # 单分支推理：旧权重或cfg_scale=1时
-                if self._cfg_debug_counter % 50 == 1:  # 减少频率
-                    print(f"   → 单分支推理: cfg_enabled={getattr(self, 'cfg_enabled', False)}")
-                v_t = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=None
-                )
-            else:
-                # 双分支CFG推理：只有训练过CFG的新权重才进入此路径
-                if self._cfg_debug_counter % 50 == 1:  # 减少频率
-                    print(f"   → 双分支CFG推理: 条件分支 + 无条件分支, 合成系数={cfg_scale:.2f}")
-                
-                # 构造is_positive标志张量 (CFG需要LongTensor)
-                cond_flag = torch.ones(bsize, dtype=torch.long, device=device)
-                uncond_flag = torch.zeros(bsize, dtype=torch.long, device=device)
-                
-                # 条件分支
-                v_t_cond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=cond_flag
-                )
-                
-                # 无条件分支
-                v_t_uncond = self.predict_velocity(
-                    state, prefix_pad_masks, past_key_values, x_t, expanded_time, is_positive=uncond_flag
-                )
-                
-                # 标准CFG合成公式
-                v_t = v_t_uncond + cfg_scale * (v_t_cond - v_t_uncond)
+
+            v_t = self.predict_velocity(
+                state, prefix_pad_masks, past_key_values, x_t, expanded_time
+            )
 
             # Euler step
             x_t += dt * v_t
@@ -620,10 +548,10 @@ class PI0FlowMatching(nn.Module):
 
         return x_t
 
-    def predict_velocity(self, state, prefix_pad_masks, past_key_values, x_t, timestep, is_positive=None):
+    def predict_velocity(self, state, prefix_pad_masks, past_key_values, x_t, timestep):
         """predict velocity at time t using the suffix model."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(
-            state, x_t, timestep, is_positive
+            state, x_t, timestep
         )
 
         suffix_len = suffix_pad_masks.shape[1]

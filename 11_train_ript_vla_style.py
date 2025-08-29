@@ -526,10 +526,18 @@ def create_environment_runner(config: Dict[str, Any], policy):
     if use_ript_vla and RIPT_VLA_RUNNER_AVAILABLE:
         print("🚀 使用RIPT-VLA风格环境runner")
         
+        # 统一rollouts_per_env语义：优先使用评估配置，其次回退到rloo_batch_size
+        _rollouts_per_env_effective = (
+            config.get('rollout', {}).get('rollouts_per_env', None)
+            if isinstance(config, dict) else None
+        )
+        if _rollouts_per_env_effective is None:
+            _rollouts_per_env_effective = config['algo']['rloo_batch_size']
+
         runner = PI0LiberoRunner(
             policy=policy,
             benchmark_name=config['task']['benchmark_name'],
-            rollouts_per_env=config['algo']['rloo_batch_size'],
+            rollouts_per_env=_rollouts_per_env_effective,
             num_parallel_envs=config['task']['num_parallel_envs'],
             max_episode_length=config['task']['max_episode_length'],
             task_names_to_use=selected_task_names,  # 使用动态选择的任务
@@ -544,10 +552,18 @@ def create_environment_runner(config: Dict[str, Any], policy):
         if not norm_stats_path:
             norm_stats_path = f"{config['policy_path']}/norm_stats.json"
         
+        # 统一rollouts_per_env语义：优先使用评估配置，其次回退到rloo_batch_size
+        _rollouts_per_env_effective = (
+            config.get('rollout', {}).get('rollouts_per_env', None)
+            if isinstance(config, dict) else None
+        )
+        if _rollouts_per_env_effective is None:
+            _rollouts_per_env_effective = config['algo']['rloo_batch_size']
+
         runner = LIBEROEnvRunner(
             policy=policy,
             benchmark_name=config['task']['benchmark_name'],
-            rollouts_per_env=config['algo']['rloo_batch_size'],
+            rollouts_per_env=_rollouts_per_env_effective,
             num_parallel_envs=config['task']['num_parallel_envs'],
             max_episode_length=config['task']['max_episode_length'],
             task_names_to_use=selected_task_names,  # 使用动态选择的任务

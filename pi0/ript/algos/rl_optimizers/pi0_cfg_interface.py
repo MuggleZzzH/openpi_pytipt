@@ -883,17 +883,11 @@ class PI0_CFG_Adapter(RLModelInterface):
                     base_images_seq.append(base_img)
                     wrist_images_seq.append(wrist_img)
 
-                    # 动作(7维) - 使用稳健的7维整理逻辑
+                    # 动作数据处理 - 仅进行二维降一维
                     arr = np.asarray(act_t, dtype=np.float32)
                     if arr.ndim == 2 and arr.shape[0] == 1:
+                        print(f"🔧 动作数据降维: {arr.shape} -> {arr[0].shape}")
                         arr = arr[0]
-                    if arr.ndim == 0:  # 标量，广播到 7 维
-                        arr = np.full(7, float(arr), np.float32)
-                    if arr.size != 7:
-                        buf = np.zeros(7, np.float32)
-                        n = min(7, arr.size)
-                        buf[:n] = arr[:n]
-                        arr = buf
                     actions_seq.append(arr)
 
                 # 🔥 窗口化采样：根据模式产生多个窗口

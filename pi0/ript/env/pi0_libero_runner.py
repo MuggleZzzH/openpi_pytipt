@@ -1328,7 +1328,19 @@ class LIBEROEnvRunner:
             print(f"🚀 开始并行执行 {env_num} 个环境")
         
         # 计算需要的轮次
-        eval_loop_num = (self.rollouts_per_env + env_num - 1) // env_num
+        # 若调用方明确给定了init_states，则以其长度为准（避免日志与实际不一致）
+        total_needed = None
+        try:
+            if init_states is not None:
+                if isinstance(init_states, list):
+                    total_needed = len(init_states)
+                elif isinstance(init_states, np.ndarray):
+                    total_needed = int(init_states.shape[0]) if init_states.ndim >= 1 else 1
+        except Exception:
+            total_needed = None
+
+        effective_total = total_needed if (total_needed is not None and total_needed > 0) else self.rollouts_per_env
+        eval_loop_num = (effective_total + env_num - 1) // env_num
         count = 0
         
         while count < eval_loop_num:
