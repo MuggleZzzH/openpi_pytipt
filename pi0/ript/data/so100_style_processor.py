@@ -51,10 +51,8 @@ class SO100StyleProcessor:
     
     def _load_normalization_stats(self):
         """Load normalization statistics following 2_pi0_on_libero.py pattern."""
-        norm_stats_path = self.config.get('norm_stats_path', 
-            "/zhaohan/ZJH/openpi_pytorch/lerobot_dataset/norm_stats.json")
-        
-        if not Path(norm_stats_path).exists():
+        norm_stats_path = self.config.get('norm_stats_path', None)
+        if not norm_stats_path or not Path(norm_stats_path).exists():
             raise FileNotFoundError(f"Normalization stats not found: {norm_stats_path}")
         
         with open(norm_stats_path) as f:

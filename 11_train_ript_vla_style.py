@@ -886,11 +886,18 @@ def update_policy_with_gradient_accumulation(policy, optimizer, cfg_adapter, epi
     
     policy.train()
     
-    # 🔥 关键：使用AMP的GradScaler（新版本API）
-    try:
-        scaler = torch.amp.GradScaler('cuda')  # 新版本API
-    except AttributeError:
-        scaler = torch.cuda.amp.GradScaler()  # 旧版本兼容
+    # 🔥 关键：根据训练精度决定是否启用GradScaler（仅FP16才需要）
+    # 假设使用BF16（根据代码中的torch.bfloat16），如需FP16可通过配置调整
+    use_fp16 = config.get('training', {}).get('use_fp16', False)  # 默认使用BF16
+    autocast_dtype = torch.float16 if use_fp16 else torch.bfloat16
+    
+    if autocast_dtype is torch.float16:
+        try:
+            scaler = torch.amp.GradScaler('cuda')  # 新版本API
+        except AttributeError:
+            scaler = torch.cuda.amp.GradScaler()  # 旧版本兼容
+    else:
+        scaler = None  # BF16不使用GradScaler
     
     # 使用标准梯度累积方法
     return update_policy_with_gradient_accumulation_fallback(

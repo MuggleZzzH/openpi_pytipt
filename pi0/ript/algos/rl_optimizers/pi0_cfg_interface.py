@@ -106,6 +106,9 @@ class PI0_CFG_Adapter(RLModelInterface):
             print(f"  State std shape: {self.state_std.shape}")
             print(f"  Action mean shape: {self.action_mean.shape}")
             print(f"  Action std shape: {self.action_std.shape}")
+            
+            # 记录下实际使用的路径，供 SO100 初始化时使用
+            self._norm_stats_path = norm_stats_path
         else:
             print("⚠️  Warning: No norm_stats.json found, using identity normalization")
             # 使用单位归一化（不进行归一化）
@@ -113,6 +116,9 @@ class PI0_CFG_Adapter(RLModelInterface):
             self.state_std = np.ones(8, dtype=np.float32)
             self.action_mean = np.zeros(7, dtype=np.float32)
             self.action_std = np.ones(7, dtype=np.float32)
+            
+            # 记录下实际使用的路径，供 SO100 初始化时使用
+            self._norm_stats_path = None
 
     def _initialize_so100_processors(self):
         """
@@ -126,7 +132,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         # Create configuration for SO100 processors
         so100_config = {
             'action_chunk_size': getattr(self.policy.config, 'n_action_steps', 50),
-            'norm_stats_path': "/zhaohan/ZJH/openpi_pytorch/checkpoints/pi0_libero_pytorch/norm_stats.json",  # 给真实路径
+            'norm_stats_path': self._norm_stats_path,  # 统一用已解析的路径
             'state_mean': self.state_mean,
             'state_std': self.state_std,
             'action_mean': self.action_mean,
@@ -558,7 +564,8 @@ class PI0_CFG_Adapter(RLModelInterface):
                             print(f"  ✓ 参数更新完成 (OOM分割, 步骤 {gradient_step}/{gradient_accumulation_steps}, 梯度范数: {grad_norm:.6f})")
                             gradient_step = 0
                     
-                    # 跳过正常的梯度累积，因为已经处理过了
+                    # 计算权重并跳过正常的梯度累积，因为已经处理过了
+                    batch_weight = len(batch_samples) / total_samples
                     total_loss += batch_loss_value * batch_weight
                     processed_samples += len(batch_samples)
                     
@@ -654,8 +661,7 @@ class PI0_CFG_Adapter(RLModelInterface):
         Returns:
             loss: 该batch的平均损失
         """
-        # 🔥 内存优化：强制清理显存碎片
-        torch.cuda.empty_cache()
+        # 🔥 内存优化：移除热路径中的empty_cache以提升性能
 
         # 获取CFG参数
         cfg_alpha = getattr(self.policy.config, 'cfg_uncond_weight', 0.1)
@@ -687,7 +693,6 @@ class PI0_CFG_Adapter(RLModelInterface):
 
                 # 立即清理中间结果
                 del outputs, loss_dict_pos, pos_batch
-                torch.cuda.empty_cache()
 
                 # Step 2: 无条件分支（IQL风格：相同输入，只改变CFG标志）
                 uncond_batch = batch.copy()
@@ -702,14 +707,12 @@ class PI0_CFG_Adapter(RLModelInterface):
 
                 # 立即清理
                 del uncond_outputs, loss_dict_uncond, uncond_batch
-                torch.cuda.empty_cache()
 
                 # Step 3: CFG组合（在autocast内完成）
                 combined_loss_per_step = w_pos.view(B, 1, 1) * per_step_per_dim_pos + cfg_alpha * per_step_per_dim_uncond
 
                 # 立即清理分支结果
                 del per_step_per_dim_pos, per_step_per_dim_uncond
-                torch.cuda.empty_cache()
         else:
             print(f"📝 单分支计算: batch_size={B}")
 
@@ -723,19 +726,16 @@ class PI0_CFG_Adapter(RLModelInterface):
                 losses = loss_dict['losses']
 
                 del outputs, loss_dict
-                torch.cuda.empty_cache()
 
                 combined_loss_per_step = w_pos.view(B, 1, 1) * losses
 
                 del losses
-                torch.cuda.empty_cache()
 
         # 计算平均损失
         loss = combined_loss_per_step.mean()
 
         # 最终清理
         del combined_loss_per_step
-        torch.cuda.empty_cache()
 
         return loss
 
@@ -808,27 +808,16 @@ class PI0_CFG_Adapter(RLModelInterface):
         device: Optional[torch.device] = None,
     ) -> Tuple[Dict[str, Any], List[int]]:
         """
-        🔥 Phase 2: Unified episode processing method.
-
-        Routes to either SO100-style processing or legacy windowing based on configuration.
-
-        Args:
-            episodes: List of episode dictionaries
-            device: Target device for tensors
-
-        Returns:
-            Tuple of:
-                - batch: Training batch
-                - owner_indices: List mapping batch indices to episode indices
+        统一入口：根据 use_so100_processing 路由
+        - True  → SO100 样本法（返回 batch, owner_indices 由 SO100 生成）
+        - False → legacy 窗口化法（返回 batch, owner_indices 由本地窗口化生成）
         """
         if self.use_so100_processing:
-            # Use SO100-style processing
             batch, episode_to_samples_map = self.process_episodes_to_samples_so100(episodes, device)
             owner_indices = batch['owner_indices']
             return batch, owner_indices
         else:
-            # Use legacy windowing processing
-            return self._extract_microbatch_data(episodes, device)
+            return self.process_episodes_legacy(episodes, device)
     
     def normalize_state(self, state: np.ndarray) -> np.ndarray:
         """Normalize state using loaded statistics"""
@@ -838,12 +827,15 @@ class PI0_CFG_Adapter(RLModelInterface):
         """Denormalize action using loaded statistics"""
         return action * (self.action_std + 1e-6) + self.action_mean
 
-    def process_episodes(
+    def process_episodes_legacy(
         self,
         episodes: List[Dict[str, Any]],
         device: Optional[torch.device] = None,
     ) -> Tuple[Dict[str, Any], List[int]]:
         """
+        legacy 窗口化版本：原来第二个同名函数的完整实现整体搬到这里
+        （包括采样窗口、构造 state/image/action/action_is_pad、owner_indices 等）
+        
         将 episodes 打包为 PI0Policy 期望的 batch，支持窗口化采样：
         - 根据windowing_mode从每条轨迹产生多个窗口样本
         - action 形状保持 (B, T, 7)，B现在是总窗口数
@@ -891,14 +883,18 @@ class PI0_CFG_Adapter(RLModelInterface):
                     base_images_seq.append(base_img)
                     wrist_images_seq.append(wrist_img)
 
-                    # 动作(7维)
-                    act_t = np.array(act_t[0] if (isinstance(act_t, list) and len(act_t) > 0) else act_t,
-                                    dtype=np.float32)
-                    if act_t.size != 7:
-                        buf = np.zeros(7, dtype=np.float32)
-                        buf[:min(7, act_t.size)] = act_t[:min(7, act_t.size)]
-                        act_t = buf
-                    actions_seq.append(act_t)
+                    # 动作(7维) - 使用稳健的7维整理逻辑
+                    arr = np.asarray(act_t, dtype=np.float32)
+                    if arr.ndim == 2 and arr.shape[0] == 1:
+                        arr = arr[0]
+                    if arr.ndim == 0:  # 标量，广播到 7 维
+                        arr = np.full(7, float(arr), np.float32)
+                    if arr.size != 7:
+                        buf = np.zeros(7, np.float32)
+                        n = min(7, arr.size)
+                        buf[:n] = arr[:n]
+                        arr = buf
+                    actions_seq.append(arr)
 
                 # 🔥 窗口化采样：根据模式产生多个窗口
                 windows = self._sample_windows_from_episode(
